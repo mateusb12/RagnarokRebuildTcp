@@ -13,6 +13,16 @@ public class EmoteEntry : MonoBehaviour, IPointerClickHandler
 
     public void SetEmote(int id, int frame, Vector2 pos, float scale, string text)
     {
+        if (SpriteRenderer == null)
+        {
+            Debug.LogError("SpriteRenderer is not assigned!");
+            return;
+        }
+        if (SpriteRenderer.SpriteData == null)
+        {
+            Debug.LogError("SpriteRenderer.SpriteData is null!");
+            return;
+        }
         emoteId = id;
 
         SpriteRenderer.ActionId = id;
@@ -31,5 +41,9 @@ public class EmoteEntry : MonoBehaviour, IPointerClickHandler
     public void Awake()
     {
         //SpriteRenderer.Rebuild();
+        if (SpriteRenderer == null)
+        {
+            Debug.LogError("Failed to find RoSpriteRendererUI on this GameObject.");
+        }
     }
 }

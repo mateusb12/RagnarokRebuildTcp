@@ -182,7 +182,14 @@ namespace Assets.Scripts.UI
 
             lastFrame = activeCursor[frame].name;
 
-            Cursor.SetCursor(activeCursor[frame], hotSpot, CursorMode.Auto);
+            if (activeCursor != null && activeCursor.Count > 0)
+            {
+                Cursor.SetCursor(activeCursor[0], hotSpot, CursorMode.Auto);
+            }
+            else
+            {
+                Debug.LogWarning("activeCursor is null or empty. Make sure it is properly assigned.");
+            }
             return;
             /*
 
