@@ -21,6 +21,17 @@ namespace Assets.Scripts.UI.Stats
         public Button ResetButton;
         public Button ApplyButton;
 
+        private const float AccordionHeight = 118f;
+
+        private Button accordionToggleButton;
+        private Button existingInfoButton;
+        private RectTransform accordionPanel;
+        private TextMeshProUGUI accordionToggleText;
+        private Vector2 collapsedWindowSize;
+        private bool capturedCollapsedWindowSize;
+        private bool normalizedBottomButtonParents;
+        private bool isAccordionExpanded;
+
         //public int[] MinValues;
         private readonly int[] adjustValue = new int[6];
         private int statPointsRequired;
@@ -130,6 +141,8 @@ namespace Assets.Scripts.UI.Stats
 
         public void UpdateCharacterStats()
         {
+            EnsureAccordionUi();
+
             var state = PlayerState.Instance;
 
             UpdateStat(0, state.GetData(PlayerStat.Str), state.GetStat(CharacterStat.AddStr), adjustValue[0]);
@@ -171,5 +184,338 @@ namespace Assets.Scripts.UI.Stats
             else
                 AttributeText[8].text = $"<color=blue>{state.GetData(PlayerStat.StatPoints) - statPointsRequired}";
         }
+        private void EnsureAccordionUi()
+        {
+            if (accordionPanel != null)
+                return;
+
+            var windowRect = transform as RectTransform;
+            if (windowRect == null)
+                return;
+
+            collapsedWindowSize = windowRect.sizeDelta;
+            capturedCollapsedWindowSize = true;
+
+            existingInfoButton = FindExistingInfoButton();
+            NormalizeExistingBottomButtons(windowRect);
+
+            accordionPanel = CreateAccordionPanel(windowRect);
+            accordionToggleButton = CreateAccordionToggle(windowRect);
+
+            SetAccordionExpanded(false);
+        }
+
+        private Button FindExistingInfoButton()
+        {
+            var buttons = GetComponentsInChildren<Button>(true);
+            foreach (var button in buttons)
+            {
+                var buttonText = button.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (buttonText == null)
+                    continue;
+
+                if (buttonText.text.Trim() == "Info")
+                    return button;
+            }
+
+            return null;
+        }
+
+        private void NormalizeExistingBottomButtons(RectTransform windowRect)
+        {
+            if (normalizedBottomButtonParents)
+                return;
+
+            ReparentButtonToWindowRootPreservingPosition(ApplyButton, windowRect);
+            ReparentButtonToWindowRootPreservingPosition(ResetButton, windowRect);
+            ReparentButtonToWindowRootPreservingPosition(existingInfoButton, windowRect);
+
+            normalizedBottomButtonParents = true;
+        }
+
+        private void ReparentButtonToWindowRootPreservingPosition(Button button, RectTransform windowRect)
+        {
+            if (button == null || windowRect == null)
+                return;
+
+            if (button.transform is not RectTransform buttonRect)
+                return;
+
+            if (buttonRect.parent == windowRect)
+                return;
+
+            var buttonSize = buttonRect.rect.size;
+            if (buttonSize.x <= 0f || buttonSize.y <= 0f)
+                buttonSize = buttonRect.sizeDelta;
+
+            var worldCorners = new Vector3[4];
+            buttonRect.GetWorldCorners(worldCorners);
+            var bottomLeftInWindow = (Vector2)windowRect.InverseTransformPoint(worldCorners[0]);
+
+            var windowRectData = windowRect.rect;
+            var bottomLeftAnchorPosition = new Vector2(windowRectData.xMin, windowRectData.yMin);
+            var anchoredBottomLeft = bottomLeftInWindow - bottomLeftAnchorPosition;
+
+            buttonRect.SetParent(windowRect, false);
+            buttonRect.anchorMin = Vector2.zero;
+            buttonRect.anchorMax = Vector2.zero;
+            buttonRect.pivot = Vector2.zero;
+            buttonRect.sizeDelta = buttonSize;
+            buttonRect.anchoredPosition = anchoredBottomLeft;
+            buttonRect.localScale = Vector3.one;
+        }
+
+        private TextMeshProUGUI GetButtonTextStyleSource()
+        {
+            if (existingInfoButton != null)
+            {
+                var infoText = existingInfoButton.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (infoText != null)
+                    return infoText;
+            }
+
+            if (ApplyButton != null)
+            {
+                var applyText = ApplyButton.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (applyText != null)
+                    return applyText;
+            }
+
+            if (ResetButton != null)
+            {
+                var resetText = ResetButton.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (resetText != null)
+                    return resetText;
+            }
+
+            return null;
+        }
+
+        private TextMeshProUGUI GetBodyTextStyleSource()
+        {
+            if (AttributeText != null && AttributeText.Count > 0 && AttributeText[0] != null)
+                return AttributeText[0];
+
+            if (BaseStatText != null && BaseStatText.Count > 0 && BaseStatText[0] != null)
+                return BaseStatText[0];
+
+            return GetButtonTextStyleSource();
+        }
+
+        private Button CreateAccordionToggle(RectTransform parent)
+        {
+            var toggleObject = new GameObject("StatsAccordionToggle", typeof(RectTransform), typeof(Image), typeof(Button));
+            toggleObject.transform.SetParent(parent, false);
+
+            var toggleRect = toggleObject.GetComponent<RectTransform>();
+
+            if (existingInfoButton != null)
+            {
+                var infoRect = existingInfoButton.transform as RectTransform;
+                if (infoRect != null)
+                {
+                    toggleRect.anchorMin = new Vector2(0f, 0f);
+                    toggleRect.anchorMax = new Vector2(0f, 0f);
+                    toggleRect.pivot = new Vector2(0f, 1f);
+                    toggleRect.sizeDelta = infoRect.sizeDelta;
+                    toggleRect.anchoredPosition = new Vector2(0f, 3f);
+                }
+
+                var infoImage = existingInfoButton.GetComponent<Image>();
+                var toggleImage = toggleObject.GetComponent<Image>();
+                CopyImageStyle(infoImage, toggleImage);
+
+                var button = toggleObject.GetComponent<Button>();
+                CopyButtonStyle(existingInfoButton, button, toggleImage);
+                button.onClick.AddListener(ToggleAccordion);
+
+                accordionToggleText = CreateClonedText(toggleObject.transform, GetButtonTextStyleSource(), "Text");
+                var textRect = accordionToggleText.rectTransform;
+                textRect.anchorMin = Vector2.zero;
+                textRect.anchorMax = Vector2.one;
+                textRect.offsetMin = Vector2.zero;
+                textRect.offsetMax = Vector2.zero;
+                textRect.localScale = Vector3.one;
+
+                accordionToggleText.text = "More ▼";
+                accordionToggleText.alignment = TextAlignmentOptions.Center;
+                accordionToggleText.enableWordWrapping = false;
+                accordionToggleText.overflowMode = TextOverflowModes.Overflow;
+                accordionToggleText.raycastTarget = false;
+
+                toggleObject.transform.SetSiblingIndex(existingInfoButton.transform.GetSiblingIndex());
+
+                return button;
+            }
+
+            toggleRect.anchorMin = new Vector2(0f, 0f);
+            toggleRect.anchorMax = new Vector2(0f, 0f);
+            toggleRect.pivot = new Vector2(0f, 1f);
+            toggleRect.anchoredPosition = new Vector2(0f, 3f);
+            toggleRect.sizeDelta = new Vector2(70f, 30f);
+
+            var fallbackImage = toggleObject.GetComponent<Image>();
+            fallbackImage.color = new Color(0.78f, 0.78f, 0.78f, 1f);
+
+            var fallbackButton = toggleObject.GetComponent<Button>();
+            fallbackButton.targetGraphic = fallbackImage;
+            fallbackButton.onClick.AddListener(ToggleAccordion);
+
+            accordionToggleText = CreateClonedText(toggleObject.transform, GetButtonTextStyleSource(), "Text");
+            var fallbackTextRect = accordionToggleText.rectTransform;
+            fallbackTextRect.anchorMin = Vector2.zero;
+            fallbackTextRect.anchorMax = Vector2.one;
+            fallbackTextRect.offsetMin = Vector2.zero;
+            fallbackTextRect.offsetMax = Vector2.zero;
+            fallbackTextRect.localScale = Vector3.one;
+
+            accordionToggleText.text = "More ▼";
+            accordionToggleText.alignment = TextAlignmentOptions.Center;
+            accordionToggleText.enableWordWrapping = false;
+            accordionToggleText.overflowMode = TextOverflowModes.Overflow;
+
+            return fallbackButton;
+        }
+
+        private void CopyImageStyle(Image source, Image target)
+        {
+            if (source == null || target == null)
+                return;
+
+            target.sprite = source.sprite;
+            target.type = source.type;
+            target.preserveAspect = source.preserveAspect;
+            target.fillCenter = source.fillCenter;
+            target.fillMethod = source.fillMethod;
+            target.fillOrigin = source.fillOrigin;
+            target.fillAmount = source.fillAmount;
+            target.fillClockwise = source.fillClockwise;
+            target.material = source.material;
+            target.color = source.color;
+            target.raycastTarget = source.raycastTarget;
+            target.maskable = source.maskable;
+            target.pixelsPerUnitMultiplier = source.pixelsPerUnitMultiplier;
+        }
+
+        private void CopyButtonStyle(Button source, Button target, Graphic targetGraphic)
+        {
+            if (source == null || target == null)
+                return;
+
+            target.interactable = source.interactable;
+            target.transition = source.transition;
+            target.colors = source.colors;
+            target.spriteState = source.spriteState;
+            target.animationTriggers = source.animationTriggers;
+            target.navigation = source.navigation;
+            target.targetGraphic = targetGraphic;
+        }
+
+        private RectTransform CreateAccordionPanel(RectTransform parent)
+        {
+            var panelObject = new GameObject("StatsAccordionPanel", typeof(RectTransform));
+            panelObject.transform.SetParent(parent, false);
+
+            var panelRect = panelObject.GetComponent<RectTransform>();
+            panelRect.anchorMin = new Vector2(0f, 0f);
+            panelRect.anchorMax = new Vector2(1f, 0f);
+            panelRect.pivot = new Vector2(0.5f, 0f);
+            panelRect.anchoredPosition = new Vector2(0f, 34f);
+            panelRect.sizeDelta = new Vector2(-18f, AccordionHeight - 42f);
+
+            var separatorObject = new GameObject("AccordionSeparator", typeof(RectTransform), typeof(Image));
+            separatorObject.transform.SetParent(panelObject.transform, false);
+
+            var separatorRect = separatorObject.GetComponent<RectTransform>();
+            separatorRect.anchorMin = new Vector2(0f, 1f);
+            separatorRect.anchorMax = new Vector2(1f, 1f);
+            separatorRect.pivot = new Vector2(0.5f, 1f);
+            separatorRect.anchoredPosition = Vector2.zero;
+            separatorRect.sizeDelta = new Vector2(-12f, 1f);
+
+            var separatorImage = separatorObject.GetComponent<Image>();
+            separatorImage.color = new Color(0.72f, 0.72f, 0.72f, 1f);
+
+            var titleText = CreateClonedText(panelObject.transform, GetBodyTextStyleSource(), "AccordionTitle");
+            var titleRect = titleText.rectTransform;
+            titleRect.anchorMin = new Vector2(0f, 1f);
+            titleRect.anchorMax = new Vector2(1f, 1f);
+            titleRect.pivot = new Vector2(0f, 1f);
+            titleRect.anchoredPosition = new Vector2(10f, -8f);
+            titleRect.sizeDelta = new Vector2(-20f, 22f);
+            titleRect.localScale = Vector3.one;
+
+            titleText.text = "Character Notes";
+            titleText.fontSize = 18f;
+            titleText.fontStyle = FontStyles.Bold;
+            titleText.alignment = TextAlignmentOptions.Left;
+            titleText.enableWordWrapping = false;
+            titleText.overflowMode = TextOverflowModes.Overflow;
+
+            var bodyText = CreateClonedText(panelObject.transform, GetBodyTextStyleSource(), "AccordionBody");
+            var bodyRect = bodyText.rectTransform;
+            bodyRect.anchorMin = Vector2.zero;
+            bodyRect.anchorMax = Vector2.one;
+            bodyRect.offsetMin = new Vector2(10f, 8f);
+            bodyRect.offsetMax = new Vector2(-10f, -34f);
+            bodyRect.localScale = Vector3.one;
+
+            bodyText.text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer vitae sem sed lorem gravida luctus. Donec feugiat justo at porta facilisis.";
+            bodyText.fontSize = 18f;
+            bodyText.fontStyle = FontStyles.Normal;
+            bodyText.alignment = TextAlignmentOptions.TopLeft;
+            bodyText.enableWordWrapping = true;
+            bodyText.overflowMode = TextOverflowModes.Truncate;
+
+            return panelRect;
+        }
+
+        private TextMeshProUGUI CreateClonedText(Transform parent, TextMeshProUGUI styleSource, string objectName)
+        {
+            TextMeshProUGUI text;
+
+            if (styleSource != null)
+            {
+                text = Instantiate(styleSource, parent, false);
+                text.name = objectName;
+            }
+            else
+            {
+                var textObject = new GameObject(objectName, typeof(RectTransform), typeof(TextMeshProUGUI));
+                textObject.transform.SetParent(parent, false);
+                text = textObject.GetComponent<TextMeshProUGUI>();
+            }
+
+            text.rectTransform.localScale = Vector3.one;
+            text.color = Color.black;
+            text.enableAutoSizing = false;
+            text.raycastTarget = false;
+            return text;
+        }
+
+        private void ToggleAccordion()
+        {
+            SetAccordionExpanded(!isAccordionExpanded);
+        }
+
+        private void SetAccordionExpanded(bool expanded)
+        {
+            isAccordionExpanded = expanded;
+
+            if (accordionPanel != null)
+                accordionPanel.gameObject.SetActive(expanded);
+
+            if (accordionToggleText != null)
+                accordionToggleText.text = expanded ? "Less ▲" : "More ▼";
+
+            var windowRect = transform as RectTransform;
+            if (windowRect == null || !capturedCollapsedWindowSize)
+                return;
+
+            windowRect.sizeDelta = expanded
+                ? new Vector2(collapsedWindowSize.x, collapsedWindowSize.y + AccordionHeight)
+                : collapsedWindowSize;
+        }
+
     }
 }
