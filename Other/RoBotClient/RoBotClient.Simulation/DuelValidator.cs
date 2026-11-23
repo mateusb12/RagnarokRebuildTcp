@@ -112,7 +112,9 @@ public static class DuelValidator
         if (record.HelpedByPlayer) return "another player attacked the target";
         if (record.MonsterMaxHpAtEngage > 0 && record.MonsterHpAtEngage < record.MonsterMaxHpAtEngage) return "target already damaged";
         if (record.OtherAttackers > 0) return "other monsters attacked us";
-        if (record.SelfStatuses.Count > 0) return "own status effects at engage";
+        // A status the simulator was given (OwnStatuses) is run by the server's own handler; the static fidelity check
+        // compares what it does to the stats (AttackDelay for an attack speed potion) with the server's live values.
+        if (record.SelfStatuses.Any(s => record.OwnStatuses?.Any(o => o.Status.ToString() == s) != true)) return "own status effects at engage";
         // Poison on the target is simulated (Envenom); any other status change is not.
         if (record.StatusChanges.Any(change => !change.EndsWith("target +Poison") && !change.EndsWith("target -Poison")))
             return "status effects during the duel";
@@ -137,7 +139,7 @@ public static class DuelValidator
                 ? new PlayerAction(actions[moment.ActionIndex].Skill, actions[moment.ActionIndex].Level)
                 : PlayerAction.AutoAttack,
             MonsterAttacksFirst: record.TargetActions.Any(a => a.At <= firstAction),
-            Trials: trials, Seed: seed));
+            Trials: trials, Seed: seed, PlayerStatuses: record.OwnStatuses));
     }
 
     /// <summary>Observed value of each metric for a won duel, null when the duel doesn't define it.</summary>
@@ -207,30 +209,37 @@ public static class DuelValidator
 
     private static List<StaticCheck> StaticChecks(IReadOnlyList<DuelRecord> records) => records
         .Where(r => r.Build != null && r.Live != null && DuelSimulator.IsKnownMonster(r.MonsterClassId))
-        .GroupBy(r => (r.Character, Build: JsonSerializer.Serialize(r.Build), Live: JsonSerializer.Serialize(r.Live)))
+        .GroupBy(r => (r.Character, Build: JsonSerializer.Serialize(r.Build), Live: JsonSerializer.Serialize(r.Live),
+            Statuses: string.Join(",", r.OwnStatuses?.Select(s => $"{s.Status}:{s.Value1}") ?? [])))
         .Select(g =>
         {
             var record = g.First();
-            var sheet = DuelSimulator.Inspect(record.Build!, record.MonsterClassId);
-            var live = record.Live!;
-            var mismatches = new List<string>();
-            void Compare(string stat, double offline, double server, double tolerance = 0)
-            {
-                if (Math.Abs(offline - server) > tolerance) mismatches.Add($"{stat}: offline {offline:0.###}, server {server:0.###}");
-            }
-            Compare("MaxHp", sheet.MaxHp, live.MaxHp);
-            Compare("MaxSp", sheet.MaxSp, live.MaxSp);
-            Compare("Attack", sheet.ClientAttackMin, live.AttackMin);
-            Compare("Attack2", sheet.ClientAttackMax, live.AttackMax);
-            Compare("Def", sheet.Def, live.Def);
-            Compare("MDef", sheet.MDef, live.MDef);
-            Compare("AddHit", sheet.AddHit, live.Hit);
-            Compare("AddFlee", sheet.AddFlee, live.Flee);
-            Compare("AddCrit", sheet.AddCrit, live.Crit);
-            Compare("PerfectDodge", sheet.PerfectDodge, live.PerfectDodge);
-            Compare("AttackDelay", sheet.AttackDelay, live.AttackSpeed, 0.001); // sent as a float
-            return new StaticCheck(g.Key.Character, Describe(record.Build!), g.Count(), mismatches);
+            var mismatches = StatMismatches(DuelSimulator.Inspect(record.Build!, record.MonsterClassId, record.OwnStatuses), record.Live!);
+            return new StaticCheck(g.Key.Character, Describe(record.Build!) + (g.Key.Statuses.Length > 0 ? $" with {g.Key.Statuses}" : ""), g.Count(), mismatches);
         }).ToList();
+
+    /// <summary>Where the simulated character's stats differ from the ones the live server sent the bot: a status or
+    /// item the simulator wasn't given (a buff the bot can't see after a reconnect), or a build read wrongly.</summary>
+    public static List<string> StatMismatches(CombatSheet sheet, LiveStats live)
+    {
+        var mismatches = new List<string>();
+        void Compare(string stat, double offline, double server, double tolerance = 0)
+        {
+            if (Math.Abs(offline - server) > tolerance) mismatches.Add($"{stat}: offline {offline:0.###}, server {server:0.###}");
+        }
+        Compare("MaxHp", sheet.MaxHp, live.MaxHp);
+        Compare("MaxSp", sheet.MaxSp, live.MaxSp);
+        Compare("Attack", sheet.ClientAttackMin, live.AttackMin);
+        Compare("Attack2", sheet.ClientAttackMax, live.AttackMax);
+        Compare("Def", sheet.Def, live.Def);
+        Compare("MDef", sheet.MDef, live.MDef);
+        Compare("AddHit", sheet.AddHit, live.Hit);
+        Compare("AddFlee", sheet.AddFlee, live.Flee);
+        Compare("AddCrit", sheet.AddCrit, live.Crit);
+        Compare("PerfectDodge", sheet.PerfectDodge, live.PerfectDodge);
+        Compare("AttackDelay", sheet.AttackDelay, live.AttackSpeed, 0.001); // sent as a float
+        return mismatches;
+    }
 
     /// <summary>A live server forecast that was ready before the duel ended: a real prediction. One that arrived
     /// later (the worker was busy) was still computed from the state at engagement, but is reported apart and
@@ -249,20 +258,25 @@ public static class DuelValidator
     private static List<ForecastComparison> CompareForecasts(List<DuelRecord> eligible)
     {
         var both = eligible.Where(r => r.Outcome == DuelOutcome.Won && r.OldForecast != null && ForecastBeforeOutcome(r)).ToList();
-        ForecastComparison Compare(string metric, Func<ForecastSummary, double> predicted, Func<DuelRecord, double> observed)
+        // Old forecasts don't predict skill casts (NaN columns); server forecasts made before SkillCasts was recorded are left out.
+        ForecastComparison Compare(string metric, Func<ForecastSummary, double?> predicted, Func<DuelRecord, double> observed)
         {
-            if (both.Count == 0) return new ForecastComparison(metric, 0, 0, 0, 0, 0);
-            var oldErrors = both.Select(r => observed(r) - predicted(r.OldForecast!)).ToList();
-            var serverErrors = both.Select(r => observed(r) - predicted(r.ServerForecast!)).ToList();
-            return new ForecastComparison(metric, both.Count, oldErrors.Average(), oldErrors.Average(Math.Abs),
+            var duels = both.Where(r => predicted(r.ServerForecast!) != null).ToList();
+            if (duels.Count == 0) return new ForecastComparison(metric, 0, 0, 0, 0, 0);
+            var oldErrors = duels.Select(r => observed(r) - (predicted(r.OldForecast!) ?? double.NaN)).ToList();
+            var serverErrors = duels.Select(r => observed(r) - predicted(r.ServerForecast!)!.Value).ToList();
+            return new ForecastComparison(metric, duels.Count, oldErrors.Average(), oldErrors.Average(Math.Abs),
                 serverErrors.Average(), serverErrors.Average(Math.Abs));
         }
+        static int Casts(DuelRecord r) => r.Actions.Count(a => a.Skill != CharacterSkill.None);
         return new List<ForecastComparison>
         {
             Compare("Attacks", f => f.Attacks, r => Observe(r).Attacks),
             Compare("Seconds", f => f.Seconds, r => Observe(r).Seconds),
             Compare("DamageTaken", f => f.DamageTaken, r => Observe(r).DamageTaken),
             Compare("DamagePerAction", f => f.DamagePerAction, r => Observe(r).DamagePerAction),
+            Compare("SkillCasts", f => f.SkillCasts, r => Casts(r)),
+            Compare("AutoAttacks", f => f.Attacks - f.SkillCasts, r => r.Actions.Count - Casts(r)),
         };
     }
 

@@ -45,7 +45,7 @@ public sealed partial class BotBehavior
     private DateTime _nextSit = DateTime.MinValue;
     private int _lootTargetId;
     private readonly HashSet<int> _skipDrops = new();
-    private readonly List<(Position pos, int radius, string name)> _hazards = new();
+    private readonly List<(Position pos, int radius, string name, string engine, int id)> _hazards = new();
 
     // Stuck failsafe: "progress" = moving OR the current target losing HP. No progress for StuckSeconds
     // means the target/route is unreachable (e.g. behind a wall), so we abandon it and relocate.
@@ -582,7 +582,7 @@ public sealed partial class BotBehavior
                 else { avoided++; continue; }
             }
             if (_unreachable.Contains(m.Id)) { blacklisted++; continue; }
-            if (CellNearHazard(m.Pos.X, m.Pos.Y)) { hazardous++; continue; } // inside an aggressive monster's zone
+            if (ApproachNearHazard(snap, m.Pos, out var hzHit, out var hzWhere)) { hazardous++; NoteHazardReject(snap, m, hzHit, hzWhere); continue; } // in or near an aggressive monster's zone, or the walk there crosses one
             // Portal safety: don't engage a mob standing on a portal apron, or the chase will warp us
             // off the map mid-fight. Buffer is configurable via BotBehaviorConfig.PortalSafeDistance;
             // 0 disables. Uses the existing GameDatabase.IsNearPortal check.
@@ -644,6 +644,7 @@ public sealed partial class BotBehavior
                 NoteServerPick(c.m, OldPick());
                 _decision = (c.source == "old" ? "old: not shortlisted" : c.source, c.old);
             }
+            NotePostFleePick(snap, c.m);
             _restToWin = false;
             _lastIdleReason = ""; // armed for the next idle window
             _idleSummary = "";
@@ -1670,12 +1671,97 @@ public sealed partial class BotBehavior
             // a chance to fire. Treating force-hunted mobs as "never a hazard" closes the loop.
             if (_config.ForceHuntClassIds.Contains(m.ClassId)) continue;
             if (!IsAggressive(m.ClassId)) continue;
-            if (DecisionForecast(snap, m, Forecast(snap, m), "hazard", out _).CanWin) continue; // aggressive but winnable = a target, not a hazard
-            _hazards.Add((m.Pos, HazardRadius(m.ClassId), m.Name));
+            // Either engine saying "lose" makes a hazard; a server "win" never cancels the old "lose". The deaths on in_sphinx1
+            // (Mantis, Zerom) came from the engines disagreeing at the zone's edge: a server "win" ended the flee, the next
+            // tick's old "lose" restarted it. A server "lose" sticks to the monster until a server "win" arrives while we're
+            // not fleeing, so a pending re-simulation (old says win) can't end a flee either.
+            var old = Forecast(snap, m);
+            var f = DecisionForecast(snap, m, old, "hazard", out var source);
+            if (source == "server")
+            {
+                if (!f.CanWin) _serverLoses.Add(m.Id);
+                else if (Mode != BotMode.Fleeing) _serverLoses.Remove(m.Id);
+            }
+            var serverLose = _serverLoses.Contains(m.Id);
+            // The one we're fleeing stays a hazard until the flee ends: the old forecast flips with our HP/SP mid-chase,
+            // and each "win" ended the flee and re-engaged it at 1 cell (Bot1 vs Zerom on in_sphinx2, Bot3 vs Raggler).
+            var fleeing = Mode == BotMode.Fleeing && _fleeThreats.Contains(m.Id);
+            if (old.CanWin && !serverLose && !fleeing) continue; // aggressive but winnable = a target, not a hazard
+            var engine = !old.CanWin ? (serverLose ? "old+server" : "old") : serverLose ? "server" : "earlier (still fleeing it)";
+            _hazards.Add((m.Pos, HazardRadius(m.ClassId), m.Name, engine, m.Id));
             _seenHazards[m.Id] = (m.Pos, HazardRadius(m.ClassId), DateTime.UtcNow);
         }
         foreach (var (id, h) in _seenHazards)
             if (DateTime.UtcNow - h.at > HazardMemory) _seenHazards.Remove(id);
+        _serverLoses.RemoveWhere(id => !snap.Monsters.Any(m => m.Id == id));
+    }
+
+    // Monsters the server forecast last called a loss (see ComputeHazards); only ever set with ServerForecast On.
+    private readonly HashSet<int> _serverLoses = new();
+    // Monsters the current flee is from (AvoidHazardsAsync); cleared when the flee ends.
+    private readonly HashSet<int> _fleeThreats = new();
+    // Same 3-cell warning band as the path cost: a flee ends only past it, and a target must sit outside it.
+    private const int HazardBuffer = 3;
+
+    // A target in or near a hazard zone, or whose straight walk crosses one, pulls us back to the threat: Bot3 left See
+    // Otter's zone by one cell, engaged an Aster beyond it and re-entered the zone three times in 6 s before dying.
+    private bool ApproachNearHazard(Snapshot snap, Position target, out int hazard, out string where)
+    {
+        var n = Math.Max(1, Dist(snap.SelfPos, target));
+        // In view, plus the ones seen in the last HazardMemory: Bot3 escaped one See Otter and engaged an Aster inside the
+        // zone of a second one that had just left view. A remembered zone we stand in is stale (it'd be in view if there).
+        var zones = _hazards.Select(h => (h.id, h.pos, h.radius)).Concat(_seenHazards
+            .Where(s => _hazards.All(h => h.id != s.Key) && Dist(snap.SelfPos, s.Value.pos) > s.Value.radius)
+            .Select(s => (id: s.Key, s.Value.pos, s.Value.radius))).ToList();
+        for (var i = n; i >= 1; i--) // target cell first, so "where" names it when both apply
+        {
+            int x = snap.SelfPos.X + (target.X - snap.SelfPos.X) * i / n, y = snap.SelfPos.Y + (target.Y - snap.SelfPos.Y) * i / n;
+            var buffer = i == n ? HazardBuffer : 0;
+            foreach (var h in zones)
+            {
+                hazard = h.id;
+                var d = Math.Max(Math.Abs(h.pos.X - x), Math.Abs(h.pos.Y - y));
+                if (d > h.radius + buffer) continue;
+                where = i < n ? $"the walk to it crosses (at ({x},{y}))" : d <= h.radius ? "it stands inside" : $"it stands {d - h.radius} cell(s) outside";
+                return true;
+            }
+        }
+        (hazard, where) = (0, "");
+        return false;
+    }
+
+    // Verification telemetry for the flee/target-selection fix: one line per (candidate, threat) rejection, and one per pick
+    // made shortly after a flee ended, so both sides of the guard show up in the log without per-tick spam.
+    private readonly HashSet<(int, int)> _hazardRejectLogged = new();
+    private (int id, string name, Position pos, int radius, DateTime endedAt) _lastFlee;
+    private (int id, string name, Position pos, int radius) _fleeHz;
+    private static readonly TimeSpan PostFleeWindow = TimeSpan.FromSeconds(30); // telemetry only
+
+    private void NoteHazardReject(Snapshot snap, MonsterInfo m, int hazard, string where)
+    {
+        var inView = _hazards.FindIndex(x => x.id == hazard);
+        var h = inView >= 0 ? _hazards[inView] : (pos: _seenHazards[hazard].pos, radius: _seenHazards[hazard].radius, name: "a monster out of view", engine: "earlier", id: hazard);
+        if (_hazardRejectLogged.Count > 500) _hazardRejectLogged.Clear();
+        if (!_hazardRejectLogged.Add((m.Id, h.id))) return;
+        var winnable = WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m)).CanWin;
+        var fled = h.id == _fleeHz.id && Mode == BotMode.Fleeing ? "fleeing it now"
+            : h.id == _lastFlee.id && DateTime.UtcNow - _lastFlee.endedAt < PostFleeWindow ? $"fled it {(DateTime.UtcNow - _lastFlee.endedAt).TotalSeconds:F0}s ago" : "not fled from";
+        RoBotClient.Simulation.ForecastWorker.Count($"pick: rejected near hazard ({(winnable ? "winnable" : "unwinnable")}, {(fled == "not fled from" ? "other threat" : "threat being escaped")})");
+        OnLog?.Invoke($"Target rejected: '{m.Name}' at ({m.Pos.X},{m.Pos.Y}) — {where} the zone of '{h.name}' at ({h.pos.X},{h.pos.Y}) "
+            + $"(radius {h.radius}+{HazardBuffer}, {h.engine} says lose, {fled}). Me at ({snap.SelfPos.X},{snap.SelfPos.Y}), mode {Mode}, "
+            + $"old forecast {(winnable ? "win" : "lose")}.");
+    }
+
+    private void NotePostFleePick(Snapshot snap, MonsterInfo m)
+    {
+        var since = DateTime.UtcNow - _lastFlee.endedAt;
+        if (_lastFlee.name == null || since > PostFleeWindow) return;
+        var threat = snap.Monsters.FirstOrDefault(x => x.Id == _lastFlee.id);
+        var tpos = threat?.Pos ?? _lastFlee.pos;
+        RoBotClient.Simulation.ForecastWorker.Count("pick: accepted after a flee");
+        OnLog?.Invoke($"Post-flee pick: '{m.Name}' at ({m.Pos.X},{m.Pos.Y}), {since.TotalSeconds:F0}s after fleeing '{_lastFlee.name}' "
+            + $"({(threat == null ? "out of view, last" : "in view")} at ({tpos.X},{tpos.Y}), radius {_lastFlee.radius}); me {Dist(snap.SelfPos, tpos)} cells from it, "
+            + $"target {Dist(m.Pos, tpos)}; threat {(_hazards.Any(h => h.id == _lastFlee.id) ? "still a hazard" : "no longer a hazard")}.");
     }
 
     // Hazards seen recently but now out of view. Only path costs use them: once a fled-from mob left view, the
@@ -1846,10 +1932,16 @@ public sealed partial class BotBehavior
         for (var i = 0; i < _hazards.Count; i++)
         {
             var d = Dist(snap.SelfPos, _hazards[i].pos);
-            if (d <= _hazards[i].radius && d < nearestD) { nearestD = d; bestIdx = i; }
+            // An ongoing flee lasts until we're past the warning band too: ending it one cell outside the zone handed
+            // the next tick to PickTarget at the zone's edge, and the hazard was back in range two seconds later.
+            var reach = _hazards[i].radius + (Mode == BotMode.Fleeing ? HazardBuffer : 0);
+            if (d <= reach && d < nearestD) { nearestD = d; bestIdx = i; }
         }
         if (bestIdx < 0)
         {
+            if (Mode == BotMode.Fleeing && _fleeHz.name != null) _lastFlee = (_fleeHz.id, _fleeHz.name, _fleeHz.pos, _fleeHz.radius, DateTime.UtcNow);
+            _fleeHz = default;
+            _fleeThreats.Clear();
             // Hazard cleared (mob died, walked away, or we moved out of range). Surface the transition so a
             // tail of the bot's log shows the flee window ending instead of just going silent.
             if (Mode == BotMode.Fleeing)
@@ -1861,11 +1953,14 @@ public sealed partial class BotBehavior
 
         if (Mode != BotMode.Fleeing)
         {
-            OnLog?.Invoke($"Avoiding '{hz.name}' (aggressive, forecast says I'd lose) — fleeing. It's {nearestD} cells away "
+            RoBotClient.Simulation.ForecastWorker.Count($"hazard flee started: {hz.engine} says lose");
+            OnLog?.Invoke($"Avoiding '{hz.name}' (aggressive, {hz.engine} forecast says I'd lose) — fleeing. It's {nearestD} cells away "
                 + $"(danger radius {hz.radius}), I'm at ({snap.SelfPos.X},{snap.SelfPos.Y}), it's at ({hz.pos.X},{hz.pos.Y}).");
             NoteMapFlee(snap.Map);
         }
         Mode = BotMode.Fleeing;
+        _fleeThreats.Add(hz.id);
+        _fleeHz = (hz.id, hz.name, hz.pos, hz.radius);
         _targetId = 0;
         _targetClass = -1;
 

@@ -11,6 +11,7 @@ using RoRebuildServer.EntityComponents.Items;
 using RoRebuildServer.EntitySystem;
 using RoRebuildServer.Networking;
 using RoRebuildServer.Simulation.Skills.SkillHandlers.Swordsman;
+using RoRebuildServer.Simulation.StatusEffects.Setup;
 using RoRebuildServer.Simulation.Util;
 
 namespace RoBotClient.Simulation;
@@ -38,22 +39,28 @@ public readonly record struct PlayerAction(CharacterSkill Skill, int Level)
 public readonly record struct DuelMoment(int ActionIndex, double Seconds, int MonsterHp, int MonsterMaxHp, int Hp, int MaxHp, int Sp, int MaxSp,
     double SecondsSinceLastSkill);
 
+/// <summary>A status effect on the player when the fight starts, as the server's AddStatusEffect takes it: its type,
+/// Value1 (an Awakening Potion's IncreasedAttackSpeed is 15) and the seconds it has left.</summary>
+public readonly record struct ActiveStatus(CharacterStatusEffect Status, int Value1, double Seconds);
+
 /// <summary>Chooses the action for the next attack slot. A skill the SP can't pay for falls back to an auto-attack,
 /// as the server refuses the cast.</summary>
 public delegate PlayerAction ActionPolicy(in DuelMoment moment);
 
 /// <param name="PlayerHp">HP when the fight starts; 0 = full.</param>
-/// <param name="PlayerSp">SP when the fight starts; 0 = full.</param>
+/// <param name="PlayerSp">SP when the fight starts; null = full. 0 is an empty SP bar, not full: Bot3 engaged with 0 SP and
+/// was simulated casting a full bar of Bashes.</param>
 /// <param name="MonsterHp">Target HP when the fight starts; 0 = full.</param>
 /// <param name="MonsterAttacksFirst">The monster is already attacking when we start (an aggressive one that reached
 /// us); otherwise it starts swinging when our first hit lands, as a passive monster retaliates.</param>
 /// <param name="Seed">Fixes the server's GameRandom stream for this request (deterministic replays and tests).</param>
 public sealed record DuelRequest(
     PlayerBuild Player, int MonsterClassId,
-    int PlayerHp = 0, int PlayerSp = 0, int MonsterHp = 0,
+    int PlayerHp = 0, int? PlayerSp = null, int MonsterHp = 0,
     ActionPolicy? Policy = null,
     bool MonsterAttacksFirst = false,
-    int Trials = 1000, int? Seed = null, double MaxSeconds = 300);
+    int Trials = 1000, int? Seed = null, double MaxSeconds = 300,
+    IReadOnlyList<ActiveStatus>? PlayerStatuses = null);
 
 public readonly record struct Distribution(int Count, double Mean, double StdDev, double P10, double P50, double P90)
 {
@@ -84,13 +91,14 @@ public sealed record CombatSheet(
 /// <param name="DuelDamagePerAction">Each won trial's mean damage per action. Not the same as DamagePerAction: a duel
 /// stops at the kill, so lucky duels (crits, double attacks) are short and high and unlucky ones long and low; this is
 /// the distribution one real duel's mean is a draw from.</param>
+/// <param name="SkillCasts">Skill actions per won trial, the rest of Attacks being auto-attacks.</param>
 /// <param name="UnsupportedEffects">A status effect other than poison appeared on either side (card procs, stun...).
 /// The server runs it, but its effects (lost turns, stat changes the simulator's clock ignores) are not trusted.</param>
 public sealed record DuelPrediction(
     int Trials, double WinRate, double DeathRate, double TimeoutRate,
     Distribution Attacks, Distribution Seconds, Distribution DamageTaken, Distribution DamagePerAction,
     Distribution DuelDamagePerAction, double MissRate, double CritRate, double DoubleAttackRate, double SkillActionShare,
-    CombatSheet Sheet, bool UnsupportedEffects, TimeSpan Elapsed);
+    Distribution SkillCasts, CombatSheet Sheet, bool UnsupportedEffects, TimeSpan Elapsed);
 
 /// <summary>
 /// Offline 1v1 duels executed by the game server's own combat code (RoRebuildServer.dll, the build the live server
@@ -143,6 +151,7 @@ public static class DuelSimulator
             var monster = CreateMonster(monsterInfo);
             try
             {
+                ApplyStatuses(player.CombatEntity, request.PlayerStatuses);
                 return Run(request, player, monster, stopwatch);
             }
             finally
@@ -161,16 +170,21 @@ public static class DuelSimulator
     public static bool IsKnownMonster(int monsterClassId) => DataManager.MonsterIdLookup.ContainsKey(monsterClassId);
 
     /// <summary>The server-derived stats of this build against this monster, without fighting.</summary>
-    public static CombatSheet Inspect(PlayerBuild build, int monsterClassId)
+    public static CombatSheet Inspect(PlayerBuild build, int monsterClassId, IReadOnlyList<ActiveStatus>? statuses = null)
     {
         var monsterInfo = DataManager.MonsterIdLookup[monsterClassId];
         lock (ServerCombatRuntime.Gate)
         {
             var player = CreatePlayer(build);
             var monster = CreateMonster(monsterInfo);
-            try { return Sheet(player, monster); }
+            try
+            {
+                ApplyStatuses(player.CombatEntity, statuses);
+                return Sheet(player, monster);
+            }
             finally
             {
+                ClearStatusEffects(player.CombatEntity);
                 EntityManager.Recycle(player.Entity);
                 EntityManager.Recycle(monster.Entity);
                 ServerCombatRuntime.ResetPacketQueue();
@@ -185,7 +199,7 @@ public static class DuelSimulator
         var sheet = Sheet(player, monster);
         var monsterInterval = MonsterAttackInterval(enemy);
         var startHp = request.PlayerHp > 0 ? request.PlayerHp : sheet.MaxHp;
-        var startSp = request.PlayerSp > 0 ? request.PlayerSp : sheet.MaxSp;
+        var startSp = request.PlayerSp is { } sp0 ? Math.Min(sp0, sheet.MaxSp) : sheet.MaxSp;
         var startMonsterHp = request.MonsterHp > 0 ? request.MonsterHp : sheet.MonsterMaxHp;
 
         var attacks = new List<double>();
@@ -193,13 +207,14 @@ public static class DuelSimulator
         var damageTaken = new List<double>();
         var damagePerAction = new List<double>();
         var duelDamagePerAction = new List<double>();
+        var skillCasts = new List<double>();
         int wins = 0, deaths = 0, timeouts = 0, actions = 0, misses = 0, crits = 0, doubles = 0, skillActions = 0;
         var unsupported = false;
         var landings = new PriorityQueue<(int Damage, bool OnMonster), double>();
 
         for (var trial = 0; trial < request.Trials; trial++)
         {
-            int hp = startHp, sp = startSp, monsterHp = startMonsterHp, trialActions = 0, taken = 0, trialDealt = 0;
+            int hp = startHp, sp = startSp, monsterHp = startMonsterHp, trialActions = 0, taken = 0, trialDealt = 0, trialSkills = 0;
             double nextPlayerAction = 0, lastSkillAt = double.NegativeInfinity;
             var nextMonsterAction = request.MonsterAttacksFirst && sheet.MonsterFightsBack ? 0 : double.PositiveInfinity;
             var nextStatusTick = double.PositiveInfinity;
@@ -209,6 +224,8 @@ public static class DuelSimulator
             var outcome = 0; // 1 win, -1 death, 0 still fighting
             var clock = 0.0;
             SetClock(clock);
+            ApplyStatuses(self, request.PlayerStatuses); // cleared above; they start each trial with the time they had left
+            if (HasStatusEffects(self, enemy)) nextStatusTick = StatusTickSeconds;
 
             while (outcome == 0)
             {
@@ -274,6 +291,7 @@ public static class DuelSimulator
                     if (action.Skill != CharacterSkill.None)
                     {
                         skillActions++;
+                        trialSkills++;
                         lastSkillAt = clock;
                     }
                     nextPlayerAction = clock + cooldown;
@@ -304,6 +322,7 @@ public static class DuelSimulator
                 seconds.Add(clock);
                 damageTaken.Add(taken);
                 if (trialActions > 0) duelDamagePerAction.Add((double)trialDealt / trialActions);
+                skillCasts.Add(trialSkills);
             }
             else if (outcome == -1) deaths++;
             else timeouts++;
@@ -315,7 +334,7 @@ public static class DuelSimulator
             Distribution.Of(attacks), Distribution.Of(seconds), Distribution.Of(damageTaken), Distribution.Of(damagePerAction),
             Distribution.Of(duelDamagePerAction),
             (double)misses / swings, (double)crits / swings, (double)doubles / swings, (double)skillActions / swings,
-            sheet, unsupported, stopwatch.Elapsed);
+            Distribution.Of(skillCasts), sheet, unsupported, stopwatch.Elapsed);
     }
 
     /// <summary>One attack slot through the server's code path for it. Returns the damage result and the cooldown
@@ -354,7 +373,20 @@ public static class DuelSimulator
     /// <summary>Status effects whose effect the simulator reproduces by running the server's own handlers over
     /// simulated time. Anything else (stun, provoke, card procs...) still flags the trial UnsupportedEffects:
     /// it may need behaviour the duel loop doesn't model (a stunned monster stops swinging, for one).</summary>
-    private static readonly HashSet<CharacterStatusEffect> SimulatedStatuses = new() { CharacterStatusEffect.Poison };
+    /// IncreasedAttackSpeed (Concentration, Awakening, Berserk Potion): its handler only adds Value1 to AspdBonus, which
+    /// the server's own stat update turns into AttackDelayTime; the static fidelity check compares that with the live one.
+    private static readonly HashSet<CharacterStatusEffect> SimulatedStatuses = new() { CharacterStatusEffect.Poison, CharacterStatusEffect.IncreasedAttackSpeed };
+
+    /// <summary>Whether a status effect on the player at the start of a fight can be given to the simulator.</summary>
+    public static bool IsSimulatedStatus(CharacterStatusEffect status) => SimulatedStatuses.Contains(status);
+
+    // The server's own entry point for them (an item script's AddStatusEffect(StatusIncreasedAttackSpeed, 30m, 15)).
+    private static void ApplyStatuses(CombatEntity entity, IReadOnlyList<ActiveStatus>? statuses)
+    {
+        if (statuses == null) return;
+        foreach (var status in statuses)
+            entity.AddStatusEffect(StatusEffectState.NewStatusEffect(status.Status, (float)status.Seconds, status.Value1));
+    }
 
     private static readonly FieldInfo MonsterLastDamageField =
         typeof(Monster).GetField("timeSinceLastDamage", BindingFlags.NonPublic | BindingFlags.Instance)!;

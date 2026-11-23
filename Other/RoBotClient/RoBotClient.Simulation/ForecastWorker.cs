@@ -71,7 +71,7 @@ public static class ForecastWorker
     /// action in every moment. Ignored (and may be anything) when Policy is null.</param>
     public static Task<ForecastResult> Submit(DuelRequest request, string policyKey, ForecastPriority priority)
     {
-        if (request.Policy == null) request = request with { PlayerSp = 0 }; // SP only matters to skills
+        if (request.Policy == null) request = request with { PlayerSp = null }; // SP only matters to skills
         var key = Key(request, policyKey);
         if (request.Seed == null) request = request with { Seed = BitConverter.ToInt32(Convert.FromHexString(key[..8])) };
         lock (Lock)

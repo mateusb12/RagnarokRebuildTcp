@@ -40,6 +40,7 @@ public sealed partial class BotBehavior
                 InParty = _bot.InParty,
                 DecisionSource = _config.ServerForecast == ServerForecastMode.On ? _decision?.Source ?? "old: not a PickTarget decision" : null,
                 SelfStatuses = snap.SelfStatuses.Select(s => s.ToString()).ToList(),
+                OwnStatuses = _bot.OwnStatuses(MaxFightSeconds, out _),
                 SkillRules = rules.Select(r => $"{r.Skill} {r.Level}" + (r.EveryCooldown > 0 ? $" every {r.EveryCooldown}" : "")
                     + (r.Conditions.Count > 0 ? " if " + string.Join(" and ", r.Conditions.Select(c => $"{c.Lhs} {c.Op} {c.Value}")) : "")).ToList(),
                 Build = build,
@@ -53,7 +54,7 @@ public sealed partial class BotBehavior
                 var request = ServerRequest(snap, target, build, out var policyNote, out var policyKey);
                 var notes = new List<string>();
                 if (policyNote != null) notes.Add(policyNote);
-                if (snap.SelfStatuses.Count > 0) notes.Add("own status effects not simulated");
+                if (record.OwnStatuses == null) notes.Add("own status effects not simulated");
                 record.PendingForecast = ForecastWorker.Submit(request, policyKey, ForecastPriority.Urgent)
                     .ContinueWith(t => AttachServerForecast(record, t.Result, notes), TaskContinuationOptions.ExecuteSynchronously);
             }
@@ -80,7 +81,7 @@ public sealed partial class BotBehavior
             // DamagePerAction: the duel's own mean (what one real duel is compared with), not the pooled per-hit mean.
             record.ServerForecast = new ForecastSummary(prediction.WinRate, prediction.Attacks.Mean, prediction.Seconds.Mean,
                 prediction.DamageTaken.Mean, prediction.Attacks.StdDev, prediction.Seconds.StdDev, prediction.DamageTaken.StdDev,
-                prediction.DuelDamagePerAction.Mean, notes.Count > 0 ? string.Join("; ", notes) : null);
+                prediction.DuelDamagePerAction.Mean, notes.Count > 0 ? string.Join("; ", notes) : null, prediction.SkillCasts.Mean);
         }
     }
 
@@ -92,8 +93,11 @@ public sealed partial class BotBehavior
         var policy = ScriptedSkillPolicy(snap, target, rules, out policyNote, out policyKey);
         return new DuelRequest(build, target.ClassId,
             PlayerHp: snap.SelfHp, PlayerSp: snap.SelfSp, MonsterHp: target.MaxHp > 0 ? target.Hp : 0,
-            Policy: policy, MonsterAttacksFirst: _bot.HasHitMe(target.Id), Trials: ShadowTrials);
+            Policy: policy, MonsterAttacksFirst: _bot.HasHitMe(target.Id), Trials: ShadowTrials, MaxSeconds: MaxFightSeconds,
+            PlayerStatuses: _bot.OwnStatuses(MaxFightSeconds, out _)); // unsimulated ones: ServerUnsupported, or the record's note
     }
+
+    private const double MaxFightSeconds = 300; // DuelRequest's default
 
     // ---- ServerForecast On: decisions ----
 
@@ -107,7 +111,7 @@ public sealed partial class BotBehavior
 
     private readonly Dictionary<int, Task<ForecastResult>> _serverInFlight = new(); // by monster id; tick thread only
     private Snapshot? _buildSnap;
-    private PlayerBuild? _snapBuild;
+    private (PlayerBuild Build, LiveStats Live)? _snapBuild;
     private (string Source, BattleForecast Old)? _decision; // PickTarget's chosen engagement, for its duel record
     private readonly HashSet<int> _disagreementLogged = new();
     private string _lastPickChange = "";
@@ -161,13 +165,20 @@ public sealed partial class BotBehavior
             if (ServerUnsupported(snap, m, old) is { } why) { source = $"old: unsupported ({why})"; return old; }
             // One simulation per monster in flight: a fight changes HP every hit, and each state is a new request.
             if (_serverInFlight.TryGetValue(m.Id, out var flight) && !flight.IsCompleted) { source = "old: pending"; return old; }
-            var request = ServerRequest(snap, m, BuildOf(snap), out var policyNote, out var policyKey);
+            var request = ServerRequest(snap, m, BuildOf(snap).Build, out var policyNote, out var policyKey);
             if (policyNote != null) { source = $"old: unsupported ({policyNote})"; return old; }
             var task = ForecastWorker.Submit(request, policyKey, ForecastPriority.Urgent);
             if (!task.IsCompleted) { _serverInFlight[m.Id] = task; source = "old: pending"; return old; }
             _serverInFlight.Remove(m.Id);
             if (task.Result.Prediction is not { } p) { source = $"old: failed ({task.Result.Error?.Split('\n')[0]})"; return old; }
             if (p.UnsupportedEffects) { source = "old: unsupported (status effects in the simulation)"; return old; }
+            // The simulated character must be the one the server reports: after a reconnect Bot3 still had an Awakening
+            // Potion it couldn't see (AttackDelay 0.819 live, 0.967 simulated).
+            if (DuelValidator.StatMismatches(p.Sheet, BuildOf(snap).Live) is [var mismatch, ..])
+            {
+                source = $"old: unsupported (simulated stats differ from the server's: {mismatch.Split(':')[0]})";
+                return old;
+            }
             source = "server";
             return ServerBattleForecast(snap, old, p);
         }
@@ -182,7 +193,7 @@ public sealed partial class BotBehavior
     private string? ServerUnsupported(Snapshot snap, MonsterInfo m, BattleForecast old)
     {
         if (_bot.InParty) return "in a party";
-        if (snap.SelfStatuses.Count > 0) return "own status effects";
+        if (_bot.OwnStatuses(MaxFightSeconds, out var statusWhy) == null) return $"own status effects ({statusWhy})";
         if (InferAttackRange(snap) > 1) return "ranged attacker";
         if (_config.NoAutoAttack) return "no auto-attack";
         if (!DuelSimulator.IsKnownMonster(m.ClassId)) return "monster unknown to the server data";
@@ -198,10 +209,10 @@ public sealed partial class BotBehavior
         return null;
     }
 
-    private PlayerBuild BuildOf(Snapshot snap)
+    private (PlayerBuild Build, LiveStats Live) BuildOf(Snapshot snap)
     {
-        if (!ReferenceEquals(_buildSnap, snap)) { _snapBuild = _bot.CaptureCombatState().Build; _buildSnap = snap; }
-        return _snapBuild!;
+        if (!ReferenceEquals(_buildSnap, snap)) { _snapBuild = _bot.CaptureCombatState(); _buildSnap = snap; }
+        return _snapBuild!.Value;
     }
 
     /// <summary>The old forecast with the server's numbers. CanWin keeps the old rule (expected HP lost within

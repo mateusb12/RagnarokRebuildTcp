@@ -50,6 +50,14 @@ public sealed class BotSession : IAsyncDisposable
     public int MaxHitTakenFrom(string monsterName) => _maxHitTaken.GetValueOrDefault(monsterName);
     private string _lastUsedItemName = "";
     private DateTime _lastUsedItemAt = DateTime.MinValue;
+    private int _lastUsedItemId;
+    // Strength (the item script's Value1) of our buffs, by status: the Apply packet carries only type and duration, so
+    // it's taken from the buff item we drank just before. Unknown after a reconnect with the buff still on.
+    private readonly Dictionary<CharacterStatusEffect, int> _ownStatusPower = new();
+    // Damage aimed at us that hasn't landed yet: one entry per Attack or Skill packet (attacker id, or -1 for a status
+    // effect such as poison; its total damage). The HitTarget packet that applies damage names no attacker, so it is
+    // matched here by its exact total. Under _stateLock (the receive loop).
+    private readonly List<(int Attacker, string Name, int Damage, DateTime At)> _incoming = new();
     // Recent attack pairing — target entity id → (attacker entity id, when). Updated from ReadAttack; read
     // by ReadHit to attribute damage to the most recent attacker even when the HitTarget packet itself
     // doesn't carry an attacker id. ~3s freshness window matches typical melee swing rate.
@@ -192,15 +200,53 @@ public sealed class BotSession : IAsyncDisposable
     /// <summary>This monster has hit us and we haven't killed it yet: it's already in the fight.</summary>
     public bool HasHitMe(int monsterId) => _damageTakenFrom.ContainsKey(monsterId);
 
-    private void NoteDamageTaken(int dmg)
+    // Under _stateLock. An Attack or Skill packet aimed at us: its damage lands with a later HitTarget.
+    private void NoteIncoming(int attacker, int target, int damage)
     {
-        (int Attacker, DateTime At)? last = null;
-        if (_recentAttacks.TryGetValue(World.Self.EntityId, out var hit)) last = hit;
-        if (_recentSkillHits.TryGetValue(World.Self.EntityId, out var skill) && (last == null || skill.At > last.Value.At))
-            last = skill;
-        if (last is not { Attacker: > 0 } l) return;
-        _damageTakenFrom.AddOrUpdate(l.Attacker, dmg, (_, d) => d + dmg);
-        if (_damageTakenFrom.Count > 256) _damageTakenFrom.Clear(); // ponytail: crude cap, monsters we never killed
+        if (target != World.Self.EntityId || damage <= 0) return;
+        var name = attacker > 0 && World.Entities.TryGetValue(attacker, out var e) ? e.Name : "";
+        _incoming.Add((attacker > 0 ? attacker : -1, name, damage, DateTime.UtcNow));
+    }
+
+    /// <summary>Who dealt a HitTarget on us: the attacker of the in-flight hit with exactly that total (its id, -1 a status
+    /// effect), or 0 when no hit matches or attackers with hits of the same size are in flight. In that case nobody is
+    /// credited, and the other hits of that size are dropped too, since which of them is still to land is unknown.</summary>
+    private (int Attacker, string Name) AttributeHit(int dmg)
+    {
+        var now = DateTime.UtcNow;
+        _incoming.RemoveAll(h => (now - h.At).TotalSeconds > 5); // landed unseen (HitTarget out of view) or never sent
+        var i = _incoming.FindIndex(h => h.Damage == dmg);
+        if (i < 0) return (0, "");
+        var hit = _incoming[i];
+        _incoming.RemoveAt(i);
+        if (_incoming.Any(h => h.Damage == dmg && h.Attacker != hit.Attacker))
+        {
+            _incoming.RemoveAll(h => h.Damage == dmg);
+            return (0, "");
+        }
+        return (hit.Attacker, hit.Name);
+    }
+
+    /// <summary>Our status effects at this moment as the duel simulator takes them, or null naming the first it can't
+    /// run (not simulated, or its strength unknown). Seconds left are capped at the simulator's longest fight: beyond
+    /// it they can't change a simulation, so a long buff keeps one cache key instead of a new one each tick.</summary>
+    public List<ActiveStatus>? OwnStatuses(double maxFightSeconds, out string? unsupported)
+    {
+        lock (_stateLock)
+        {
+            unsupported = null;
+            var list = new List<ActiveStatus>();
+            if (!World.Entities.TryGetValue(World.Self.EntityId, out var self)) return list;
+            var now = DateTime.UtcNow;
+            foreach (var (status, expires) in self.Statuses)
+            {
+                if (expires <= now) continue;
+                if (!DuelSimulator.IsSimulatedStatus(status)) { unsupported = $"{status} not simulated"; return null; }
+                if (!_ownStatusPower.TryGetValue(status, out var power)) { unsupported = $"{status} strength unknown"; return null; }
+                list.Add(new ActiveStatus(status, power, Math.Round(Math.Min((expires - now).TotalSeconds, maxFightSeconds + 1), 3)));
+            }
+            return list;
+        }
     }
 
     private void NoteOwnHit(int target)
@@ -679,6 +725,7 @@ public sealed class BotSession : IAsyncDisposable
         if (_conn == null) return Task.CompletedTask;
         _lastUsedItemName = _data?.ItemName(itemId) ?? $"#{itemId}";
         _lastUsedItemAt = DateTime.UtcNow;
+        _lastUsedItemId = itemId;
         Telemetry.Record(TelemetryEventType.UsedItem, World.Self.Level, _lastUsedItemName);
         var w = new PacketWriter();
         w.WritePacketType(PacketType.UseInventoryItem);
@@ -1360,6 +1407,7 @@ public sealed class BotSession : IAsyncDisposable
         var offHand = r.ReadInt32();
         // remaining fields (timings, showMotion) drive visuals only.
         NoteDuelAction(src, target, CharacterSkill.None, 0, result, hitCount, damage * hitCount + Math.Max(0, offHand));
+        NoteIncoming(src, target, damage * hitCount + Math.Max(0, offHand));
         // Do NOT subtract Hp here: Attack carries per-hit DisplayDamage, while the authoritative Hp change
         // arrives in the HitTarget packet (server applies Damage*HitCount+offhand once). Counting both
         // double-decremented the target's tracked Hp, making it look "dead" after 1-2 hits so the bot
@@ -1428,6 +1476,7 @@ public sealed class BotSession : IAsyncDisposable
         var result = (AttackResult)r.ReadByte();
         var hits = r.ReadByte();
         NoteDuelAction(owner > 0 ? owner : caster, target, skill, level, result, hits, damage * hits);
+        NoteIncoming(owner > 0 ? owner : caster, target, damage * hits);
         _recentSkillHits[target] = (owner > 0 ? owner : caster, DateTime.UtcNow);
         if ((owner > 0 ? owner : caster) == World.Self.EntityId) NoteOwnHit(target); else NoteOtherHit(owner > 0 ? owner : caster, target);
         if (_recentSkillHits.Count > 256)
@@ -1463,13 +1512,17 @@ public sealed class BotSession : IAsyncDisposable
         if (dmg <= 0) return;
         if (id == World.Self.EntityId)
         {
-            // We took a hit. Attacker name is whatever ReadAttack last recorded as targeting us.
-            NoteDamageTaken(dmg);
-            if (!string.IsNullOrEmpty(_lastAttackerName))
-                _maxHitTaken.AddOrUpdate(_lastAttackerName, dmg, (_, old) => Math.Max(old, dmg));
-            Log($"Damage taken: {(string.IsNullOrEmpty(_lastAttackerName) ? "(unknown)" : _lastAttackerName)} hit me for {dmg} damage.");
-            Telemetry.Record(TelemetryEventType.DamageReceived, World.Self.Level,
-                string.IsNullOrEmpty(_lastAttackerName) ? "(unknown)" : _lastAttackerName, dmg);
+            // We took a hit. The packet names no attacker: match it to the hit in flight that carries this damage.
+            var (from, fromName) = AttributeHit(dmg);
+            if (from > 0)
+            {
+                _damageTakenFrom.AddOrUpdate(from, dmg, (_, d) => d + dmg);
+                if (_damageTakenFrom.Count > 256) _damageTakenFrom.Clear(); // ponytail: crude cap, monsters we never killed
+                if (fromName.Length > 0) _maxHitTaken.AddOrUpdate(fromName, dmg, (_, old) => Math.Max(old, dmg));
+            }
+            var who = from == -1 ? "(status effect)" : from == 0 ? "(unattributed)" : fromName.Length > 0 ? fromName : $"#{from}";
+            Log($"Damage taken: {who} hit me for {dmg} damage.");
+            Telemetry.Record(TelemetryEventType.DamageReceived, World.Self.Level, who, dmg);
         }
         else if (World.Entities.TryGetValue(id, out var allyView) && allyView.IsPlayer)
         {
@@ -1632,6 +1685,9 @@ public sealed class BotSession : IAsyncDisposable
         var status = (CharacterStatusEffect)statusByte;
         var expires = duration > 0 ? DateTime.UtcNow.AddSeconds(duration) : DateTime.UtcNow.AddMinutes(60);
         NoteDuelStatus(id, status, true);
+        if (id == World.Self.EntityId && (DateTime.UtcNow - _lastUsedItemAt).TotalSeconds < 5
+            && _data?.Buff(_lastUsedItemId) is { } buff && buff.Status == status)
+            _ownStatusPower[status] = buff.Power;
         if (World.Entities.TryGetValue(id, out var e))
         {
             e.Statuses[status] = expires;
@@ -1650,6 +1706,7 @@ public sealed class BotSession : IAsyncDisposable
         var isRefresh = r.ReadBoolean();
         var status = (CharacterStatusEffect)statusByte;
         if (!isRefresh) NoteDuelStatus(id, status, false);
+        if (!isRefresh && id == World.Self.EntityId) _ownStatusPower.Remove(status);
         if (World.Entities.TryGetValue(id, out var e) && e.Statuses.Remove(status))
         {
             if (id == World.Self.EntityId && !isRefresh)

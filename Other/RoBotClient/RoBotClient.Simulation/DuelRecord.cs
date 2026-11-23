@@ -24,7 +24,7 @@ public sealed record LiveStats(int MaxHp, int MaxSp, int AttackMin, int AttackMa
 /// <summary>What a forecast predicted for this duel, in the observation's units.</summary>
 public sealed record ForecastSummary(double WinRate, double Attacks, double Seconds, double DamageTaken,
     double AttacksStdDev = 0, double SecondsStdDev = 0, double DamageTakenStdDev = 0, double DamagePerAction = 0,
-    string? Note = null);
+    string? Note = null, double? SkillCasts = null);
 
 /// <summary>
 /// One duel: the bot's combat state when it engaged a monster, what the old and the server-based forecasts
@@ -47,6 +47,9 @@ public sealed class DuelRecord
     /// <summary>ServerForecast On only: which forecast chose this engagement: "server", or "old: ..." with the reason
     /// the server's wasn't used (pending, unsupported, failed, not shortlisted, not a PickTarget decision).</summary>
     public string? DecisionSource { get; set; }
+    /// <summary>Our status effects at engagement that the simulator was given (type, strength, seconds left); a status
+    /// in SelfStatuses but not here was not simulated.</summary>
+    public List<ActiveStatus>? OwnStatuses { get; set; }
     public List<string> SelfStatuses { get; set; } = new();
     /// <summary>The bot's enemy-targeted skill rules, as written in its script (what the policy can use).</summary>
     public List<string> SkillRules { get; set; } = new();
