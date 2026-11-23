@@ -6,6 +6,10 @@ namespace RoBotClient.Bot.Behavior;
 /// engaging enemies; Tank intercepts threats hitting party-mates; Buffer rotates buffs on the party.</summary>
 public enum PartyRole { Auto, Tank, Dps, Healer, Buffer, Utility }
 
+/// <summary>What the server-code duel simulator (RoBotClient.Simulation) does for a bot. Shadow is first so a config
+/// saved before this field existed reads as Shadow.</summary>
+public enum ServerForecastMode { Shadow, Off, On }
+
 /// <summary>Tunables that decide what a bot hunts and when it flees.</summary>
 public sealed class BotBehaviorConfig
 {
@@ -250,6 +254,12 @@ public sealed class BotBehaviorConfig
     /// is wasted DPS, and for skill-only solo builds. Skills + heals + walking still work normally.</summary>
     public bool NoAutoAttack = false;
 
+    /// <summary>Shadow (default): every engagement records the server simulator's forecast beside the old one, which
+    /// decides. On: the server forecast also decides PickTarget's nearest candidates and the hazard win/lose checks
+    /// whenever its result for the exact current state is ready; otherwise the old forecast decides and the decision
+    /// says why (pending, unsupported, failed). Off: the server simulator isn't run for this bot.</summary>
+    public ServerForecastMode ServerForecast = ServerForecastMode.Shadow;
+
     /// <summary>Per-bot allowlist of monster class ids the bot will hunt EVEN IF the battle forecast
     /// says <c>CanWin = false</c>. Failsafe so the operator can override a too-cautious WinMargin —
     /// e.g. force a level-50 bot to keep hunting Mandragoras when the simulator hasn't realized they're
@@ -355,6 +365,7 @@ public sealed class BotBehaviorConfig
         AnnounceTargetInChat = other.AnnounceTargetInChat;
         ListenToPartyChat = other.ListenToPartyChat;
         NoAutoAttack = other.NoAutoAttack;
+        ServerForecast = other.ServerForecast;
         ForceHuntClassIds = new HashSet<int>(other.ForceHuntClassIds);
         EnableKite = other.EnableKite;
         KiteBufferTiles = other.KiteBufferTiles;

@@ -552,7 +552,7 @@ public static class McpBotTools
         bots.StopBot(botId) ? $"Stopped {botId}." : $"No bot '{botId}'.";
 
     [McpServerTool(Name = "configure_bot"),
-     Description("Update a running bot's behavior config. Omitted fields are unchanged. Monster lists are comma-separated CODES; healingItemIds/lootBlacklist are comma-separated item ids. Fractional units: healHpPercent and restBelowPercent are 0..1 (e.g. 0.5 = 50%); winMargin is 0..2 (smaller = pickier targets). partyRole = Auto|Tank|Dps|Healer|Buffer|Utility (Auto derives from JobId at runtime). Build: statTargets = six comma-separated goals STR,AGI,VIT,INT,DEX,LUK (0 = no goal), e.g. \"40,50,30,0,20,0\"; skillOrder = learning order like \"Bash 10, MagnumBreak 3, Endure 1\". The bot spends points toward both automatically. buildPreset = a named build that sets desiredJob, statTargets, skillOrder and the skill script at once: Agi Swordsman, Vit Swordsman, Dex Archer, Int Mage, Heal Acolyte, Agi Thief, Str Merchant. Shopping (needs autoShop): weight budgets, as 0..1 shares of max weight: consumableWeightShare for healing items and other consumables (restockItemId is bought back up to that once fewer than restockBelow are held), flyWingWeightShare for Fly Wings, of which emergencyFlyWingShare is kept for escapes and the rest spent on travel shortcuts. One Butterfly Wing is always kept for the ride home. Zeny: healingZenyShare, buffZenyShare and flyWingZenyShare are 0..1 shares of the income since the last shop trip (the rest is saved for gear); healing may always top up to restockBelow.")]
+     Description("Update a running bot's behavior config. Omitted fields are unchanged. Monster lists are comma-separated CODES; healingItemIds/lootBlacklist are comma-separated item ids. Fractional units: healHpPercent and restBelowPercent are 0..1 (e.g. 0.5 = 50%); winMargin is 0..2 (smaller = pickier targets). partyRole = Auto|Tank|Dps|Healer|Buffer|Utility (Auto derives from JobId at runtime). Build: statTargets = six comma-separated goals STR,AGI,VIT,INT,DEX,LUK (0 = no goal), e.g. \"40,50,30,0,20,0\"; skillOrder = learning order like \"Bash 10, MagnumBreak 3, Endure 1\". The bot spends points toward both automatically. buildPreset = a named build that sets desiredJob, statTargets, skillOrder and the skill script at once: Agi Swordsman, Vit Swordsman, Dex Archer, Int Mage, Heal Acolyte, Agi Thief, Str Merchant. Shopping (needs autoShop): weight budgets, as 0..1 shares of max weight: consumableWeightShare for healing items and other consumables (restockItemId is bought back up to that once fewer than restockBelow are held), flyWingWeightShare for Fly Wings, of which emergencyFlyWingShare is kept for escapes and the rest spent on travel shortcuts. One Butterfly Wing is always kept for the ride home. Zeny: healingZenyShare, buffZenyShare and flyWingZenyShare are 0..1 shares of the income since the last shop trip (the rest is saved for gear); healing may always top up to restockBelow. serverForecast = Off|Shadow|On: Shadow (default) records the server-code simulator's forecast beside every engagement; On also lets it decide target picks and hazard checks when its result is ready.")]
     public static string ConfigureBot(BotManager bots, GameDatabase db, string botId,
         bool? enabled = null, string? homeMap = null,
         string? huntCodes = null, string? fleeCodes = null, string? ignoreCodes = null,
@@ -566,7 +566,8 @@ public static class McpBotTools
         string? statTargets = null, string? skillOrder = null, string? buildPreset = null,
         int? restockItemId = null, double? consumableWeightShare = null, int? restockBelow = null,
         double? flyWingWeightShare = null, double? emergencyFlyWingShare = null,
-        double? healingZenyShare = null, double? buffZenyShare = null, double? flyWingZenyShare = null, bool? autoMap = null)
+        double? healingZenyShare = null, double? buffZenyShare = null, double? flyWingZenyShare = null, bool? autoMap = null,
+        string? serverForecast = null)
     {
         var cfg = bots.GetBehaviorConfig(botId);
         if (cfg == null) return $"No bot '{botId}'.";
@@ -621,6 +622,11 @@ public static class McpBotTools
                 return $"Unknown partyRole '{partyRole}'. Valid: Auto, Tank, Dps, Healer, Buffer, Utility.";
         }
         if (itemScript != null) cfg.ItemScript = itemScript;
+        if (!string.IsNullOrWhiteSpace(serverForecast))
+        {
+            if (Enum.TryParse<ServerForecastMode>(serverForecast, ignoreCase: true, out var mode)) cfg.ServerForecast = mode;
+            else return $"Unknown serverForecast '{serverForecast}'. Valid: Off, Shadow, On.";
+        }
         if (announceTarget.HasValue) cfg.AnnounceTargetInChat = announceTarget.Value;
         if (listenToPartyChat.HasValue) cfg.ListenToPartyChat = listenToPartyChat.Value;
         bots.SaveConfig(botId); // persist so the change survives a stop+respawn / dashboard restart
@@ -954,6 +960,7 @@ public static class McpBotTools
         itemScriptLength = (c.ItemScript ?? "").Length,
         squadId = c.SquadId, c.IsSquadLeader, c.SquadLeaderName,
         c.AnnounceTargetInChat, c.ListenToPartyChat,
+        serverForecast = c.ServerForecast.ToString(),
     };
 
     private static void ResolveCodes(GameDatabase db, HashSet<int> set, string? codes)

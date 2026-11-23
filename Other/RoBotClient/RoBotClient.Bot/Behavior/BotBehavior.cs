@@ -164,6 +164,7 @@ public sealed partial class BotBehavior
             BeginApronDeparture(snap.SelfPos, arrivedFrom, snap.Map);
             _travelWingMap = null; // a fresh visit gets a fresh Fly Wing budget
             _seenHazards.Clear();
+            _serverInFlight.Clear();
             _walkGoal = null;
             OnLog?.Invoke($"Changed maps → {snap.Map}.");
         }
@@ -286,6 +287,7 @@ public sealed partial class BotBehavior
         // already covers us, drop everything and flee away from it.
         NoteHp(snap);
         ComputeHazards(snap);
+        PrefetchServerForecasts(snap);
         if (await AvoidHazardsAsync(snap, ct)) return;
         if (await TryEmergencyFlyWingAsync(snap, ct)) return;
 
@@ -497,11 +499,13 @@ public sealed partial class BotBehavior
         ResetStuck(snap.SelfPos, target.Hp); // start the progress clock for this target
         _bot.NoteForecast(target.Id, forecast.SecondsToKillMonster, forecast.AttacksToKill, forecast.ExpectedDamageTaken);
         RecordDuelStart(snap, target, forecast);
+        var source = _config.ServerForecast == ServerForecastMode.On ? $" [forecast: {_decision?.Source ?? "old, not a PickTarget decision"}]" : "";
+        _decision = null;
         _nextAttack = DateTime.UtcNow.AddSeconds(3);
         _duel = new DuelStart(DateTime.UtcNow, snap.SelfHp, snap.SelfSp, target.Name);
         OnLog?.Invoke($"Engaging {target.Name} (hp {target.MaxHp}): my hit ~{forecast.MyDamagePerHit}@{forecast.MyHitChance:P0}, " +
                       $"its hit ~{forecast.MonsterDamagePerHit}@{forecast.MonsterHitChance:P0}, " +
-                      $"kill ~{forecast.SecondsToKillMonster:F1}s vs my death ~{forecast.SecondsToKillMe:F1}s{why}");
+                      $"kill ~{forecast.SecondsToKillMonster:F1}s vs my death ~{forecast.SecondsToKillMe:F1}s{why}{source}");
         await MaybeAnnounceTargetAsync(target, ct);
         // Skill-only bots still need the server to know who their target is (skills auto-target the
         // bot's current target id when no explicit target is passed in the rule). Just don't issue the
@@ -558,7 +562,11 @@ public sealed partial class BotBehavior
     private MonsterInfo? PickTarget(Snapshot snap, out BattleForecast chosen)
     {
         chosen = default;
-        var candidates = new List<(double score, MonsterInfo m, BattleForecast f)>();
+        _decision = null;
+        // ServerForecast On: the nearest few are decided by the server forecast when it's ready; ok is that decision,
+        // oldOk/oldScore what the old forecast alone would decide, to count where the two pick differently.
+        var shortlist = ServerShortlist(snap);
+        var candidates = new List<(double score, MonsterInfo m, BattleForecast f, string source, bool ok, double oldScore, bool oldOk, BattleForecast old)>();
         // Solo, rank by expected exp per second (walk + fight) so the bot prefers efficient monsters over merely
         // close ones. In a party, healing and shared exp change the math, so keep the nearest-first rule there.
         var solo = !_bot.InParty;
@@ -581,7 +589,9 @@ public sealed partial class BotBehavior
             if (_config.PortalSafeDistance > 0 && _data != null
                 && _data.IsNearPortal(snap.Map, m.Pos.X, m.Pos.Y, _config.PortalSafeDistance))
             { portalRisk++; continue; }
-            var forecast = WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m));
+            var old = WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m));
+            var source = "old";
+            var forecast = shortlist?.Contains(m.Id) == true ? DecisionForecast(snap, m, old, "pick", out source) : old;
             if (SnipesFixed(snap, m) && FindFiringSpot(snap, m) == null) { noSafeCell++; continue; }
             // Failsafe override: operator-set ForceHuntClassIds bypasses the forecast veto. The bot
             // still consults the forecast (numbers go in the Engaging log), but the unwinnable gate
@@ -589,7 +599,9 @@ public sealed partial class BotBehavior
             // estimates a fight (e.g. element gear it can't see, or until the kite FSM is on for a
             // ranged build) and the operator wants the bot to commit anyway.
             var forced = _config.ForceHuntClassIds.Contains(m.ClassId);
-            if (!forced && !forecast.CanWin)
+            var ok = forced || forecast.CanWin;
+            var oldOk = forced || old.CanWin;
+            if (!ok)
             {
                 unwinnable++;
                 if (snap.SelfHp < snap.SelfMaxHp)
@@ -599,30 +611,39 @@ public sealed partial class BotBehavior
                     if (WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m)).CanWin) winnableRested++;
                     snap.SelfHp = hp;
                 }
-                continue;
+                if (!oldOk) continue;
             }
             var group = EngagementGroup(snap, m);
             // One already hitting us isn't a pull: idling leaves it (and the pack) on us, so fight it if it's winnable 1v1.
-            if (!forced && group.Count > 1 && !_bot.HasHitMe(m.Id) && !ForecastGroupOf(snap, group).CanWin) { swarmed++; continue; }
+            if (!forced && group.Count > 1 && !_bot.HasHitMe(m.Id) && !ForecastGroupOf(snap, group).CanWin) { if (ok) swarmed++; continue; }
+            candidates.Add((Score(m, forecast), m, forecast, source, ok, Score(m, old), oldOk, old));
+        }
+
+        double Score(MonsterInfo m, BattleForecast f)
+        {
             double score = Dist(snap.SelfPos, m.Pos);
-            if (solo)
-                score = -ExpPerSecond(snap, m, forecast, (int)score); // negated: candidates sort ascending
-            else
-            {
-                var mlvl = _data?.Monster(m.ClassId)?.Level ?? 0;
-                if (mlvl > 0 && mlvl <= snap.SelfLevel - 15) score += 100; // grey mob: poor exp, deprioritize
-            }
-            candidates.Add((score, m, forecast));
+            if (solo) return -ExpPerSecond(snap, m, f, (int)score); // negated: candidates sort ascending
+            var mlvl = _data?.Monster(m.ClassId)?.Level ?? 0;
+            return mlvl > 0 && mlvl <= snap.SelfLevel - 15 ? score + 100 : score; // grey mob: poor exp, deprioritize
         }
 
         // Take the nearest target we can actually path to (A* over the walkmap). Checking reachability up
         // front avoids committing to monsters behind walls and waiting on the stuck timeout to bail out.
         candidates.Sort(static (a, b) => a.score.CompareTo(b.score));
+        var reachable = new Dictionary<int, bool>();
+        bool Reachable(MonsterInfo m) => reachable.TryGetValue(m.Id, out var r) ? r : reachable[m.Id] = IsReachable(snap, m.Pos);
+        MonsterInfo? OldPick() => candidates.Where(c => c.oldOk).OrderBy(c => c.oldScore).FirstOrDefault(c => Reachable(c.m)).m;
         var unreachable = 0;
         foreach (var c in candidates)
         {
-            if (!IsReachable(snap, c.m.Pos)) { unreachable++; continue; }
+            if (!c.ok) continue;
+            if (!Reachable(c.m)) { unreachable++; continue; }
             chosen = c.f;
+            if (shortlist != null)
+            {
+                NoteServerPick(c.m, OldPick());
+                _decision = (c.source == "old" ? "old: not shortlisted" : c.source, c.old);
+            }
             _restToWin = false;
             _lastIdleReason = ""; // armed for the next idle window
             _idleSummary = "";
@@ -631,6 +652,7 @@ public sealed partial class BotBehavior
 
         // No target. Log WHY (deduped — only fire when the reason string actually changes), so the user can
         // diagnose "FSM keeps the bot Idle" without enabling Verbose chat.
+        if (shortlist != null) NoteServerPick(null, OldPick());
         _restToWin = winnableRested > 0;
         var reason = $"PickTarget idle — {snap.Monsters.Count} mon in view (not-huntable={notHuntable}, avoided-class={avoided}, blacklisted={blacklisted}, in-hazard={hazardous}, near-portal={portalRisk}, unwinnable={unwinnable}, group-swarm={swarmed}, no-safe-cell={noSafeCell}, unreachable={unreachable}).";
         // Main reason for the stay log (time split): which filter dropped the most monsters in view.
@@ -1635,7 +1657,7 @@ public sealed partial class BotBehavior
             // a chance to fire. Treating force-hunted mobs as "never a hazard" closes the loop.
             if (_config.ForceHuntClassIds.Contains(m.ClassId)) continue;
             if (!IsAggressive(m.ClassId)) continue;
-            if (Forecast(snap, m).CanWin) continue; // aggressive but winnable = a target, not a hazard
+            if (DecisionForecast(snap, m, Forecast(snap, m), "hazard", out _).CanWin) continue; // aggressive but winnable = a target, not a hazard
             _hazards.Add((m.Pos, HazardRadius(m.ClassId), m.Name));
             _seenHazards[m.Id] = (m.Pos, HazardRadius(m.ClassId), DateTime.UtcNow);
         }

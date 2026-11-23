@@ -22,6 +22,7 @@ public sealed partial class BotBehavior
     {
         try
         {
+            if (_decision is { } decision) forecast = decision.Old; // OldForecast is the old simulator's, whatever decided
             var (build, live) = _bot.CaptureCombatState();
             var rules = GetSkillRules().Where(r => r.Target == SkillCastTarget.Enemy).ToList();
             var record = new DuelRecord
@@ -37,6 +38,7 @@ public sealed partial class BotBehavior
                 HpAtEngage = snap.SelfHp,
                 SpAtEngage = snap.SelfSp,
                 InParty = _bot.InParty,
+                DecisionSource = _config.ServerForecast == ServerForecastMode.On ? _decision?.Source ?? "old: not a PickTarget decision" : null,
                 SelfStatuses = snap.SelfStatuses.Select(s => s.ToString()).ToList(),
                 SkillRules = rules.Select(r => $"{r.Skill} {r.Level}" + (r.EveryCooldown > 0 ? $" every {r.EveryCooldown}" : "")
                     + (r.Conditions.Count > 0 ? " if " + string.Join(" and ", r.Conditions.Select(c => $"{c.Lhs} {c.Op} {c.Value}")) : "")).ToList(),
@@ -46,15 +48,15 @@ public sealed partial class BotBehavior
                     forecast.ExpectedDamageTaken, DamagePerAction: forecast.ExpectedDamagePerSwing,
                     Note: "deterministic: WinRate is CanWin"),
             };
-            var policy = ScriptedSkillPolicy(snap, target, rules, out var policyNote, out var policyKey);
-            var notes = new List<string>();
-            if (policyNote != null) notes.Add(policyNote);
-            if (snap.SelfStatuses.Count > 0) notes.Add("own status effects not simulated");
-            var request = new DuelRequest(build, target.ClassId,
-                PlayerHp: snap.SelfHp, PlayerSp: snap.SelfSp, MonsterHp: target.MaxHp > 0 ? target.Hp : 0,
-                Policy: policy, MonsterAttacksFirst: _bot.HasHitMe(target.Id), Trials: ShadowTrials);
-            record.PendingForecast = ForecastWorker.Submit(request, policyKey, ForecastPriority.Urgent)
-                .ContinueWith(t => AttachServerForecast(record, t.Result, notes), TaskContinuationOptions.ExecuteSynchronously);
+            if (_config.ServerForecast != ServerForecastMode.Off)
+            {
+                var request = ServerRequest(snap, target, build, out var policyNote, out var policyKey);
+                var notes = new List<string>();
+                if (policyNote != null) notes.Add(policyNote);
+                if (snap.SelfStatuses.Count > 0) notes.Add("own status effects not simulated");
+                record.PendingForecast = ForecastWorker.Submit(request, policyKey, ForecastPriority.Urgent)
+                    .ContinueWith(t => AttachServerForecast(record, t.Result, notes), TaskContinuationOptions.ExecuteSynchronously);
+            }
             _bot.BeginDuel(record);
         }
         catch (Exception e)
@@ -80,6 +82,152 @@ public sealed partial class BotBehavior
                 prediction.DamageTaken.Mean, prediction.Attacks.StdDev, prediction.Seconds.StdDev, prediction.DamageTaken.StdDev,
                 prediction.DuelDamagePerAction.Mean, notes.Count > 0 ? string.Join("; ", notes) : null);
         }
+    }
+
+    /// <summary>The server simulation of fighting <paramref name="target"/> from this tick's state. Engagement records
+    /// and On-mode decisions build it the same way, so a decision's forecast is the cache entry its duel record gets.</summary>
+    private DuelRequest ServerRequest(Snapshot snap, MonsterInfo target, PlayerBuild build, out string? policyNote, out string policyKey)
+    {
+        var rules = GetSkillRules().Where(r => r.Target == SkillCastTarget.Enemy).ToList();
+        var policy = ScriptedSkillPolicy(snap, target, rules, out policyNote, out policyKey);
+        return new DuelRequest(build, target.ClassId,
+            PlayerHp: snap.SelfHp, PlayerSp: snap.SelfSp, MonsterHp: target.MaxHp > 0 ? target.Hp : 0,
+            Policy: policy, MonsterAttacksFirst: _bot.HasHitMe(target.Id), Trials: ShadowTrials);
+    }
+
+    // ---- ServerForecast On: decisions ----
+
+    private const int ShortlistSize = 4; // PickTarget's nearest huntable monsters get a server forecast
+    // ponytail: guessed cap on simulated deaths + timeouts for a fight without potions to count as winnable; the
+    // WinMargin damage check bounds the mean, this bounds the tail. Re-fit from On-mode deaths if any appear.
+    private const double MaxServerLossRate = 0.05;
+    // ponytail: guessed. Monster skill damage below this share of its total is within the duel validator's tolerance
+    // (shadow duels against Caramel, Metaller, Drainliar stayed consistent); re-fit from per-monster On-mode errors.
+    private const double MaxMonsterSkillShare = 0.2;
+
+    private readonly Dictionary<int, Task<ForecastResult>> _serverInFlight = new(); // by monster id; tick thread only
+    private Snapshot? _buildSnap;
+    private PlayerBuild? _snapBuild;
+    private (string Source, BattleForecast Old)? _decision; // PickTarget's chosen engagement, for its duel record
+    private readonly HashSet<int> _disagreementLogged = new();
+    private string _lastPickChange = "";
+
+    private HashSet<int>? ServerShortlist(Snapshot snap) => _config.ServerForecast != ServerForecastMode.On ? null
+        : snap.Monsters.Where(IsHuntable).OrderBy(m => Dist(snap.SelfPos, m.Pos)).Take(ShortlistSize).Select(m => m.Id).ToHashSet();
+
+    /// <summary>Every tick, fighting included: queue the shortlist's simulations for the exact current state. PickTarget
+    /// runs a tick after a kill, and HP and SP usually settled before the last blow, so that state is often cached by
+    /// then. Monsters in combat aren't simulated (see ServerLookup); one in flight per monster bounds the load.</summary>
+    private void PrefetchServerForecasts(Snapshot snap)
+    {
+        if (ServerShortlist(snap) is not { } shortlist) return;
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        foreach (var m in snap.Monsters)
+            if (shortlist.Contains(m.Id)) ServerLookup(snap, m, Forecast(snap, m), out _);
+        DecisionTiming.PrefetchMs.Add(System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+    }
+
+    /// <summary>The forecast a decision uses. Off and Shadow: the old one. On: the server's, when its result for this
+    /// exact state is cached; otherwise the old one, and <paramref name="source"/> says why (pending, unsupported,
+    /// failed). Never waits: a miss queues the simulation and a later tick uses it if nothing changed.</summary>
+    private BattleForecast DecisionForecast(Snapshot snap, MonsterInfo m, BattleForecast old, string use, out string source)
+    {
+        source = "old";
+        if (_config.ServerForecast != ServerForecastMode.On) return old;
+        var forecast = ServerLookup(snap, m, old, out source);
+        ForecastWorker.Count($"{use}: {(source.StartsWith("old: failed") ? "old: failed" : source)}");
+        if (source == "server" && forecast.CanWin != old.CanWin)
+        {
+            ForecastWorker.Count($"{use}: disagree, server says {(forecast.CanWin ? "win" : "lose")}");
+            if (_disagreementLogged.Count > 500) _disagreementLogged.Clear();
+            if (_disagreementLogged.Add(m.Id))
+                OnLog?.Invoke($"Forecasts disagree on {m.Name} ({use}, my HP {snap.SelfHp}): old says {(old.CanWin ? "win" : "lose")} "
+                    + $"(~{old.ExpectedDamageTaken:F0} HP lost, {old.AttacksToKill} attacks), server says {(forecast.CanWin ? "win" : "lose")} "
+                    + $"(~{forecast.ExpectedDamageTaken:F0} HP lost, {forecast.AttacksToKill} attacks, win {forecast.WinChancePercent:F0}%).");
+        }
+        return forecast;
+    }
+
+    private BattleForecast ServerLookup(Snapshot snap, MonsterInfo m, BattleForecast old, out string source)
+    {
+        try
+        {
+            if (!ServerCombatRuntime.IsInitialized) { ForecastWorker.Start(); source = "old: pending (simulator starting)"; return old; }
+            // Mid-fight every hit is a new state, so the server's answer is nearly always one tick behind: the verdict
+            // flipped between engines each tick (engage, flee, engage) on an Orc Warrior. Contact keeps the old forecast.
+            // HasHitMe goes by damage attribution, which can credit a neighbour's hits to the last attacker; a monster at
+            // melee distance counts as in contact too.
+            if (m.Id == _targetId || _bot.HasHitMe(m.Id) || Dist(snap.SelfPos, m.Pos) <= 2) { source = "old: in combat (state changes every hit)"; return old; }
+            if (ServerUnsupported(snap, m, old) is { } why) { source = $"old: unsupported ({why})"; return old; }
+            // One simulation per monster in flight: a fight changes HP every hit, and each state is a new request.
+            if (_serverInFlight.TryGetValue(m.Id, out var flight) && !flight.IsCompleted) { source = "old: pending"; return old; }
+            var request = ServerRequest(snap, m, BuildOf(snap), out var policyNote, out var policyKey);
+            if (policyNote != null) { source = $"old: unsupported ({policyNote})"; return old; }
+            var task = ForecastWorker.Submit(request, policyKey, ForecastPriority.Urgent);
+            if (!task.IsCompleted) { _serverInFlight[m.Id] = task; source = "old: pending"; return old; }
+            _serverInFlight.Remove(m.Id);
+            if (task.Result.Prediction is not { } p) { source = $"old: failed ({task.Result.Error?.Split('\n')[0]})"; return old; }
+            if (p.UnsupportedEffects) { source = "old: unsupported (status effects in the simulation)"; return old; }
+            source = "server";
+            return ServerBattleForecast(snap, old, p);
+        }
+        catch (Exception e)
+        {
+            source = $"old: failed ({e.GetType().Name}: {e.Message})";
+            return old;
+        }
+    }
+
+    /// <summary>Why the server simulation can't stand for this fight; the duel validator excludes the same cases.</summary>
+    private string? ServerUnsupported(Snapshot snap, MonsterInfo m, BattleForecast old)
+    {
+        if (_bot.InParty) return "in a party";
+        if (snap.SelfStatuses.Count > 0) return "own status effects";
+        if (InferAttackRange(snap) > 1) return "ranged attacker";
+        if (_config.NoAutoAttack) return "no auto-attack";
+        if (!DuelSimulator.IsKnownMonster(m.ClassId)) return "monster unknown to the server data";
+        if (IsMonsterImmobile(_data?.Monster(m.ClassId))) return "fixed monster";
+        // The simulated monster only auto-attacks. Where the old model says its casts are a real share of its damage,
+        // or it has hit us far harder than a swing, the server forecast would miss that damage.
+        var skillDps = BuildMonsterMods(snap, m).MonsterSkillDps;
+        var meleeDps = old.MonsterDamagePerHit * old.MonsterHitChance 
+            / (_data?.MonsterAttackDelay(m.ClassId) is > 0.05 and var delay ? delay : 1.6); // BattleSimulator's default interval
+        if (skillDps > MaxMonsterSkillShare * (skillDps + meleeDps)) return "monster skills";
+        if (_bot.MaxHitTakenFrom(m.Name) > old.MonsterDamagePerHit * 2) return "unexplained hits above its swing";
+        if (HealingOn(snap, m) > 0) return "healer near the target";
+        return null;
+    }
+
+    private PlayerBuild BuildOf(Snapshot snap)
+    {
+        if (!ReferenceEquals(_buildSnap, snap)) { _snapBuild = _bot.CaptureCombatState().Build; _buildSnap = snap; }
+        return _snapBuild!;
+    }
+
+    /// <summary>The old forecast with the server's numbers. CanWin keeps the old rule (expected HP lost within
+    /// WinMargin of HP plus the potion buffer, attacks within MaxRoundsToKill) on the simulated means, and without
+    /// potions also caps simulated deaths and timeouts.</summary>
+    private BattleForecast ServerBattleForecast(Snapshot snap, BattleForecast old, DuelPrediction p)
+    {
+        var buffer = EstimatePotionHpBuffer(snap);
+        var canWin = p.WinRate > 0 && snap.SelfHp > 0
+            && (p.Attacks.Mean <= _config.MaxRoundsToKill || p.DamageTaken.Mean <= 0)
+            && p.DamageTaken.Mean <= _config.WinMargin * (snap.SelfHp + buffer)
+            && (buffer > 0 || p.DeathRate + p.TimeoutRate <= MaxServerLossRate);
+        return old with
+        {
+            CanWin = canWin, SecondsToKillMonster = p.Seconds.Mean, ExpectedDamageTaken = p.DamageTaken.Mean,
+            AttacksToKill = (int)Math.Ceiling(p.Attacks.Mean), WinChancePercent = 100 * p.WinRate, MyHitChance = 1 - p.MissRate,
+        };
+    }
+
+    /// <summary>Counts and logs when the server forecast changed PickTarget's choice from what the old one picks.</summary>
+    private void NoteServerPick(MonsterInfo? chosen, MonsterInfo? oldPick)
+    {
+        if (chosen?.Id == oldPick?.Id) return;
+        ForecastWorker.Count(chosen == null ? "pick: changed, server idles" : oldPick == null ? "pick: changed, old would idle" : "pick: changed target");
+        var line = $"Server forecast changed the pick: {chosen?.Name ?? "nothing"} instead of {oldPick?.Name ?? "nothing"} (old).";
+        if (line != _lastPickChange) OnLog?.Invoke(_lastPickChange = line);
     }
 
     /// <summary>The script's enemy skill rules as the simulator's action policy: per attack slot, the first rule

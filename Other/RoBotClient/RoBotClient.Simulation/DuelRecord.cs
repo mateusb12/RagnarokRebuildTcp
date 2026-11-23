@@ -44,6 +44,9 @@ public sealed class DuelRecord
     public int HpAtEngage { get; set; }
     public int SpAtEngage { get; set; }
     public bool InParty { get; set; }
+    /// <summary>ServerForecast On only: which forecast chose this engagement: "server", or "old: ..." with the reason
+    /// the server's wasn't used (pending, unsupported, failed, not shortlisted, not a PickTarget decision).</summary>
+    public string? DecisionSource { get; set; }
     public List<string> SelfStatuses { get; set; } = new();
     /// <summary>The bot's enemy-targeted skill rules, as written in its script (what the policy can use).</summary>
     public List<string> SkillRules { get; set; } = new();

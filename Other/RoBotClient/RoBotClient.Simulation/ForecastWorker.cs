@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -58,6 +59,9 @@ public static class ForecastWorker
     public static readonly LatencyStats BotTickMs = new();
     public static readonly LatencyStats QueueWaitMs = new();
     public static readonly LatencyStats ComputeMs = new();
+    private static readonly ConcurrentDictionary<string, long> Decisions = new();
+    /// <summary>Counts one bot decision by the forecast it used (or why not), for the stats file.</summary>
+    public static void Count(string what) => Decisions.AddOrUpdate(what, 1, static (_, n) => n + 1);
     private static long submitted, cacheHits, deduplicated, rejected, computed, failed, maxQueueDepth;
     private static double busySeconds;
     private static readonly DateTime StartedAt = DateTime.UtcNow;
@@ -214,6 +218,7 @@ public static class ForecastWorker
                     BusySeconds = busySeconds, WallSeconds = wall, Utilisation = wall > 0 ? busySeconds / wall : 0,
                     WorkerCpuSeconds = workerCpuSeconds(),
                     QueueWaitMs = QueueWaitMs.Summary(), ComputeMs = ComputeMs.Summary(), BotTickMs = BotTickMs.Summary(),
+                    Decisions = new SortedDictionary<string, long>(Decisions), PrefetchMs = DecisionTiming.PrefetchMs.Summary(),
                 };
             }
             File.WriteAllText(path, JsonSerializer.Serialize(stats, new JsonSerializerOptions { WriteIndented = true }));
@@ -231,6 +236,12 @@ public static class ForecastWorker
             catch { return null; }
         }
     }
+}
+
+/// <summary>Time a bot spends on its tick preparing and looking up ServerForecast On decisions.</summary>
+public static class DecisionTiming
+{
+    public static readonly LatencyStats PrefetchMs = new();
 }
 
 /// <summary>The last 4096 samples of a duration, for percentiles; count and max over all samples.</summary>
