@@ -73,8 +73,10 @@ public sealed class BotManager
 
     public BotManager(GameDatabase data, AccountStore? accounts = null, BotConfigStore? configs = null,
         PartyStateStore? partyStates = null, BotTelemetryStore? telemetry = null, BotLogStore? logStore = null,
-        BotProgressStore? progress = null, MapAuditStore? mapAudit = null, BotMemoryStore? memory = null)
+        BotProgressStore? progress = null, MapAuditStore? mapAudit = null, BotMemoryStore? memory = null,
+        RoBotClient.Simulation.DuelStore? duels = null)
     {
+        Duels = duels;
         _progress = progress;
         MapAudit = mapAudit;
         _memory = memory;
@@ -96,6 +98,8 @@ public sealed class BotManager
     public BotLogStore? LogStore => _logStore;
     public BotProgressStore? Progress => _progress;
     public MapAuditStore? MapAudit { get; }
+    /// <summary>Every engagement's state, forecasts and outcome (bot-duels/), for DuelValidator.</summary>
+    public RoBotClient.Simulation.DuelStore? Duels { get; }
     private readonly BotMemoryStore? _memory;
 
     private readonly BotProgressStore? _progress;
@@ -369,6 +373,7 @@ public sealed class BotManager
                     // The session's receive loop owns the bot's lifetime: when it ends (server close, socket
                     // abort, or stop_bot), cancel the behavior loop too. Otherwise a dropped bot keeps ticking on
                     // its last snapshot and stays listed as active.
+                    if (Duels is { } duels) session.OnDuelEnded += record => duels.Append(config.CharacterName, record);
                     var sessionTask = session.RunAsync(cts.Token);
                     var brainTask = brain.RunAsync(cts.Token);
                     try { await sessionTask; }

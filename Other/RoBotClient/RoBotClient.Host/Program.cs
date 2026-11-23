@@ -3,6 +3,7 @@ using RoBotClient.Bot.Behavior;
 using RoBotClient.Bot.GameData;
 using RoBotClient.Bot.Session;
 using RoBotClient.Bot.State;
+using RoBotClient.Simulation;
 
 // Usage:  [mode] [seconds]
 //   hunt (default) : log in, enter, then hunt nearby monsters / flee when hurt for N seconds (default 300)
@@ -11,6 +12,23 @@ var mode = args.Length > 0 ? args[0].ToLowerInvariant() : "hunt";
 var seconds = args.Length > 1 && int.TryParse(args[1], out var ss) ? ss : 300;
 
 void Log(string s) => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {s}");
+
+//   validate [dir] : replay the duels real bots recorded (default ../bot-duels) through the server-code simulator
+//   benchmark      : time and size the server-code simulator against the old BattleSimulator
+if (mode is "validate" or "benchmark")
+{
+    var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
+                          ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
+    if (mode == "validate")
+    {
+        var directory = args.Length > 1 ? args[1] : Path.Combine(Path.GetDirectoryName(Path.GetDirectoryName(serverDirectory))!, "Other", "RoBotClient", "bot-duels");
+        ServerCombatRuntime.EnsureInitialized(serverDirectory);
+        Console.WriteLine(DuelValidator.ToMarkdown(DuelValidator.Validate(DuelStore.ReadAll(directory))));
+    }
+    else
+        SimulatorBenchmark.Run(serverDirectory, Console.WriteLine);
+    return;
+}
 
 var gameData = GameDatabase.Load(ResolveRepoSubdir(Path.Combine("RebuildClient", "Assets", "StreamingAssets", "ClientConfigGenerated")),
                                  ResolveRepoSubdir(Path.Combine("RebuildClient", "Assets", "Maps", "exportdata")));

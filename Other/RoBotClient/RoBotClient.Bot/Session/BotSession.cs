@@ -7,6 +7,7 @@ using RoBotClient.Bot.GameData;
 using RoBotClient.Bot.Net;
 using RoBotClient.Bot.Protocol;
 using RoBotClient.Bot.State;
+using RoBotClient.Simulation;
 
 namespace RoBotClient.Bot.Session;
 
@@ -84,6 +85,93 @@ public sealed class BotSession : IAsyncDisposable
     {
         _forecasts[targetId] = new KillForecast(seconds, attacks, hpLost);
         if (_forecasts.Count > 256) _forecasts.Clear(); // ponytail: crude cap, targets we never killed
+    }
+
+    // ---- duel recorder: one DuelRecord per engagement, whatever its outcome (see DuelRecord) ----
+
+    private DuelRecord? _activeDuel;
+
+    /// <summary>Raised (off the receive thread) when a duel recorded by <see cref="BeginDuel"/> ends.</summary>
+    public event Action<DuelRecord>? OnDuelEnded;
+
+    /// <summary>Start recording a duel. Engaging a different monster first ends the current duel as abandoned;
+    /// re-engaging the same monster keeps the record already running.</summary>
+    public void BeginDuel(DuelRecord record)
+    {
+        lock (_stateLock)
+        {
+            if (_activeDuel?.MonsterId == record.MonsterId) return;
+            EndDuel(DuelOutcome.Abandoned);
+            record.HelpedByPlayer = _helpedOn.ContainsKey(record.MonsterId);
+            _activeDuel = record;
+        }
+    }
+
+    /// <summary>The build the server derives this character's combat stats from (base stats, job, learned skills,
+    /// equipment with refine and cards), and the stats the server reported for it. Call under no lock.</summary>
+    public (PlayerBuild Build, LiveStats Live) CaptureCombatState() => WithState(w =>
+    {
+        var self = w.Self;
+        var skills = new Dictionary<CharacterSkill, int>();
+        foreach (var known in self.KnownSkills)
+            skills[known.Skill] = Math.Max(skills.GetValueOrDefault(known.Skill), known.Level);
+        var equipment = new List<EquippedItem>();
+        for (var slot = 0; slot < self.EquippedBagIds.Length; slot++)
+        {
+            var bagId = self.EquippedBagIds[slot];
+            if (bagId == 0) continue;
+            var item = self.Inventory.FirstOrDefault(i => i.BagId == bagId);
+            if (item != null) equipment.Add(new EquippedItem((EquipSlot)slot, item.ItemId, item.Refine, item.Cards.ToArray()));
+        }
+        var build = new PlayerBuild(self.Level, self.JobLevel, self.JobId, self.Str, self.Agi, self.Vit, self.Int, self.Dex, self.Luk,
+            skills, equipment, self.AmmoId);
+        var live = new LiveStats(self.MaxHp, self.MaxSp, self.Attack, self.AttackMax, self.Def, self.MDef, self.Hit, self.Flee,
+            self.AddCrit, self.Stats.GetValueOrDefault(CharacterStat.PerfectDodge), self.AttackSpeed);
+        return (build, live);
+    });
+
+    private double DuelClock(DuelRecord duel) => (DateTime.UtcNow - duel.EngagedAtUtc).TotalSeconds;
+
+    // Under _stateLock.
+    private void EndDuel(DuelOutcome outcome)
+    {
+        if (_activeDuel is not { } duel) return;
+        _activeDuel = null;
+        duel.Outcome = outcome;
+        duel.EndedAt = DuelClock(duel);
+        if (OnDuelEnded is { } handler) ThreadPool.QueueUserWorkItem(_ => { try { handler(duel); } catch { } });
+    }
+
+    // Under _stateLock. One Attack or Skill packet: who hit whom, with what result and total damage.
+    private void NoteDuelAction(int attacker, int target, CharacterSkill skill, int level, AttackResult result, int hitCount, int damage)
+    {
+        if (_activeDuel is not { } duel) return;
+        var self = World.Self.EntityId;
+        if (attacker == self && target == duel.MonsterId)
+            duel.Actions.Add(new ObservedAction(DuelClock(duel), skill, level, result, hitCount, damage));
+        else if (attacker == duel.MonsterId && target == self)
+            duel.TargetActions.Add(new ObservedAction(DuelClock(duel), skill, level, result, hitCount, damage));
+        else if (target == self && attacker != self)
+        {
+            duel.DamageFromOthers += damage;
+            duel.OtherAttackers++;
+        }
+        else if (target == duel.MonsterId && World.Entities.TryGetValue(attacker, out var other) && other.IsPlayer)
+            duel.HelpedByPlayer = true;
+    }
+
+    // Under _stateLock. The duel target died (Death packet or a dead-removal), or left view.
+    private void NoteDuelTargetGone(int id, bool dead)
+    {
+        if (_activeDuel is not { } duel || duel.MonsterId != id) return;
+        EndDuel(!dead ? DuelOutcome.LostSight : duel.Actions.Any(a => a.Damage > 0) ? DuelOutcome.Won : DuelOutcome.Stolen);
+    }
+
+    // Under _stateLock.
+    private void NoteDuelStatus(int id, CharacterStatusEffect status, bool applied)
+    {
+        if (_activeDuel is not { } duel || (id != duel.MonsterId && id != World.Self.EntityId)) return;
+        duel.StatusChanges.Add($"{DuelClock(duel):F1}s {(id == duel.MonsterId ? "target" : "self")} {(applied ? "+" : "-")}{status}");
     }
 
     // Monsters another player has attacked (auto-attack or damaging skill), so a kill can say it wasn't a pure duel.
@@ -1263,7 +1351,10 @@ public sealed class BotSession : IAsyncDisposable
         var hitCount = r.ReadByte();
         var result = (AttackResult)r.ReadByte();
         var pos = r.ReadPosition();   // attacker's authoritative cell
-        // remaining fields (per-hit display dmg, offhand dmg, timings, showMotion) drive visuals only.
+        var damage = r.ReadInt32();   // per hit (DamageInfo.DisplayDamage)
+        var offHand = r.ReadInt32();
+        // remaining fields (timings, showMotion) drive visuals only.
+        NoteDuelAction(src, target, CharacterSkill.None, 0, result, hitCount, damage * hitCount + Math.Max(0, offHand));
         // Do NOT subtract Hp here: Attack carries per-hit DisplayDamage, while the authoritative Hp change
         // arrives in the HitTarget packet (server applies Damage*HitCount+offhand once). Counting both
         // double-decremented the target's tracked Hp, making it look "dead" after 1-2 hits so the bot
@@ -1321,8 +1412,17 @@ public sealed class BotSession : IAsyncDisposable
         }
         var owner = r.ReadInt32();  // -1 unless the damage belongs to someone other than the caster
         var target = r.ReadInt32();
-        Shout(caster, (CharacterSkill)r.ReadByte());
+        var skill = (CharacterSkill)r.ReadByte();
+        Shout(caster, skill);
         if (kind != SkillTarget.Enemy || target <= 0) return;
+        // CommandBuilder.SkillExecuteTargetedSkill: level, facing, position, per-hit damage, result, hits, timings.
+        var level = r.ReadByte();
+        r.ReadByte();
+        r.ReadPosition();
+        var damage = r.ReadInt32();
+        var result = (AttackResult)r.ReadByte();
+        var hits = r.ReadByte();
+        NoteDuelAction(owner > 0 ? owner : caster, target, skill, level, result, hits, damage * hits);
         _recentSkillHits[target] = (owner > 0 ? owner : caster, DateTime.UtcNow);
         if ((owner > 0 ? owner : caster) == World.Self.EntityId) NoteOwnHit(target); else NoteOtherHit(owner > 0 ? owner : caster, target);
         if (_recentSkillHits.Count > 256)
@@ -1526,6 +1626,7 @@ public sealed class BotSession : IAsyncDisposable
         var duration = r.ReadFloat();
         var status = (CharacterStatusEffect)statusByte;
         var expires = duration > 0 ? DateTime.UtcNow.AddSeconds(duration) : DateTime.UtcNow.AddMinutes(60);
+        NoteDuelStatus(id, status, true);
         if (World.Entities.TryGetValue(id, out var e))
         {
             e.Statuses[status] = expires;
@@ -1543,6 +1644,7 @@ public sealed class BotSession : IAsyncDisposable
         var statusByte = r.ReadByte();
         var isRefresh = r.ReadBoolean();
         var status = (CharacterStatusEffect)statusByte;
+        if (!isRefresh) NoteDuelStatus(id, status, false);
         if (World.Entities.TryGetValue(id, out var e) && e.Statuses.Remove(status))
         {
             if (id == World.Self.EntityId && !isRefresh)
@@ -1679,11 +1781,13 @@ public sealed class BotSession : IAsyncDisposable
 
     private void ReadRemoveEntity(PacketReader r)
     {
-        if (!World.Entities.TryRemove(r.ReadInt32(), out var e) || !e.IsMonster || !r.HasUnreadData
-            || (CharacterRemovalReason)r.ReadByte() != CharacterRemovalReason.Dead)
+        var id = r.ReadInt32();
+        var reason = r.HasUnreadData ? (CharacterRemovalReason)r.ReadByte() : CharacterRemovalReason.OutOfSight;
+        NoteDuelTargetGone(id, reason == CharacterRemovalReason.Dead);
+        if (!World.Entities.TryRemove(id, out var e) || !e.IsMonster || reason != CharacterRemovalReason.Dead)
             return;
-        foreach (var (id, d) in World.RecentDeaths)
-            if (DateTime.UtcNow - d.At > TimeSpan.FromSeconds(5)) World.RecentDeaths.TryRemove(id, out _);
+        foreach (var (deadId, d) in World.RecentDeaths)
+            if (DateTime.UtcNow - d.At > TimeSpan.FromSeconds(5)) World.RecentDeaths.TryRemove(deadId, out _);
         e.State = CharacterState.Dead;
         World.RecentDeaths[e.Id] = (e, DateTime.UtcNow);
     }
@@ -1694,9 +1798,13 @@ public sealed class BotSession : IAsyncDisposable
         e.Hp = 0;
         e.State = CharacterState.Dead;
         if (id == World.Self.EntityId)
+        {
             Telemetry.Record(TelemetryEventType.Death, World.Self.Level, _lastAttackerName);
+            EndDuel(DuelOutcome.Died);
+        }
         else if (e.IsMonster)
         {
+            NoteDuelTargetGone(id, true);
             _lastDeadMonsterName = e.Name;
             _lastDeadMonsterAt = DateTime.UtcNow;
             _lastDeadMonsterId = id;

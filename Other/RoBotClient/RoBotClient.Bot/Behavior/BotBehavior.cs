@@ -494,6 +494,7 @@ public sealed partial class BotBehavior
         Mode = BotMode.Hunting;
         ResetStuck(snap.SelfPos, target.Hp); // start the progress clock for this target
         _bot.NoteForecast(target.Id, forecast.SecondsToKillMonster, forecast.AttacksToKill, forecast.ExpectedDamageTaken);
+        RecordDuelStart(snap, target, forecast);
         _nextAttack = DateTime.UtcNow.AddSeconds(3);
         _duel = new DuelStart(DateTime.UtcNow, snap.SelfHp, snap.SelfSp, target.Name);
         OnLog?.Invoke($"Engaging {target.Name} (hp {target.MaxHp}): my hit ~{forecast.MyDamagePerHit}@{forecast.MyHitChance:P0}, " +
@@ -2001,6 +2002,8 @@ public sealed partial class BotBehavior
 
     private sealed class Snapshot
     {
+        public Snapshot Clone() => (Snapshot)MemberwiseClone(); // shallow: the lists are read-only after From()
+
         public int SelfId;
         public Position SelfPos;
         public int SelfHp;

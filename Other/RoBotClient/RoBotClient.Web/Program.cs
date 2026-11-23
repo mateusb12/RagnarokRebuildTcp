@@ -49,6 +49,8 @@ builder.Services.AddSingleton(new BotLogStore(string.IsNullOrEmpty(repoRoBot) ? 
 
 // Per-character progression curve (playtime vs lifetime base exp) at bot-progress/<character>.jsonl.
 builder.Services.AddSingleton(new BotProgressStore(string.IsNullOrEmpty(repoRoBot) ? "" : Path.Combine(repoRoBot, "bot-progress")));
+// Every engagement's combat state, forecasts and outcome at bot-duels/<character>.jsonl (RoBotClient.Simulation.DuelValidator).
+builder.Services.AddSingleton(new RoBotClient.Simulation.DuelStore(string.IsNullOrEmpty(repoRoBot) ? Path.Combine(AppContext.BaseDirectory, "bot-duels") : Path.Combine(repoRoBot, "bot-duels")));
 
 // Per-character map move audit (predicted vs measured breakdown per move) at bot-map-audit/<character>.jsonl.
 builder.Services.AddSingleton(new MapAuditStore(string.IsNullOrEmpty(repoRoBot) ? "" : Path.Combine(repoRoBot, "bot-map-audit")));
