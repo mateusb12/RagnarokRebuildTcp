@@ -14,6 +14,7 @@ public sealed partial class BotBehavior
     private bool _kafraSaved;
     private KafraEntry? _saveKafra;
     private DateTime _saveDeadline, _nextSaveCheck;
+    private readonly Dictionary<(string, int, int), DateTime> _saveGaveUp = new();
 
     // The first settled position after a respawn is the save point.
     private void LearnSavePoint(Snapshot snap)
@@ -40,7 +41,7 @@ public sealed partial class BotBehavior
             : float.MaxValue;
 
     /// <summary>Drives a save-point detour when one is active or worth starting. True = handled this tick.</summary>
-    private async Task<bool> TickSavePointAsync(Snapshot snap, CancellationToken ct)
+    private async Task<bool> TickSavePointAsync(Snapshot snap, bool stuck, CancellationToken ct)
     {
         if (_saveKafra == null && !TryStartSaveTrip(snap)) return false;
         var k = _saveKafra!;
@@ -54,13 +55,17 @@ public sealed partial class BotBehavior
         }
         if (DateTime.UtcNow > _saveDeadline || IsKafraBlacklisted(k.Map, k.X, k.Y))
         {
-            OnLog?.Invoke($"Save point: gave up saving at the Kafra on {k.Map} (timed out).");
+            // Retrying the same Kafra at once repeated the same 5-minute timeout forever (Bot5: prontera → alberta, 8 maps).
+            _saveGaveUp[(k.Map, k.X, k.Y)] = DateTime.UtcNow.AddMinutes(30);
+            OnLog?.Invoke($"Save point: gave up saving at the Kafra on {k.Map} (timed out) — not trying it again for 30 min.");
             _saveKafra = null;
             ResetKafraStep();
             return false;
         }
         Mode = BotMode.Traveling;
         _targetId = 0;
+        // Like the travel branch: Bot5 stood still for 10 min on moc_fild03 with nothing logged, because this path never nudged.
+        if (stuck) { ResetStuck(snap.SelfPos); await NudgeAsync(snap, ct); return true; }
         if (!string.Equals(snap.Map, k.Map, StringComparison.OrdinalIgnoreCase))
             await StepTowardMapAsync(snap, k.Map, ct, (k.X, k.Y));
         else
@@ -80,6 +85,7 @@ public sealed partial class BotBehavior
         var current = RouteCost(_config.SavePointMap, _config.SavePointX, _config.SavePointY, home);
         // @Kafra NPCs (Save, Storage, Teleport...) put Teleport at option 2; @KafraNoSave ones can't save.
         var best = _data.Kafras.Where(k => k.TopMenuOption == 2 && !IsKafraBlacklisted(k.Map, k.X, k.Y)
+                                           && !(_saveGaveUp.TryGetValue((k.Map, k.X, k.Y), out var until) && DateTime.UtcNow < until)
                                            && !string.Equals(k.Map, _config.SavePointMap, StringComparison.OrdinalIgnoreCase))
             .Select(k => (Kafra: k, Cost: RouteCost(k.Map, k.X, k.Y, home)))
             .Where(c => c.Cost < float.MaxValue && RouteCost(snap.Map, snap.SelfPos.X, snap.SelfPos.Y, c.Kafra.Map) < float.MaxValue)

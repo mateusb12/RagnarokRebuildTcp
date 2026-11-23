@@ -373,7 +373,7 @@ public sealed partial class BotBehavior
         if (!defending && await TickAsFollowerAsync(snap, ct)) return;
 
         // Respawning far from the hunting map? Re-save at a Kafra closer to it first.
-        if (!defending && await TickSavePointAsync(snap, ct)) return;
+        if (!defending && await TickSavePointAsync(snap, stuck, ct)) return;
 
         // Travel to the hunting map if we're elsewhere (e.g. respawned in town).
         if (!defending && !string.IsNullOrEmpty(_config.HomeMap) &&
@@ -954,15 +954,27 @@ public sealed partial class BotBehavior
     {
         if (_data == null) return;
         var snap = _bot.WithState(Snapshot.From);
+        // Remembered for the whole visit: they can't move, and pricing only the ones in view made the A* route flip each
+        // time one came into or left view. Bot2 and Bot4 walked back and forth on beach_dun3 for hours (westward the
+        // Hydras came into view and the route turned east, eastward they left view and it turned back west).
+        if (_immobileMap != snap.Map) { _immobileMap = snap.Map; _immobileSeen.Clear(); }
         foreach (var m in snap.Monsters)
         {
             var db = _data.Monster(m.ClassId);
             if (!IsMonsterImmobile(db)) continue;
             var range = db?.Range ?? 0;
             if (range < 2) continue; // melee plant has no projectile zone worth detouring around
-            hzList.Add((m.Pos.X, m.Pos.Y, range + 1)); // +1: server range is rounded Euclidean, as in InOtherFixedReach
+            _immobileSeen[m.Id] = (m.Pos.X, m.Pos.Y, range + 1); // +1: server range is rounded Euclidean, as in InOtherFixedReach
         }
+        // Gone from a cell we can still see = killed.
+        foreach (var (id, z) in _immobileSeen)
+            if (Dist(snap.SelfPos, new Position(z.x, z.y)) <= ImmobileForgetDist && !snap.Monsters.Any(m => m.Id == id)) _immobileSeen.Remove(id);
+        hzList.AddRange(_immobileSeen.Values);
     }
+
+    private string? _immobileMap;
+    private readonly Dictionary<int, (int x, int y, int radius)> _immobileSeen = new();
+    private const int ImmobileForgetDist = 10; // well inside view range
 
     /// <summary>Look up DemonBane / BeastBane max-learned level from the bot's KnownSkills snapshot. The
     /// server adds (DemonBane*3) pre-DEF damage vs Demon/Undead and (BeastBane*5) vs Beast/Insect — see
@@ -1397,6 +1409,7 @@ public sealed partial class BotBehavior
     // Walk to a random nearby walkable cell to break out of a stuck position.
     private async Task NudgeAsync(Snapshot snap, CancellationToken ct)
     {
+        if (await EscapeConfinementAsync(snap, ct)) return;
         var self = snap.SelfPos;
         var map = _data?.GetWalkMap(snap.Map);
         for (var i = 0; i < 10; i++)
