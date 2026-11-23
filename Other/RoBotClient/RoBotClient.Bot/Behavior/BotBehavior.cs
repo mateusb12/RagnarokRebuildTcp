@@ -552,102 +552,36 @@ public sealed partial class BotBehavior
     /// <summary>Seconds of sitting to regenerate the HP the forecast says this fight costs (HuntPolicy.RestSeconds).</summary>
     private static double RestSeconds(Snapshot snap, BattleForecast f) => HuntPolicy.RestSeconds(snap.SelfMaxHp, snap.SelfVit, f.ExpectedDamageTaken);
 
+    /// <summary>The live side of HuntPolicy.PickTarget (the same rules the offline HuntSimulator picks by), plus the
+    /// bookkeeping only live has: the server-forecast decision record, the rest-to-win flag and the idle reason.</summary>
     private MonsterInfo? PickTarget(Snapshot snap, out BattleForecast chosen)
     {
-        chosen = default;
         _decision = null;
-        // ServerForecast On: the nearest few are decided by the server forecast when it's ready; ok is that decision,
-        // oldOk/oldScore what the old forecast alone would decide, to count where the two pick differently.
+        // ServerForecast On: the nearest few are decided by the server forecast when it's ready; the shadow pick is
+        // what the old forecast alone would choose, to count where the two pick differently.
         var shortlist = ServerShortlist(snap);
-        var candidates = new List<(double score, MonsterInfo m, BattleForecast f, string source, bool ok, double oldScore, bool oldOk, BattleForecast old)>();
-        // Solo, rank by expected exp per second (walk + fight) so the bot prefers efficient monsters over merely
-        // close ones. In a party, healing and shared exp change the math, so keep the nearest-first rule there.
-        var solo = !_bot.InParty;
-        int notHuntable = 0, avoided = 0, blacklisted = 0, hazardous = 0, unwinnable = 0, swarmed = 0, portalRisk = 0, noSafeCell = 0, winnableRested = 0;
-        foreach (var m in snap.Monsters)
+        var world = new LiveTargets(this, snap, shortlist);
+        var pick = HuntPolicy.PickTarget(snap.Monsters, world, _config, _data, snap.Map, wantShadow: shortlist != null);
+        chosen = pick.Forecast.Value;
+        if (shortlist != null) NoteServerPick(pick.Target, pick.ShadowTarget);
+        if (pick.Target is { } target)
         {
-            if (!IsHuntable(m)) { notHuntable++; continue; }
-            // Time-decayed avoidance: drop the entry once it's older than AvoidClassDuration so a fluke
-            // death doesn't permanently exclude a mob from the rotation.
-            if (_avoidClasses.TryGetValue(m.ClassId, out var avoidUntil))
-            {
-                if (DateTime.UtcNow >= avoidUntil) _avoidClasses.Remove(m.ClassId);
-                else { avoided++; continue; }
-            }
-            if (_unreachable.Contains(m.Id)) { blacklisted++; continue; }
-            if (ApproachNearHazard(snap, m.Pos, out var hzHit, out var hzWhere)) { hazardous++; NoteHazardReject(snap, m, hzHit, hzWhere); continue; } // in or near an aggressive monster's zone, or the walk there crosses one
-            // Portal safety: don't engage a mob standing on a portal apron, or the chase will warp us
-            // off the map mid-fight. Buffer is configurable via BotBehaviorConfig.PortalSafeDistance;
-            // 0 disables. Uses the existing GameDatabase.IsNearPortal check.
-            if (_config.PortalSafeDistance > 0 && _data != null
-                && _data.IsNearPortal(snap.Map, m.Pos.X, m.Pos.Y, _config.PortalSafeDistance))
-            { portalRisk++; continue; }
-            var old = WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m));
-            var source = "old";
-            var forecast = shortlist?.Contains(m.Id) == true ? DecisionForecast(snap, m, old, "pick", out source) : old;
-            if (SnipesFixed(snap, m) && FindFiringSpot(snap, m) == null) { noSafeCell++; continue; }
-            // Failsafe override: operator-set ForceHuntClassIds bypasses the forecast veto. The bot
-            // still consults the forecast (numbers go in the Engaging log), but the unwinnable gate
-            // and the group-swarm gate both yield to the override. Useful when the simulator under-
-            // estimates a fight (e.g. element gear it can't see, or until the kite FSM is on for a
-            // ranged build) and the operator wants the bot to commit anyway.
-            var forced = _config.ForceHuntClassIds.Contains(m.ClassId);
-            var ok = forced || forecast.CanWin;
-            var oldOk = forced || old.CanWin;
-            if (!ok)
-            {
-                unwinnable++;
-                if (snap.SelfHp < snap.SelfMaxHp)
-                {
-                    var hp = snap.SelfHp;
-                    snap.SelfHp = snap.SelfMaxHp;
-                    if (WithHealing(Forecast(snap, m), m.MaxHp, HealingOn(snap, m)).CanWin) winnableRested++;
-                    snap.SelfHp = hp;
-                }
-                if (!oldOk) continue;
-            }
-            var group = EngagementGroup(snap, m);
-            // One already hitting us isn't a pull: idling leaves it (and the pack) on us, so fight it if it's winnable 1v1.
-            if (!forced && group.Count > 1 && !_bot.HasHitMe(m.Id) && !ForecastGroupOf(snap, group).CanWin) { if (ok) swarmed++; continue; }
-            candidates.Add((Score(m, forecast), m, forecast, source, ok, Score(m, old), oldOk, old));
-        }
-
-        double Score(MonsterInfo m, BattleForecast f)
-        {
-            double score = Dist(snap.SelfPos, m.Pos);
-            if (solo) return -ExpPerSecond(snap, m, f, (int)score); // negated: candidates sort ascending
-            var mlvl = _data?.Monster(m.ClassId)?.Level ?? 0;
-            return mlvl > 0 && mlvl <= snap.SelfLevel - 15 ? score + 100 : score; // grey mob: poor exp, deprioritize
-        }
-
-        // Take the nearest target we can actually path to (A* over the walkmap). Checking reachability up
-        // front avoids committing to monsters behind walls and waiting on the stuck timeout to bail out.
-        candidates.Sort(static (a, b) => a.score.CompareTo(b.score));
-        var reachable = new Dictionary<int, bool>();
-        bool Reachable(MonsterInfo m) => reachable.TryGetValue(m.Id, out var r) ? r : reachable[m.Id] = IsReachable(snap, m.Pos);
-        MonsterInfo? OldPick() => candidates.Where(c => c.oldOk).OrderBy(c => c.oldScore).FirstOrDefault(c => Reachable(c.m)).m;
-        var unreachable = 0;
-        foreach (var c in candidates)
-        {
-            if (!c.ok) continue;
-            if (!Reachable(c.m)) { unreachable++; continue; }
-            chosen = c.f;
-            if (shortlist != null)
-            {
-                NoteServerPick(c.m, OldPick());
-                _decision = (c.source == "old" ? "old: not shortlisted" : c.source, c.old);
-            }
-            NotePostFleePick(snap, c.m);
+            if (shortlist != null && world.Sources[target.Id] is var (source, old))
+                _decision = (source == "old" ? "old: not shortlisted" : source, old);
+            NotePostFleePick(snap, target);
             _restToWin = false;
             _lastIdleReason = ""; // armed for the next idle window
             _idleSummary = "";
-            return c.m;
+            return target;
         }
 
         // No target. Log WHY (deduped — only fire when the reason string actually changes), so the user can
         // diagnose "FSM keeps the bot Idle" without enabling Verbose chat.
-        if (shortlist != null) NoteServerPick(null, OldPick());
-        _restToWin = winnableRested > 0;
+        _restToWin = world.WinnableRested > 0;
+        int N(TargetReject r) => world.Rejects[(int)r];
+        int notHuntable = N(TargetReject.NotHuntable), avoided = N(TargetReject.AvoidedClass), blacklisted = N(TargetReject.Blacklisted),
+            hazardous = N(TargetReject.Hazard), portalRisk = N(TargetReject.NearPortal), unwinnable = N(TargetReject.TooStrong),
+            swarmed = N(TargetReject.Swarm), noSafeCell = N(TargetReject.NoSafeCell), unreachable = N(TargetReject.Unreachable);
         var reason = $"PickTarget idle — {snap.Monsters.Count} mon in view (not-huntable={notHuntable}, avoided-class={avoided}, blacklisted={blacklisted}, in-hazard={hazardous}, near-portal={portalRisk}, unwinnable={unwinnable}, group-swarm={swarmed}, no-safe-cell={noSafeCell}, unreachable={unreachable}).";
         // Main reason for the stay log (time split): which filter dropped the most monsters in view.
         _idleCause = new (string Why, int Count)[] { ("not huntable", notHuntable), ("avoided class", avoided), ("blacklisted", blacklisted),
@@ -665,6 +599,72 @@ public sealed partial class BotBehavior
             OnLog?.Invoke(reason);
         }
         return null;
+    }
+
+    /// <summary>What HuntPolicy.PickTarget reads live: the session snapshot, the death-avoided classes (time-decayed on
+    /// the wall clock), the unreachable blacklist, hazards, the hand-formula or server forecast, fixed-monster firing
+    /// spots, group pulls and the hazard/portal-weighted A*.</summary>
+    private sealed class LiveTargets(BotBehavior b, Snapshot snap, HashSet<int>? shortlist) : ITargetWorld<MonsterInfo, BattleForecast>
+    {
+        public readonly int[] Rejects = new int[Enum.GetValues<TargetReject>().Length];
+        public int WinnableRested; // too strong now, winnable at full HP: rest first
+        public readonly Dictionary<int, (string Source, BattleForecast Old)> Sources = new();
+
+        public TargetSelf Self => new(!b._bot.InParty, snap.SelfLevel, snap.SelfMaxHp, snap.SelfVit, b._bot.SelfSecondsPerCell);
+
+        public TargetObservation Observe(MonsterInfo m)
+        {
+            var db = b._data?.Monster(m.ClassId);
+            return new(m.ClassId, db?.Exp ?? 0, db?.Level ?? 0, m.Hp, m.MaxHp, m.Pos.X, m.Pos.Y, Dist(snap.SelfPos, m.Pos));
+        }
+
+        public TargetReject? Excluded(MonsterInfo m)
+        {
+            // Time-decayed avoidance: drop the entry once it's older than AvoidClassDuration so a fluke
+            // death doesn't permanently exclude a mob from the rotation.
+            if (b._avoidClasses.TryGetValue(m.ClassId, out var avoidUntil))
+            {
+                if (DateTime.UtcNow >= avoidUntil) b._avoidClasses.Remove(m.ClassId);
+                else return TargetReject.AvoidedClass;
+            }
+            if (b._unreachable.Contains(m.Id)) return TargetReject.Blacklisted;
+            // In or near an aggressive monster's zone, or the walk there crosses one.
+            if (b.ApproachNearHazard(snap, m.Pos, out var hzHit, out var hzWhere)) { b.NoteHazardReject(snap, m, hzHit, hzWhere); return TargetReject.Hazard; }
+            return null;
+        }
+
+        public (TargetForecast<BattleForecast> Decision, TargetForecast<BattleForecast> Shadow)? Forecast(MonsterInfo m)
+        {
+            var old = WithHealing(b.Forecast(snap, m), m.MaxHp, b.HealingOn(snap, m));
+            var source = "old";
+            var forecast = shortlist?.Contains(m.Id) == true ? b.DecisionForecast(snap, m, old, "pick", out source) : old;
+            Sources[m.Id] = (source, old);
+            return (View(forecast), View(old));
+        }
+
+        private static TargetForecast<BattleForecast> View(BattleForecast f) => new(f, f.CanWin, f.SecondsToKillMonster, f.ExpectedDamageTaken);
+
+        public bool NoSafeCell(MonsterInfo m) => b.SnipesFixed(snap, m) && b.FindFiringSpot(snap, m) == null;
+
+        // One already hitting us isn't a pull: idling leaves it (and the pack) on us, so fight it if it's winnable 1v1.
+        public bool PullsLosingGroup(MonsterInfo m)
+        {
+            var group = b.EngagementGroup(snap, m);
+            return group.Count > 1 && !b._bot.HasHitMe(m.Id) && !b.ForecastGroupOf(snap, group).CanWin;
+        }
+
+        // Checking reachability up front avoids committing to monsters behind walls and waiting on the stuck timeout.
+        public bool Reachable(MonsterInfo m) => b.IsReachable(snap, m.Pos);
+
+        public void Rejected(MonsterInfo m, TargetReject why)
+        {
+            Rejects[(int)why]++;
+            if (why != TargetReject.TooStrong || snap.SelfHp >= snap.SelfMaxHp) return;
+            var hp = snap.SelfHp;
+            snap.SelfHp = snap.SelfMaxHp;
+            if (WithHealing(b.Forecast(snap, m), m.MaxHp, b.HealingOn(snap, m)).CanWin) WinnableRested++;
+            snap.SelfHp = hp;
+        }
     }
 
     // True if the bot can walk to a cell next to the target (bounded A* over the walkmap). With no walkmap
@@ -1201,14 +1201,7 @@ public sealed partial class BotBehavior
             _config.WinMargin, _config.MaxRoundsToKill);
     }
 
-    private bool IsHuntable(MonsterInfo m)
-    {
-        if (m.MaxHp > 0 && m.Hp <= 0) return false;
-        if (_config.IgnoreClassIds.Contains(m.ClassId)) return false;
-        if (_config.HuntClassIds.Count > 0 && !_config.HuntClassIds.Contains(m.ClassId)) return false;
-        if (_config.MaxTargetHp > 0 && m.MaxHp > _config.MaxTargetHp) return false;
-        return true;
-    }
+    private bool IsHuntable(MonsterInfo m) => HuntPolicy.IsHuntable(_config, m.ClassId, m.Hp, m.MaxHp);
 
     // ---- movement ----
 
@@ -1487,18 +1480,17 @@ public sealed partial class BotBehavior
     // a monster comes within reach (sitting is cancelled on taking damage anyway), or a heal item appears.
     private async Task<bool> TickRestAsync(Snapshot snap, CancellationToken ct)
     {
-        var hpPct = snap.SelfMaxHp > 0 ? (double)snap.SelfHp / snap.SelfMaxHp : 1.0;
-        // SP only matters to bots that kill with spells. A Thief out of SP for Envenom just keeps stabbing.
-        var spPct = snap.SelfMaxSp > 0 && KillsWithSpells(snap) ? (double)snap.SelfSp / snap.SelfMaxSp : 1.0;
+        // The sit/stand rules are HuntPolicy's, shared with the offline HuntSimulator.
+        var f = HuntPolicy.RestFractions(_config, snap.SelfJobId, snap.SelfHp, snap.SelfMaxHp, snap.SelfSp, snap.SelfMaxSp);
+        // Only a monster that will attack ends the rest: a passive Horn wandering by used to stand Bot3 up at low HP.
+        var threatened = AnyAdjacentMonster(snap, aggressiveOnly: true) || _hazards.Count > 0;
 
         if (_resting)
         {
-            var recovered = hpPct >= 0.95 && spPct >= 0.95;
-            // Only a monster that will attack ends the rest: a passive Horn wandering by used to stand Bot3 up at low HP.
             // HP only climbs while sitting, so any drop means something (a provoked passive mob) is hitting us.
             var hit = snap.SelfHp < _restHp;
             _restHp = snap.SelfHp;
-            if ((!_config.RestWhenNoPotions && !_restToWin) || recovered || hit || AnyAdjacentMonster(snap, aggressiveOnly: true) || _hazards.Count > 0)
+            if (HuntPolicy.ShouldStand(_config, f, _restToWin, hit, threatened))
             {
                 _resting = false;
                 _restToWin = false;
@@ -1516,9 +1508,9 @@ public sealed partial class BotBehavior
 
         // Resting to win: something in view is beatable at full HP but not as hurt as we are. Sitting is free, while
         // wandering at 77% HP turned every Spore on pay_fild02 into "too strong" (81 s searching per kill).
-        var wantRest = _config.RestWhenNoPotions && (hpPct < _config.RestBelowPercent || spPct < _config.RestBelowPercent);
+        var wantRest = HuntPolicy.LowOnHpSp(_config, f);
         // Never sit with a monster we can't beat in view (Bot3 sat down among Greatest Generals on moc_fild03).
-        if (!(wantRest || _restToWin) || !CanSit(snap) || AnyAdjacentMonster(snap, aggressiveOnly: true) || _hazards.Count > 0) return false;
+        if (!HuntPolicy.ShouldSit(_config, f, _restToWin, CanSit(snap), threatened)) return false;
 
         _resting = true;
         _restHp = snap.SelfHp;
@@ -1531,22 +1523,13 @@ public sealed partial class BotBehavior
         return true;
     }
 
-    // A Novice (job 0) needs Basic Mastery level 2 to sit; everyone else always can.
-    private bool _restToWin;
+    private bool _restToWin; // the last target pick found fights we'd win at full HP but not now
     private int _restHp;
 
-    private bool KillsWithSpells(Snapshot snap) => _config.NoAutoAttack || snap.SelfJobId is 3 or 8 or 14; // Mage, Wizard, Sage // the last target pick found fights we'd win at full HP but not now
+    private bool KillsWithSpells(Snapshot snap) => HuntPolicy.KillsWithSpells(_config, snap.SelfJobId);
 
-    private bool CanSit(Snapshot snap)
-    {
-        if (snap.SelfJobId != 0) return true;
-        return _bot.WithState(w =>
-        {
-            foreach (var k in w.Self.KnownSkills)
-                if (k.Skill == CharacterSkill.BasicMastery && k.Level >= 2) return true;
-            return false;
-        });
-    }
+    private bool CanSit(Snapshot snap) => snap.SelfJobId != 0 || HuntPolicy.CanSit(0, _bot.WithState(w =>
+        w.Self.KnownSkills.Where(k => k.Skill == CharacterSkill.BasicMastery).Select(k => (int)k.Level).DefaultIfEmpty(0).Max()));
 
     private bool AnyAdjacentMonster(Snapshot snap, int range = 3, bool aggressiveOnly = false)
     {

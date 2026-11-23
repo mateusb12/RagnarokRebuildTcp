@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using Lidgren.Network;
 using RebuildSharedData.Data;
 using RebuildSharedData.Enum;
@@ -12,10 +13,12 @@ using RoRebuildServer.Simulation.Util;
 using RoRebuildServer.Data;
 using RoRebuildServer.EntityComponents;
 using RoRebuildServer.EntityComponents.Character;
+using RoRebuildServer.EntityComponents.Util;
 using RoRebuildServer.EntitySystem;
 using RoRebuildServer.Networking;
 using RoRebuildServer.Networking.PacketHandlers.Character;
 using RoRebuildServer.Simulation;
+using RoRebuildServer.Simulation.Pathfinding;
 using RoRebuildServer.Simulation.Skills;
 using RoRebuildServer.Simulation.Skills.SkillHandlers;
 
@@ -38,10 +41,22 @@ public sealed class SkillLedger
     public long Healed;          // HP the caster gained when it executed
     public readonly Dictionary<string, int> StatusesApplied = new(); // "self+IncreaseAgi", "target+Provoke", "area+..."
     public readonly Dictionary<string, int> Rejected = new();        // SkillError results the server sent, by reason
-    public string? Blocked;      // the server code threw: the world capability it needed
+    // World events (server Npc events: ground effects, walls, traps...) this skill's execution created, children included.
+    public int WorldEvents;
+    public readonly Dictionary<string, int> EventKinds = new();      // by the server's event behaviour class
+    public int EventsEnded;
+    public double EventSeconds;  // summed lifetime of the ended ones, on the virtual clock
+    public int Knockbacks;       // monsters the server's damage path moved on the walk data
+    // A failure: server code threw. The first one is kept as evidence; the skill is not offered again after it.
+    public string? Blocked;      // what failed: exception, the server frames that ran it
+    public string? BlockedStage; // what the simulator was doing: the cast, or a world frame running its events
+    public double BlockedAt;
+    public int Failures;
+    public int SuppressedPicks;  // later decisions where the live rule engine picked this skill but it was withheld
+    public readonly List<string> RolledBack = new(); // player state a failed call had changed and that was put back
 }
 
-/// <param name="Outcome">1 target killed, -1 the player died, 0 time ran out.</param>
+/// <param name="Outcome">1 target killed, -1 the player died, 0 time ran out, 2 the target got out of straight-line reach.</param>
 /// <param name="Killed">Every monster that died in the encounter (the target and anything area damage finished).</param>
 public sealed record EncounterResult(int Outcome, double Seconds, int DamageTaken, int Actions, int SkillActions, IReadOnlyList<int> Killed);
 
@@ -70,10 +85,22 @@ public readonly record struct PlayerChoice(CharacterSkill Skill, byte[]? Packet,
 ///   next action slot, the target's next swing);
 /// - the monster's side: only the current target swings back (CombatEntity.PerformMeleeAttack on the interval
 ///   ApplyCooldownForAttackAction gives it), monsters don't move, cast skills or assist;
-/// - damage on monsters is subtracted here (ApplyQueuedCombatResult would run Monster.Die: rewards, drops, respawn);
-///   damage on the player goes through the server's UpdateDamageQueue unless it is lethal (Player.Die is not run).
-/// When server code throws (a world capability this slice doesn't have: World entity creation, NPC effects...) the
-/// skill is marked Blocked with the failing server frame and is not offered again.
+/// - damage goes through the server's UpdateDamageQueue (status reactions, knockback on the walk data, cast
+///   interruption) unless it is lethal: Monster.Die (rewards, drops, respawn) and Player.Die are not run;
+/// - a knocked-back target is walked back into attack range in a straight line at the player's move speed (the live
+///   server walks the player through TargetForAttack's path; monster AI, which would walk it back, is not run).
+/// World events (ground effects, walls, traps, the area of effect they register) are the server's own: a handler calls
+/// World.CreateEvent, the event's behaviour class runs its InitEvent/OnTimer/OnAoEInteraction, AreaOfEffect ticks in
+/// Map.Update, and Npc.EndEvent/World.FullyRemoveEntity clean them up. What this class supplies is the server frame
+/// those need: while any event lives, every 10 ms of virtual time (ZoneWorker's frame) it runs what Instance.Update and
+/// World.Update run for them (Instance.DoRemovals, Map.Update, WorldObject.Update per event entity, World.PerformRemovals).
+/// The process-wide World is a constructor-less stand-in (a real one loads every map and NPC), so its empty containers
+/// are filled once (see CompleteWorld) and the map gets an Instance stand-in holding only its event entity list.
+///
+/// When server code throws (a world capability this slice still lacks) the player's SP/HP/statuses are put back to
+/// what they were before the call, objects it created are ended, and the failure is booked with its evidence (skill,
+/// stage, server frames, time). The skill is not offered again; the report marks the run INCOMPLETE and counts the
+/// decisions where the live rule engine would still have picked it.
 /// </summary>
 public sealed class ServerWorld
 {
@@ -87,6 +114,20 @@ public sealed class ServerWorld
         .GetMethod("PerformAttack", BindingFlags.NonPublic | BindingFlags.Instance)!.CreateDelegate<Func<Player, WorldObject, bool>>();
     private static readonly Action<Player> UpdateWithQueuedCast = typeof(Player)
         .GetMethod("UpdateWithQueuedCast", BindingFlags.NonPublic | BindingFlags.Instance)!.CreateDelegate<Action<Player>>();
+    private static readonly Action<Instance> DoRemovals = typeof(Instance)
+        .GetMethod("DoRemovals", BindingFlags.NonPublic | BindingFlags.Instance)!.CreateDelegate<Action<Instance>>();
+    private const double FrameSeconds = 0.01; // ZoneWorker runs world.Update every 10 ms
+    private static readonly Action<Player> UpdateRegenTick = typeof(Player)
+        .GetMethod("UpdateRegenTick", BindingFlags.NonPublic | BindingFlags.Instance)!.CreateDelegate<Action<Player>>();
+    // ponytail: Player.Update's timers run in slices of at most this; a regen tick (6 s, 3 s sitting) lands up to a slice late.
+    private const double TimerSliceSeconds = 0.25;
+    private bool _walking;
+    private static readonly FieldInfo ActiveAoEChunksField = typeof(Map).GetField("ActiveAoEChunks", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+    private readonly Instance _instance;
+    private double _nextFrame = double.PositiveInfinity;
+    // Live server event entities -> the skill whose execution created them (children inherit the parent's skill).
+    private readonly Dictionary<Entity, (CharacterSkill Skill, double Born, string Kind)> _events = new();
 
     private readonly Map _map;
     private readonly Player _player;
@@ -94,6 +135,7 @@ public sealed class ServerWorld
     private readonly Random _random;
     private readonly Dictionary<int, Monster> _monsters = new();
     private readonly PacketSkill _skillPacketHandler = new();
+    private readonly PacketSitStand _sitStandHandler = new();
 
     public readonly Dictionary<CharacterSkill, SkillLedger> Skills = new();
     public double Clock { get; private set; }
@@ -104,6 +146,10 @@ public sealed class ServerWorld
     public int MaxHp => _player.CombatEntity.GetStat(CharacterStat.MaxHp);
     public int Sp => _player.CombatEntity.GetStat(CharacterStat.Sp);
     public int MaxSp => _player.CombatEntity.GetStat(CharacterStat.MaxSp);
+    public bool Sitting => _player.Character.State == CharacterState.Sitting;
+    /// <summary>HP and SP the server's own regen (Player.UpdateRegenTick) gave the player so far.</summary>
+    public long RegenHp { get; private set; }
+    public long RegenSp { get; private set; }
     /// <summary>The player's current attack delay: what the live server sends the bot, buffs included.</summary>
     public double AttackDelay => _player.GetTiming(TimingStat.AttackDelayTime);
 
@@ -136,8 +182,12 @@ public sealed class ServerWorld
             var configs = DataManager.MapConfigs;
             DataManager.MapConfigs = new ReadOnlyDictionary<string, Action<IServerMapConfig>>(
                 configs.Where(c => !string.Equals(c.Key, mapName, StringComparison.OrdinalIgnoreCase)).ToDictionary(c => c.Key, c => c.Value));
-            try { _map = new Map(World.Instance, null!, mapName, mapName + ".walk", false); }
+            CompleteWorld(World.Instance);
+            _instance = NewInstance(mapName);
+            var canTeleport = DataManager.Maps.FirstOrDefault(m => m.Code == mapName)?.MapMode != "Indoor"; // as Instance's constructor
+            try { _map = new Map(World.Instance, _instance, mapName, mapName + ".walk", canTeleport); }
             finally { DataManager.MapConfigs = configs; }
+            _instance.Maps.Add(_map);
 
             _player = DuelSimulator.CreatePlayer(build);
             _player.Character.Position = new Position(x, y);
@@ -187,6 +237,16 @@ public sealed class ServerWorld
         }
     }
 
+    /// <summary>Where the server has the player now (its own skills can move it: Back Slide, Teleport, walking into range).</summary>
+    public (int X, int Y) PlayerPosition => (_player.Character.Position.X, _player.Character.Position.Y);
+
+    /// <summary>Where the server has the monster now (knockback moves it).</summary>
+    public (int X, int Y) MonsterPosition(int id) =>
+        _monsters.TryGetValue(id, out var m) ? (m.Character.Position.X, m.Character.Position.Y) : (0, 0);
+
+    /// <summary>Server event entities alive now (ground effects, wall pieces...).</summary>
+    public int LiveEvents => _events.Count;
+
     public (int Hp, int MaxHp) MonsterHp(int id) =>
         _monsters.TryGetValue(id, out var m) ? (m.CombatEntity.GetStat(CharacterStat.Hp), m.CombatEntity.GetStat(CharacterStat.MaxHp)) : (0, 0);
 
@@ -209,7 +269,7 @@ public sealed class ServerWorld
         }
     }
 
-    /// <summary>The recovery stand-in (no recovery model yet): HP and SP back to full, statuses kept.</summary>
+    /// <summary>Full HP and SP: a character entering the map, and the death stand-in (Revive).</summary>
     public void Restore()
     {
         lock (ServerCombatRuntime.Gate)
@@ -232,24 +292,70 @@ public sealed class ServerWorld
         }
     }
 
-    /// <summary>Time passes outside a fight (walking): the player's status effects keep running (and expiring) on the
-    /// server's own update, every 0.25 s while there are any.</summary>
-    public void Advance(double until)
+    /// <summary>Sends the client's sit/stand packet (BotSession.SitStandPacket) to the server's PacketSitStand; returns
+    /// whether the player sits afterwards (the server refuses within its input delay, mid-cast, a Novice without Basic
+    /// Mastery 2...).</summary>
+    public bool SitStand(byte[] packet, int length)
     {
-        if (until < Clock - 1e-9) throw new InvalidOperationException($"clock going back: {Clock} -> {until}");
         lock (ServerCombatRuntime.Gate)
         {
             Enter();
-            var self = _player.CombatEntity;
-            while (self.TryGetStatusContainer(out _) && Clock + StatusTickSeconds <= until)
-            {
-                SetClock(Clock + StatusTickSeconds);
-                Observe(CharacterSkill.None, null, () => self.Update());
-                if (self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0) self.SetStat(CharacterStat.Hp, 1); // ponytail: a walk-time death is kept alive at 1 HP
-            }
-            SetClock(until);
+            Receive(packet, length);
             ServerCombatRuntime.ResetPacketQueue();
+            return Sitting;
         }
+    }
+
+    /// <summary>Time passes outside a fight (walking, or sitting): the player's status effects keep running (and
+    /// expiring) on the server's own update every 0.25 s while there are any, world events keep running on server frames
+    /// (a ground effect left behind can still hit monsters), and the server's regen ticks (as every SetClock).
+    /// <paramref name="walking"/>: the time was spent walking, which the server's regen reads as CharacterState.Moving.
+    /// Returns the monsters that died meanwhile.</summary>
+    public IReadOnlyList<int> Advance(double until, bool walking = false)
+    {
+        if (until < Clock - 1e-9) throw new InvalidOperationException($"clock going back: {Clock} -> {until}");
+        var killed = new List<int>();
+        lock (ServerCombatRuntime.Gate)
+        {
+            Enter();
+            _walking = walking;
+            try { AdvanceTo(until, killed); }
+            finally { _walking = false; }
+        }
+        return killed;
+    }
+
+    private void AdvanceTo(double until, List<int> killed)
+    {
+        var self = _player.CombatEntity;
+        var nextTick = Clock + StatusTickSeconds;
+        while (true)
+        {
+            var tick = self.TryGetStatusContainer(out _) ? nextTick : double.PositiveInfinity;
+            var landing = EarliestLanding();
+            var t = Math.Max(Clock, Math.Min(Math.Min(tick, _nextFrame), landing));
+            if (t > until) break;
+            SetClock(t);
+            if (landing <= t)
+            {
+                foreach (var (id, monster) in _monsters.ToList())
+                {
+                    if (monster.CombatEntity.DamageQueue.Count == 0) continue;
+                    LandOnMonster(monster, out var killedBy);
+                    if (monster.CombatEntity.GetStat(CharacterStat.Hp) > 0) continue;
+                    killed.Add(id);
+                    if (killedBy != CharacterSkill.None) Ledger(killedBy).KillingBlows++;
+                    RemoveMonster(id);
+                }
+                if (self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0) self.SetStat(CharacterStat.Hp, 1); // ponytail: a walk-time death is kept alive at 1 HP
+                continue;
+            }
+            if (_nextFrame <= t) { Frame(); continue; }
+            nextTick = t + StatusTickSeconds;
+            Observe(CharacterSkill.None, null, () => self.Update());
+        }
+        SetClock(until);
+        ServerCombatRuntime.ResetPacketQueue();
     }
 
     // ---- one encounter ----
@@ -277,14 +383,15 @@ public sealed class ServerWorld
 
             while (outcome == 0)
             {
+                if (double.IsPositiveInfinity(nextTick) && HasStatuses()) nextTick = Clock + StatusTickSeconds; // a status gained mid-fight starts ticking
                 var landing = EarliestLanding();
                 var castDone = self.IsCasting ? self.CastingTime + Epsilon : double.PositiveInfinity;
                 var ready = self.IsCasting ? double.PositiveInfinity : Math.Max(_player.Character.AttackCooldown, holdUntil) + Epsilon;
-                var t = Math.Max(Clock, Math.Min(Math.Min(landing, castDone), Math.Min(Math.Min(ready, nextMonster), nextTick)));
+                var t = Math.Max(Clock, Math.Min(Math.Min(Math.Min(landing, castDone), _nextFrame), Math.Min(Math.Min(ready, nextMonster), nextTick)));
                 if (t - start > maxSeconds) { SetClock(start + maxSeconds); break; } // cut off: time still passes to the limit
                 if (++steps > 100_000) // a fight is hundreds of events; this many means one isn't consuming itself
                     throw new InvalidOperationException($"encounter stuck at {t:F3}s: landing {landing:F3}, cast {castDone:F3}, ready {ready:F3}, "
-                        + $"monster {nextMonster:F3}, tick {nextTick:F3}, queued {_player.Character.QueuedAction}, player queue {self.DamageQueue.Count}, pending {pending}");
+                        + $"monster {nextMonster:F3}, tick {nextTick:F3}, frame {_nextFrame:F3}, queued {_player.Character.QueuedAction}, player queue {self.DamageQueue.Count}, pending {pending}");
                 SetClock(t);
 
                 if (landing <= t)
@@ -302,6 +409,12 @@ public sealed class ServerWorld
                         if (id == targetId) outcome = 1;
                     }
                     if (outcome == 0 && self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0) outcome = -1;
+                    continue;
+                }
+
+                if (_nextFrame <= t)
+                {
+                    Frame(); // world events: their timers, area-of-effect ticks, expiry
                     continue;
                 }
 
@@ -352,14 +465,31 @@ public sealed class ServerWorld
                         // Rejected, queued or blocked: the live bot's auto-attack carries on (the server keeps swinging
                         // while a cast waits out the after-cast delay).
                     }
+                    var range = Math.Max(1, self.GetStat(CharacterStat.Range));
+                    var steps2 = StepsIntoRange(target.Character.Position, range);
+                    if (steps2 == 0 && DistanceCache.IntDistance(_player.Character.Position, target.Character.Position) > range)
+                    {
+                        OnEvent?.Invoke($"target out of reach and the straight line is blocked: fight abandoned (pathing back is not simulated)");
+                        outcome = 2;
+                        break;
+                    }
+                    if (steps2 > 0)
+                    {
+                        // ponytail: straight-line approach at MoveSpeed per cell; the live server paths the walk (TargetForAttack)
+                        OnEvent?.Invoke($"target out of reach ({DistanceCache.IntDistance(_player.Character.Position, target.Character.Position)} > {range}): walking {steps2} cells");
+                        holdUntil = t + steps2 * _player.Character.MoveSpeed;
+                        continue;
+                    }
                     if (!PerformAttack(_player, target.Character))
                         throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position}");
                     actions++;
                     continue;
                 }
 
-                // The target's swing (it only fights back once hit, and not while disabled).
-                if (enemy.GetStat(CharacterStat.Disabled) > 0 || !target.Character.StateCanAttack)
+                // The target's swing (it only fights back once hit, not while disabled, and only within its own reach:
+                // monsters don't walk here, so a player knocked, slid or teleported away is out of it).
+                if (enemy.GetStat(CharacterStat.Disabled) > 0 || !target.Character.StateCanAttack || !self.IsValidTarget(enemy)
+                    || DistanceCache.IntDistance(target.Character.Position, _player.Character.Position) > Math.Max(1, target.MonsterBase.Range))
                 {
                     nextMonster = t + StatusTickSeconds;
                     continue;
@@ -389,8 +519,9 @@ public sealed class ServerWorld
     {
         var message = new InboundMessage(_connection, packet, length);
         var type = (PacketType)message.ReadByte();
-        if (type != PacketType.Skill) throw new ArgumentException($"not a skill packet: {type}");
-        _skillPacketHandler.Process(_connection, message);
+        if (type == PacketType.Skill) _skillPacketHandler.Process(_connection, message);
+        else if (type == PacketType.SitStand) _sitStandHandler.Process(_connection, message);
+        else throw new ArgumentException($"not a skill or sit/stand packet: {type}");
     }
 
     /// <summary>Runs server code that may execute <paramref name="skill"/> and books what it observably did.</summary>
@@ -405,15 +536,23 @@ public sealed class ServerWorld
         {
             serverCall();
         }
-        catch (Exception e) when (skill != CharacterSkill.None)
+        catch (Exception e)
         {
-            var ledger = Ledger(skill);
-            ledger.Blocked ??= Describe(e);
-            OnEvent?.Invoke($"{skill}: BLOCKED, {ledger.Blocked}");
+            // Put back what the failed call already did to the player, and end what it created in the world: a
+            // missing capability must not cost or grant anything.
+            var undone = new List<string>();
+            if (Sp != sp) { undone.Add($"SP {Sp}->{sp}"); self.SetStat(CharacterStat.Sp, sp); }
+            if (Hp != hp) { undone.Add($"HP {Hp}->{hp}"); self.SetStat(CharacterStat.Hp, hp); }
+            foreach (var s in StatusSet(self).Except(selfBefore)) { self.RemoveStatusOfTypeIfExists(s); undone.Add($"status {s} removed"); }
+            if (_player.Character.AttackCooldown != cooldown) { _player.Character.AttackCooldown = cooldown; undone.Add("attack delay restored"); }
+            undone.AddRange(EndNewEvents());
             self.CancelCast(true);
             _player.Character.QueuedAction = QueuedAction.None;
+            DrainPackets();
+            Fail(skill != CharacterSkill.None ? skill : SoleEventSkill(), skill != CharacterSkill.None ? "cast/execute" : "status tick", e, undone);
             return Effect.Blocked;
         }
+        TrackNewEvents(skill);
         var errors = DrainPackets();
         if (skill == CharacterSkill.None) return Effect.None;
         var book = Ledger(skill);
@@ -459,39 +598,285 @@ public sealed class ServerWorld
     /// <summary>The server's handler declares the skill passive (applied through the stat pipeline, never cast).</summary>
     public static bool IsPassive(CharacterSkill skill) => SkillHandler.GetSkillAttributes(skill).SkillTarget == SkillTarget.Passive;
 
+    /// <summary>The exception and the server frames it went through, innermost first: the operation that failed, then
+    /// who called it (the event behaviour, the skill handler...).</summary>
     private static string Describe(Exception e)
     {
-        var frame = new StackTrace(e).GetFrames().Select(f => f.GetMethod()).FirstOrDefault(m => m?.DeclaringType?.Namespace?.StartsWith("RoRebuildServer") == true);
-        return $"{e.GetType().Name} in {frame?.DeclaringType?.Name}.{frame?.Name}: {e.Message}";
+        var frames = new StackTrace(e).GetFrames().Select(f => f.GetMethod())
+            .Where(m => m?.DeclaringType?.Namespace?.StartsWith("RoRebuildServer") == true)
+            .Select(m => $"{m!.DeclaringType!.Name}.{m.Name}").Distinct().Take(4).ToList();
+        return $"{e.GetType().Name} in {string.Join(" <- ", frames)}: {e.Message}";
     }
 
+    /// <summary>Damage due on a monster, booked to the skill that dealt it, then applied by the server's own
+    /// UpdateDamageQueue (status reactions, knockback over the walk data, area effects re-triggered by the move) unless
+    /// it is lethal, as Monster.Die (rewards, drops, respawn) is not run.</summary>
     private int LandOnMonster(Monster monster, out CharacterSkill killedBy)
     {
         killedBy = CharacterSkill.None;
         var combat = monster.CombatEntity;
         var hp = combat.GetStat(CharacterStat.Hp);
+        var left = hp;
         var total = 0;
-        for (var i = 0; i < combat.DamageQueue.Count; i++)
+        var pusher = CharacterSkill.None;
+        foreach (var d in combat.DamageQueue)
         {
-            var d = combat.DamageQueue[i];
-            if (d.Time > Time.ElapsedTimeFloat) continue;
-            combat.DamageQueue.RemoveAt(i--);
-            if (!d.IsDamageResult) continue;
+            if (d.Time > Time.ElapsedTimeFloat || !d.IsDamageResult) continue;
             var damage = d.Damage * Math.Max(1, (int)d.HitCount) + Math.Max(0, (int)d.DamageOffHand);
             total += damage;
-            hp -= damage;
+            left -= damage;
+            if ((d.KnockBack > 0 || pusher == CharacterSkill.None) && d.AttackSkill != CharacterSkill.None) pusher = d.AttackSkill; // knockback's skill, else the first skill
             if (d.AttackSkill != CharacterSkill.None)
             {
                 var book = Ledger(d.AttackSkill);
                 book.Damage += damage;
                 book.Hits++;
             }
-            if (hp <= 0 && killedBy == CharacterSkill.None) killedBy = d.AttackSkill;
+            if (left <= 0 && killedBy == CharacterSkill.None) killedBy = d.AttackSkill;
         }
-        combat.SetStat(CharacterStat.Hp, Math.Max(0, hp));
+        if (left <= 0)
+        {
+            combat.SetStat(CharacterStat.Hp, 0);
+            combat.DamageQueue.Clear();
+        }
+        else
+        {
+            var from = monster.Character.Position;
+            Time.ElapsedTimeFloat += (float)Epsilon; // UpdateDamageQueue applies what is strictly due
+            try
+            {
+                combat.UpdateDamageQueue();
+            }
+            catch (Exception e)
+            {
+                // The damage itself is certain (booked above); what the server failed to do around it (knockback,
+                // reactions) is reported. The HP loss is applied without it and the rest of the due entries dropped.
+                combat.SetStat(CharacterStat.Hp, left);
+                combat.DamageQueue.RemoveAll(d => d.Time <= Time.ElapsedTimeFloat);
+                Fail(pusher != CharacterSkill.None ? pusher : killedBy, $"damage landing on {monster.Character.Name} (UpdateDamageQueue)", e,
+                    new List<string> { $"{monster.Character.Name} HP set to {left} without the failed step" });
+            }
+            finally { Time.ElapsedTimeFloat = (float)Clock; }
+            var to = monster.Character.Position;
+            if (from != to)
+            {
+                if (pusher != CharacterSkill.None) Ledger(pusher).Knockbacks++;
+                OnEvent?.Invoke($"{(pusher != CharacterSkill.None ? pusher : "hit")}: {monster.Character.Name} knocked back {from} -> {to}");
+            }
+        }
         if (total > 0) DuelSimulator.MonsterLastDamageField.SetValue(monster, Time.ElapsedTimeFloat);
         return total;
     }
+
+    /// <summary>Cells the player walks in a straight line (walkable cells only) to get within range of the target.</summary>
+    private int StepsIntoRange(Position target, int range)
+    {
+        var p = _player.Character.Position;
+        var steps = 0;
+        while (DistanceCache.IntDistance(p, target) > range)
+        {
+            var next = new Position(p.X + Math.Sign(target.X - p.X), p.Y + Math.Sign(target.Y - p.Y));
+            if (!_map.WalkData.IsCellWalkable(next.X, next.Y)) break;
+            p = next;
+            steps++;
+        }
+        if (steps > 0) _map.ChangeEntityPosition3(_player.Character, _player.Character.WorldPosition, p, false);
+        return steps;
+    }
+
+    // ---- world events: the server frame they need ----
+
+    /// <summary>The process-wide World stand-in had no constructor run, so no field initializer either: give every
+    /// empty container field an empty instance (entity lock, AoE lock, removal bag...), then the AoE pool and id range
+    /// the constructor sets. No maps, NPCs or instances are loaded.</summary>
+    private static void CompleteWorld(World world)
+    {
+        var pool = typeof(World).GetField("<AoEPool>k__BackingField", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        if (pool.GetValue(world) != null) return;
+        DistanceCache.Init(); // the server's startup (ZoneWorker.Initialize) builds it before the world: knockback, ranges
+        FillEmpty(world);
+        var poolType = pool.FieldType.Assembly.GetType("Microsoft.Extensions.ObjectPool.DefaultObjectPool`1")!.MakeGenericType(typeof(AreaOfEffect));
+        pool.SetValue(world, Activator.CreateInstance(poolType, new AreaOfEffectPoolPolicy(), 128));
+        typeof(World).GetField("maxEntityId", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(world, 10_000_000);
+    }
+
+    /// <summary>The map's Instance, as far as world events use it: the entity list CreateEvent adds to (Map.AddEntity)
+    /// and the removal list FullyRemoveEntity feeds. Its constructor would build and populate every map of the instance.
+    /// Players and monsters here are added with addToInstance false, so the list holds only events.</summary>
+    private static Instance NewInstance(string mapName)
+    {
+        var instance = (Instance)RuntimeHelpers.GetUninitializedObject(typeof(Instance));
+        instance.Name = "offline " + mapName;
+        instance.Maps = new List<Map>();
+        instance.Entities = new EntityList(128) { IsActive = true }; // IsActive as the constructor sets it in DEBUG (EntityListPool borrow tracking)
+        instance.Pathfinder = new PathFinder(); // a monster hit by the player plans a chase through it (Monster.OutStartChase -> TryMove)
+        typeof(Instance).GetField("removeList", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(instance, new List<Entity>(30));
+        typeof(Instance).GetField("world", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(instance, World.Instance);
+        return instance;
+    }
+
+    /// <summary>Empty .NET containers and locks only: a server type's constructor could do anything (World's loads
+    /// every map and replaces World.Instance).</summary>
+    private static void FillEmpty(object o)
+    {
+        foreach (var f in o.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            if (f.GetValue(o) == null && f.FieldType.Namespace?.StartsWith("System") == true && !f.FieldType.IsAbstract && f.FieldType.GetConstructor(Type.EmptyTypes) != null)
+                f.SetValue(o, Activator.CreateInstance(f.FieldType));
+    }
+
+    /// <summary>One server frame for the world events, in Instance.Update/World.Update order. Scheduled every
+    /// FrameSeconds while any event or area of effect is live.</summary>
+    private void Frame()
+    {
+        Time.UpdateCount++; // WorldObject.Update checks it was not updated twice in one frame
+        var self = _player.CombatEntity;
+        var selfBefore = StatusSet(self);
+        try
+        {
+            DoRemovals(_instance);
+            _map.Update(); // area-of-effect stay ticks (AreaOfEffect.Update -> the event's OnAoEInteraction)
+        }
+        catch (Exception e)
+        {
+            var undone = EndAllEvents();
+            Fail(SoleEventSkill(), "world frame: Map.Update (area-of-effect tick)", e, undone);
+        }
+        var entities = _instance.Entities;
+        for (var i = 0; i < entities.Count; i++)
+        {
+            var entity = entities[i];
+            if (!entity.IsAlive()) continue;
+            var ch = entity.Get<WorldObject>();
+            if (!ch.IsActive) continue;
+            var skill = _events.TryGetValue(entity, out var ev) ? ev.Skill : CharacterSkill.None;
+            try
+            {
+                ch.Update(); // Npc.Update: timers (OnTimer), owner checks, event expiry
+            }
+            catch (Exception e)
+            {
+                var undone = new List<string>();
+                try { if (ch.IsActive) ch.Npc.EndEvent(); undone.Add($"{ch.Npc.Behavior.GetType().Name} ended"); }
+                catch (Exception e2) { undone.Add($"ending it failed too ({e2.GetType().Name})"); }
+                Fail(skill, $"world frame: {ch.Npc.Behavior?.GetType().Name ?? ch.Type.ToString()} update", e, undone);
+            }
+            TrackNewEvents(skill);
+        }
+        World.Instance.PerformRemovals();
+        foreach (var (entity, ev) in _events.ToList())
+        {
+            if (entity.IsAlive() && entity.Get<WorldObject>().IsActive) continue;
+            _events.Remove(entity);
+            OnEvent?.Invoke($"{ev.Skill}: world event {ev.Kind} ended after {Clock - ev.Born:F2}s");
+            if (ev.Skill == CharacterSkill.None) continue;
+            var book = Ledger(ev.Skill);
+            book.EventsEnded++;
+            book.EventSeconds += Clock - ev.Born;
+        }
+        if (!WorldActive()) // the server drops removed entities a frame late (Instance.DoRemovals), so this is the frame after the last one ended
+            OnEvent?.Invoke($"world: all events ended and removed; instance entity list {_instance.Entities.Count}, map chunks holding an area of effect "
+                            + ((int[])ActiveAoEChunksField.GetValue(_map)!).Count(c => c > 0));
+        // Statuses the events put on the player (a protective ground effect, say) are booked to their skill.
+        var gained = StatusSet(self).Except(selfBefore).ToList();
+        if (gained.Count > 0)
+        {
+            var skill = SoleEventSkill();
+            if (skill != CharacterSkill.None)
+                foreach (var s in gained) Ledger(skill).StatusesApplied[$"area+{s}"] = Ledger(skill).StatusesApplied.GetValueOrDefault($"area+{s}") + 1;
+            OnEvent?.Invoke($"{skill}: world event put {string.Join(", ", gained)} on the player");
+        }
+        ScheduleFrame();
+    }
+
+    private bool WorldActive() => _events.Count > 0 || _instance.Entities.Count > 0;
+
+    private void ScheduleFrame() => _nextFrame = WorldActive() ? Clock + FrameSeconds : double.PositiveInfinity;
+
+    /// <summary>Server event entities that appeared since the last look are booked to the skill whose execution (or
+    /// whose parent event) created them.</summary>
+    private void TrackNewEvents(CharacterSkill skill)
+    {
+        var entities = _instance.Entities;
+        for (var i = 0; i < entities.Count; i++)
+        {
+            var entity = entities[i];
+            if (!entity.IsAlive() || _events.ContainsKey(entity)) continue;
+            var ch = entity.Get<WorldObject>();
+            if (!ch.IsActive) continue;
+            var kind = ch.Type is CharacterType.NPC or CharacterType.BattleNpc ? ch.Npc.Behavior?.GetType().Name ?? ch.Name : ch.Type.ToString();
+            _events[entity] = (skill, Clock, kind);
+            if (skill != CharacterSkill.None)
+            {
+                var book = Ledger(skill);
+                book.WorldEvents++;
+                book.EventKinds[kind] = book.EventKinds.GetValueOrDefault(kind) + 1;
+            }
+            var aoe = ch.Type is CharacterType.NPC or CharacterType.BattleNpc && ch.Npc.AreaOfEffect != null ? $", area {ch.Npc.AreaOfEffect.Area}" : "";
+            OnEvent?.Invoke($"{skill}: world event {kind} created at {ch.Position}{aoe}");
+        }
+        if (double.IsPositiveInfinity(_nextFrame) && WorldActive()) _nextFrame = Clock + FrameSeconds;
+    }
+
+    /// <summary>The skill all live events belong to, when there is exactly one (to attribute a map-wide failure).</summary>
+    private CharacterSkill SoleEventSkill()
+    {
+        var skills = _events.Values.Select(e => e.Skill).Where(s => s != CharacterSkill.None).Distinct().ToList();
+        return skills.Count == 1 ? skills[0] : CharacterSkill.None;
+    }
+
+    /// <summary>Ends events a failed call created (not yet tracked).</summary>
+    private List<string> EndNewEvents()
+    {
+        var undone = new List<string>();
+        var entities = _instance.Entities;
+        for (var i = 0; i < entities.Count; i++)
+        {
+            var entity = entities[i];
+            if (!entity.IsAlive() || _events.ContainsKey(entity)) continue;
+            undone.Add(EndEvent(entity));
+        }
+        return undone;
+    }
+
+    private List<string> EndAllEvents() => _events.Keys.ToList().Where(e => e.IsAlive()).Select(EndEvent).ToList();
+
+    private string EndEvent(Entity entity)
+    {
+        var ch = entity.Get<WorldObject>();
+        var name = ch.Type is CharacterType.NPC or CharacterType.BattleNpc ? ch.Npc.Behavior?.GetType().Name ?? ch.Name : ch.Name;
+        try
+        {
+            if (ch.IsActive) ch.Npc.EndEvent();
+            return $"{name} ended";
+        }
+        catch (Exception e)
+        {
+            // Force it off the map so it can't act again.
+            ch.IsActive = false;
+            if (ch.Map != null) { var en = entity; ch.Map.RemoveEntity(ref en, CharacterRemovalReason.OutOfSight, false); }
+            return $"{name} removed by force (EndEvent threw {e.GetType().Name})";
+        }
+    }
+
+    /// <summary>Books a failure with its evidence. The skill (if known) is withheld from later decisions.</summary>
+    private void Fail(CharacterSkill skill, string stage, Exception e, List<string> undone)
+    {
+        var diagnostic = Describe(e);
+        var record = $"{(skill != CharacterSkill.None ? skill.ToString() : "(unattributed)")} at {Clock:F2}s during {stage}: {diagnostic}"
+                     + (undone.Count > 0 ? $" [undone: {string.Join(", ", undone)}]" : "");
+        Failures.Add(record);
+        OnEvent?.Invoke("FAILED " + record);
+        var book = Ledger(skill);
+        book.Failures++;
+        book.RolledBack.AddRange(undone);
+        if (book.Blocked != null) return;
+        book.Blocked = diagnostic;
+        book.BlockedStage = stage;
+        book.BlockedAt = Clock;
+    }
+
+    /// <summary>Every failure of server code in this run, in order, with its evidence.</summary>
+    public readonly List<string> Failures = new();
 
     /// <summary>Damage due on the player: through the server's UpdateDamageQueue (status reactions, cast interruption)
     /// unless it is lethal, as Player.Die is not run. Returns -1 when the player died.</summary>
@@ -507,8 +892,18 @@ public sealed class ServerWorld
             return -1;
         }
         Time.ElapsedTimeFloat += (float)Epsilon; // UpdateDamageQueue applies what is strictly due
-        self.UpdateDamageQueue();
-        Time.ElapsedTimeFloat = (float)Clock;
+        var hp = Hp;
+        try
+        {
+            self.UpdateDamageQueue();
+        }
+        catch (Exception e)
+        {
+            self.SetStat(CharacterStat.Hp, hp - due);
+            self.DamageQueue.RemoveAll(d => d.Time <= Time.ElapsedTimeFloat);
+            Fail(CharacterSkill.None, "damage landing on the player (UpdateDamageQueue)", e, new List<string> { $"player HP set to {hp - due} without the failed step" });
+        }
+        finally { Time.ElapsedTimeFloat = (float)Clock; }
         return due;
     }
 
@@ -544,7 +939,33 @@ public sealed class ServerWorld
 
     private void Enter() => DuelSimulator.RandomField.SetValue(null, _random); // this run's GameRandom stream
 
+    /// <summary>Moves the clock, running the player's per-frame timers from Player.Update over the time that passed: the
+    /// input-action delay and the server's own regen (UpdateRegenTick: its 6 s ticks, sitting and walking rates, the
+    /// HpRegenTick/SpRegenTick amounts). Not the rest of Player.Update: casts and attacks are this class's to drive.</summary>
     private void SetClock(double seconds)
+    {
+        for (var at = Clock; at < seconds - 1e-9;)
+        {
+            var dt = Math.Min(TimerSliceSeconds, seconds - at);
+            at += dt;
+            SetTime(at);
+            Time.DeltaTime = dt;
+            Time.DeltaTimeFloat = (float)dt;
+            _player.InputActionCooldown = Math.Max(0, _player.InputActionCooldown - (float)dt); // Player.Update's first lines
+            var ch = _player.Character;
+            var state = ch.State;
+            if (_walking && state == CharacterState.Idle) ch.State = CharacterState.Moving; // the walk MovePlayer jumped over
+            var (hp, sp) = (Hp, Sp);
+            try { UpdateRegenTick(_player); }
+            finally { ch.State = state; }
+            RegenHp += Math.Max(0, Hp - hp);
+            RegenSp += Math.Max(0, Sp - sp);
+            if (Sitting && (Hp > hp || Sp > sp)) OnEvent?.Invoke($"regen tick (sitting): +{Hp - hp} HP, +{Sp - sp} SP -> HP {Hp}/{MaxHp} SP {Sp}/{MaxSp}");
+        }
+        SetTime(seconds);
+    }
+
+    private void SetTime(double seconds)
     {
         Clock = seconds;
         Time.ElapsedTime = seconds;

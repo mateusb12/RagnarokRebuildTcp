@@ -887,10 +887,16 @@ public sealed class BotSession : IAsyncDisposable
     public Task SitAsync(bool sit, CancellationToken ct = default)
     {
         if (_conn == null) return Task.CompletedTask;
+        return _conn.SendPacketAsync(SitStandPacket(sit), ct);
+    }
+
+    /// <summary>The sit/stand packet SitAsync sends; the offline ServerWorld feeds the same bytes to PacketSitStand.</summary>
+    public static PacketWriter SitStandPacket(bool sit)
+    {
         var w = new PacketWriter();
         w.WritePacketType(PacketType.SitStand);
         w.Write(sit);
-        return _conn.SendPacketAsync(w, ct);
+        return w;
     }
 
     /// <summary>Cast a single-target skill at an entity. The wire "type" byte is always Enemy — the server

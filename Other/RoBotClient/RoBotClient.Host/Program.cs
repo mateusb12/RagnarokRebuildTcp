@@ -31,10 +31,10 @@ if (mode is "validate" or "benchmark")
     return;
 }
 
-//   huntsim <map> <build> <minutes> <seed> [--script "rule; rule"] [--trace file] [--check]
+//   huntsim <map> <build> <minutes> <seed> [--script "rule; rule"] [--configs bot-configs.json] [--trace file] [--check]
 //     build: a PlayerBuild JSON file, or a bot name ("Bot3", or "Bot3@mjolnir_06" for its build when it hunted there)
-//            whose latest recorded duel build is used; a bot name also brings its SkillScript and NoAutoAttack from
-//            bot-configs.json. --script replaces the script (rules separated by ';').
+//            whose latest recorded duel build is used; a bot name also brings its saved BotBehaviorConfig (skill script,
+//            rest, win and hunt rules) from bot-configs.json. --script replaces the script (rules separated by ';').
 if (mode == "huntsim")
 {
     if (args.Length < 5) { Console.WriteLine("usage: huntsim <map> <build.json | bot[@map]> <minutes> <seed> [--script \"rule; rule\"] [--trace file] [--check]"); return; }
@@ -62,24 +62,24 @@ if (mode == "huntsim")
         build = record.Build!;
         buildSource = $"{record.Character}'s build recorded {record.EngagedAtUtc:yyyy-MM-dd HH:mm}Z on {record.Map}";
     }
-    // The bot's own skill rules (BotBehaviorConfig.SkillScript) from bot-configs.json, or --script.
-    var script = "";
-    var noAutoAttack = false;
-    var configs = Path.Combine(repo, "Other", "RoBotClient", "bot-configs.json");
+    // The bot's saved BotBehaviorConfig from bot-configs.json, read by the store the live BotManager uses; --script
+    // replaces its skill rules.
+    RoBotClient.Bot.Behavior.BotBehaviorConfig? botConfig = null;
+    string? configSource = null;
+    var configsAt = Array.IndexOf(args, "--configs"); // another bot-configs.json (same format), for what-if configs
+    var configs = configsAt > 0 && configsAt + 1 < args.Length ? args[configsAt + 1] : Path.Combine(repo, "Other", "RoBotClient", "bot-configs.json");
     if (!File.Exists(args[2]) && File.Exists(configs))
     {
         var botName = args[2].Split('@')[0];
-        foreach (var entry in System.Text.Json.JsonDocument.Parse(File.ReadAllText(configs)).RootElement.EnumerateObject())
-            if (entry.Name.EndsWith(" " + botName, StringComparison.OrdinalIgnoreCase) && entry.Value.ValueKind == System.Text.Json.JsonValueKind.Object)
-            {
-                if (entry.Value.TryGetProperty("SkillScript", out var s) && s.ValueKind == System.Text.Json.JsonValueKind.String) script = s.GetString() ?? "";
-                if (entry.Value.TryGetProperty("NoAutoAttack", out var n) && n.ValueKind is System.Text.Json.JsonValueKind.True) noAutoAttack = true;
-            }
+        var store = new RoBotClient.Bot.Manager.BotConfigStore(configs);
+        var key = store.List().FirstOrDefault(k => k.EndsWith(" " + botName, StringComparison.OrdinalIgnoreCase));
+        if (key != null) (botConfig, configSource) = (store.Get(key), $"{key} in {configs}");
     }
+    var script = botConfig?.SkillScript ?? "";
     var scriptAt = Array.IndexOf(args, "--script");
     if (scriptAt > 0 && scriptAt + 1 < args.Length) script = args[scriptAt + 1].Replace(';', '\n');
     var options = new HuntSimOptions(args[1], build, double.Parse(args[3], System.Globalization.CultureInfo.InvariantCulture) * 60, int.Parse(args[4]),
-        SkillScript: script, NoAutoAttack: noAutoAttack);
+        SkillScript: script, NoAutoAttack: botConfig?.NoAutoAttack ?? false, Config: botConfig, ConfigSource: configSource);
     var started = System.Diagnostics.Stopwatch.StartNew();
     var sim = new HuntSimulator(options, data);
     sim.Run();
@@ -92,9 +92,9 @@ if (mode == "huntsim")
         Console.WriteLine("\n== Verification ==");
         Console.WriteLine("Invariants enforced during the run (any violation throws): every step is to an adjacent walkable cell without cutting a wall corner; "
             + "every candidate is within view (21 cells); every fight starts in melee range; a killed monster stays dead until a respawn delay inside its rule; "
-            + "the clock equals walking + fighting + idle time.");
-        Console.WriteLine($"Clock: {sim.WanderSeconds:F3} wander + {sim.ApproachSeconds:F3} walk-up + {sim.FightSeconds:F3} fight + {sim.IdleSeconds:F3} idle = "
-            + $"{sim.WanderSeconds + sim.ApproachSeconds + sim.FightSeconds + sim.IdleSeconds:F3}s of {options.DurationSeconds:F0}s; "
+            + "the clock equals walking + fighting + idle + resting time.");
+        Console.WriteLine($"Clock: {sim.WanderSeconds:F3} wander + {sim.ApproachSeconds:F3} walk-up + {sim.FightSeconds:F3} fight + {sim.IdleSeconds:F3} idle + {sim.RestSeconds:F3} rest = "
+            + $"{sim.WanderSeconds + sim.ApproachSeconds + sim.FightSeconds + sim.IdleSeconds + sim.RestSeconds:F3}s of {options.DurationSeconds:F0}s; "
             + $"{sim.Steps} steps = {sim.Steps - sim.DiagonalSteps} x 0.15s + {sim.DiagonalSteps} x 0.212s = {(sim.Steps - sim.DiagonalSteps) * 0.15 + sim.DiagonalSteps * 0.15 * 1.4142:F3}s walked");
         Console.WriteLine("Example obstacle: " + (sim.ObstacleExample ?? "none drawn"));
         Console.WriteLine("Example respawn: " + (sim.RespawnExample ?? "no respawn within the run"));
