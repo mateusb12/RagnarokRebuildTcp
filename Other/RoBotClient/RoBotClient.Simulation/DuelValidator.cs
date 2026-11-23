@@ -24,7 +24,7 @@ public sealed record ForecastComparison(string Metric, int Count, double OldBias
 public sealed record ValidationReport(
     int Records, IReadOnlyDictionary<string, int> Outcomes, IReadOnlyDictionary<string, int> Exclusions, int Eligible,
     IReadOnlyList<StaticCheck> StaticChecks, IReadOnlyList<GroupCheck> Groups, IReadOnlyList<ForecastComparison> Forecasts,
-    IReadOnlyList<string> Alerts, int Deaths, double PredictedDeaths, TimeSpan Elapsed);
+    IReadOnlyDictionary<string, int> ForecastAvailability, IReadOnlyList<string> Alerts, int Deaths, double PredictedDeaths, TimeSpan Elapsed);
 
 /// <summary>
 /// Checks the server-code simulator against duels real bots fought on the live server (DuelRecord, bot-duels/).
@@ -96,7 +96,7 @@ public static class DuelValidator
             .Select(m => $"{g.Dimension}={g.Group} {m.Metric}: {m.Verdict} (bias {m.Bias:+0.##;-0.##} [{m.BiasLow:0.##}, {m.BiasHigh:0.##}], n={m.Count})")).ToList();
         var complete = replays.Where(x => x.Record.Outcome is DuelOutcome.Won or DuelOutcome.Died).ToList();
         return new ValidationReport(records.Count, outcomes, exclusions, replays.Count, StaticChecks(records),
-            groups, CompareForecasts(replays.Select(x => x.Record).ToList()), alerts,
+            groups, CompareForecasts(replays.Select(x => x.Record).ToList()), ForecastAvailability(replays.Select(x => x.Record)), alerts,
             complete.Count(x => x.Record.Outcome == DuelOutcome.Died), complete.Sum(x => x.Prediction.DeathRate), stopwatch.Elapsed);
     }
 
@@ -107,6 +107,7 @@ public static class DuelValidator
         if (record.Outcome is DuelOutcome.Abandoned or DuelOutcome.LostSight or DuelOutcome.Stolen)
             return $"incomplete ({record.Outcome})";
         if (record.Actions.Count == 0) return "no attack action of ours";
+        if (record.BuildAtEnd != null) return "build changed during the duel (equipment, level or skills)";
         if (record.InParty) return "in a party";
         if (record.HelpedByPlayer) return "another player attacked the target";
         if (record.MonsterMaxHpAtEngage > 0 && record.MonsterHpAtEngage < record.MonsterMaxHpAtEngage) return "target already damaged";
@@ -231,9 +232,23 @@ public static class DuelValidator
             return new StaticCheck(g.Key.Character, Describe(record.Build!), g.Count(), mismatches);
         }).ToList();
 
+    /// <summary>A live server forecast that was ready before the duel ended: a real prediction. One that arrived
+    /// later (the worker was busy) was still computed from the state at engagement, but is reported apart and
+    /// kept out of the forecast comparison. Records from before the worker have no ready time: they were computed
+    /// synchronously at engagement.</summary>
+    public static bool ForecastBeforeOutcome(DuelRecord record) =>
+        record.ServerForecast != null && (record.ServerForecastReadyAt == null || record.ServerForecastReadyAt <= record.EndedAt);
+
+    private static Dictionary<string, int> ForecastAvailability(IEnumerable<DuelRecord> eligible) => eligible
+        .Where(r => r.Outcome == DuelOutcome.Won)
+        .GroupBy(r => ForecastBeforeOutcome(r) ? "ready before the outcome"
+            : r.ServerForecast != null ? "ready only after the outcome (excluded below)"
+            : r.ServerForecastError != null ? "failed" : "missing")
+        .ToDictionary(g => g.Key, g => g.Count());
+
     private static List<ForecastComparison> CompareForecasts(List<DuelRecord> eligible)
     {
-        var both = eligible.Where(r => r.Outcome == DuelOutcome.Won && r.OldForecast != null && r.ServerForecast != null).ToList();
+        var both = eligible.Where(r => r.Outcome == DuelOutcome.Won && r.OldForecast != null && ForecastBeforeOutcome(r)).ToList();
         ForecastComparison Compare(string metric, Func<ForecastSummary, double> predicted, Func<DuelRecord, double> observed)
         {
             if (both.Count == 0) return new ForecastComparison(metric, 0, 0, 0, 0, 0);
@@ -247,6 +262,7 @@ public static class DuelValidator
             Compare("Attacks", f => f.Attacks, r => Observe(r).Attacks),
             Compare("Seconds", f => f.Seconds, r => Observe(r).Seconds),
             Compare("DamageTaken", f => f.DamageTaken, r => Observe(r).DamageTaken),
+            Compare("DamagePerAction", f => f.DamagePerAction, r => Observe(r).DamagePerAction),
         };
     }
 
@@ -296,6 +312,9 @@ public static class DuelValidator
                             $" | {m.MeanAbsoluteError:0.##} | {m.Dispersion:0.##} | {m.PracticalThreshold:0.##} | {m.Verdict} |");
         text.AppendLine();
         text.AppendLine("## Forecasts made at engage (scripted policy, before the fight) vs observed");
+        text.AppendLine("Live server forecasts of the eligible won duels: "
+                        + string.Join(", ", report.ForecastAvailability.OrderByDescending(x => x.Value).Select(x => $"{x.Value} {x.Key}")) + ".");
+        text.AppendLine();
         text.AppendLine("| metric | n | old bias | old MAE | server bias | server MAE |");
         text.AppendLine("|---|---|---|---|---|---|");
         foreach (var f in report.Forecasts)

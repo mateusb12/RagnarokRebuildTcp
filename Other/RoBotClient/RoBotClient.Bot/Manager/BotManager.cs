@@ -77,6 +77,11 @@ public sealed class BotManager
         RoBotClient.Simulation.DuelStore? duels = null)
     {
         Duels = duels;
+        if (duels != null)
+        {
+            RoBotClient.Simulation.ForecastWorker.StatsPath = Path.Combine(duels.Directory, "forecast-worker.json");
+            RoBotClient.Simulation.ForecastWorker.Start();
+        }
         _progress = progress;
         MapAudit = mapAudit;
         _memory = memory;
@@ -98,6 +103,19 @@ public sealed class BotManager
     public BotLogStore? LogStore => _logStore;
     public BotProgressStore? Progress => _progress;
     public MapAuditStore? MapAudit { get; }
+    /// <summary>A duel can end before its shadow forecast (ForecastWorker) is ready: store it once the forecast is
+    /// in, so the two stay together. After this long the record is stored without it, saying so.</summary>
+    private static readonly TimeSpan ForecastGrace = TimeSpan.FromSeconds(60);
+
+    private static async Task AppendWhenForecastReady(RoBotClient.Simulation.DuelStore duels, string character, RoBotClient.Simulation.DuelRecord record)
+    {
+        if (record.PendingForecast is { } pending && await Task.WhenAny(pending, Task.Delay(ForecastGrace)) != pending)
+            lock (record)
+                if (record.ServerForecast == null)
+                    record.ServerForecastError ??= $"forecast not ready {ForecastGrace.TotalSeconds:0} s after the duel ended";
+        lock (record) duels.Append(character, record);
+    }
+
     /// <summary>Every engagement's state, forecasts and outcome (bot-duels/), for DuelValidator.</summary>
     public RoBotClient.Simulation.DuelStore? Duels { get; }
     private readonly BotMemoryStore? _memory;
@@ -373,7 +391,7 @@ public sealed class BotManager
                     // The session's receive loop owns the bot's lifetime: when it ends (server close, socket
                     // abort, or stop_bot), cancel the behavior loop too. Otherwise a dropped bot keeps ticking on
                     // its last snapshot and stays listed as active.
-                    if (Duels is { } duels) session.OnDuelEnded += record => duels.Append(config.CharacterName, record);
+                    if (Duels is { } duels) session.OnDuelEnded += record => _ = AppendWhenForecastReady(duels, config.CharacterName, record);
                     var sessionTask = session.RunAsync(cts.Token);
                     var brainTask = brain.RunAsync(cts.Token);
                     try { await sessionTask; }

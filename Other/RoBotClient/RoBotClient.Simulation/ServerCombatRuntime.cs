@@ -38,6 +38,20 @@ public static class ServerCombatRuntime
     public static TimeSpan InitializationTime { get; private set; }
     public static string ServerProjectDirectory { get; private set; } = "";
 
+    /// <summary>Write time and size of the Script.dll loaded at initialisation (item and card effects): part of
+    /// every cached forecast's key.</summary>
+    public static string ScriptVersion { get; private set; } = "";
+
+    /// <summary>The live server recompiled its scripts after this process loaded them: the loaded copy is stale
+    /// and only a restart reloads it.</summary>
+    public static bool ScriptsChangedSinceLoad() => ScriptStamp() != ScriptVersion;
+
+    private static string ScriptStamp()
+    {
+        var script = new FileInfo(Path.Combine(ServerConfig.DataConfig.CachePath, "Script.dll"));
+        return script.Exists ? $"{script.LastWriteTimeUtc:O}/{script.Length}" : "missing";
+    }
+
     /// <param name="serverProjectDirectory">RoRebuildServer/RoRebuildServer: the live server's working directory,
     /// which its relative data paths are resolved from.</param>
     public static void EnsureInitialized(string serverProjectDirectory)
@@ -53,6 +67,7 @@ public static class ServerCombatRuntime
             dataConfig.CachePath = Path.GetFullPath(Path.Combine(serverProjectDirectory, dataConfig.CachePath));
             ServerLogger.SetLogger(new LoggerConfiguration().MinimumLevel.Warning().WriteTo.Console().CreateLogger());
 
+            ScriptVersion = ScriptStamp();
             DataManager.Initialize(loadExisting: true); // Cache/Script.dll as compiled by the running server
             EntityManager.Initialize(64);
             ResetPacketQueue();

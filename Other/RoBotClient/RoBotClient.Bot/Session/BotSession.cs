@@ -139,6 +139,11 @@ public sealed class BotSession : IAsyncDisposable
         _activeDuel = null;
         duel.Outcome = outcome;
         duel.EndedAt = DuelClock(duel);
+        // A gear change mid-fight (Bot5 equipped a Knife halfway through a Poring) makes the engagement build wrong.
+        var atEnd = CaptureCombatState().Build; // _stateLock is re-entrant
+        if (duel.Build != null && System.Text.Json.JsonSerializer.Serialize(atEnd, DuelStore.JsonOptions)
+            != System.Text.Json.JsonSerializer.Serialize(duel.Build, DuelStore.JsonOptions))
+            duel.BuildAtEnd = atEnd;
         if (OnDuelEnded is { } handler) ThreadPool.QueueUserWorkItem(_ => { try { handler(duel); } catch { } });
     }
 

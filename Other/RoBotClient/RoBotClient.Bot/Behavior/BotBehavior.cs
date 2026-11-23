@@ -116,9 +116,11 @@ public sealed partial class BotBehavior
     {
         while (!ct.IsCancellationRequested)
         {
+            var tickStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             try { await TickAsync(ct); }
             catch (OperationCanceledException) { break; }
             catch (Exception ex) { OnLog?.Invoke($"behavior error: {ex.Message}"); }
+            RoBotClient.Simulation.ForecastWorker.BotTickMs.Add(System.Diagnostics.Stopwatch.GetElapsedTime(tickStarted).TotalMilliseconds);
 
             // Tick cadence — every 250ms (was 400). Halves the latency on combat reactions, follower
             // target mirroring, threat switches, hazard avoidance. 6 bots × 4 Hz = 24 ticks/sec total —

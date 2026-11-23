@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using RebuildSharedData.Enum;
 
 namespace RoBotClient.Simulation;
@@ -47,6 +48,9 @@ public sealed class DuelRecord
     /// <summary>The bot's enemy-targeted skill rules, as written in its script (what the policy can use).</summary>
     public List<string> SkillRules { get; set; } = new();
     public PlayerBuild? Build { get; set; }
+    /// <summary>The build when the duel ended, recorded only when it differs from Build (the bot equipped a weapon,
+    /// levelled up or learned a skill mid-fight): the duel then wasn't fought with the build it is replayed with.</summary>
+    public PlayerBuild? BuildAtEnd { get; set; }
     public LiveStats? Live { get; set; }
 
     public List<ObservedAction> Actions { get; set; } = new();
@@ -66,6 +70,14 @@ public sealed class DuelRecord
     public ForecastSummary? OldForecast { get; set; }
     public ForecastSummary? ServerForecast { get; set; }
     public string? ServerForecastError { get; set; }
+    /// <summary>Seconds after the engagement the server forecast was ready (it runs on ForecastWorker). Compare with
+    /// EndedAt: later means it was not available as a prediction. Null in records from before the worker.</summary>
+    public double? ServerForecastReadyAt { get; set; }
+    /// <summary>The forecast came from the worker's cache (an identical request was simulated before).</summary>
+    public bool? ServerForecastCacheHit { get; set; }
+    /// <summary>The server forecast still being computed; the record is stored once it completes (BotManager).
+    /// Lock the record to read or write the forecast fields.</summary>
+    [JsonIgnore] public Task? PendingForecast { get; set; }
 
     public double? FirstActionAt => Actions.Count > 0 ? Actions[0].At : null;
 }
