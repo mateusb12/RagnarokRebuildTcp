@@ -1,6 +1,7 @@
 using System.Text;
 using RoBotClient.Bot.Behavior;
 using RoBotClient.Bot.GameData;
+using RoBotClient.Bot.Offline;
 using RoBotClient.Bot.Session;
 using RoBotClient.Bot.State;
 using RoBotClient.Simulation;
@@ -27,6 +28,98 @@ if (mode is "validate" or "benchmark")
     }
     else
         SimulatorBenchmark.Run(serverDirectory, Console.WriteLine);
+    return;
+}
+
+//   huntsim <map> <build> <minutes> <seed> [--script "rule; rule"] [--trace file] [--check]
+//     build: a PlayerBuild JSON file, or a bot name ("Bot3", or "Bot3@mjolnir_06" for its build when it hunted there)
+//            whose latest recorded duel build is used; a bot name also brings its SkillScript and NoAutoAttack from
+//            bot-configs.json. --script replaces the script (rules separated by ';').
+if (mode == "huntsim")
+{
+    if (args.Length < 5) { Console.WriteLine("usage: huntsim <map> <build.json | bot[@map]> <minutes> <seed> [--script \"rule; rule\"] [--trace file] [--check]"); return; }
+    var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
+                          ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
+    ServerCombatRuntime.EnsureInitialized(serverDirectory);
+    var repo = Path.GetDirectoryName(Path.GetDirectoryName(serverDirectory))!;
+    var data = GameDatabase.Load(Path.Combine(repo, "RebuildClient", "Assets", "StreamingAssets", "ClientConfigGenerated"),
+        Path.Combine(repo, "RebuildClient", "Assets", "Maps", "exportdata"),
+        Path.Combine(repo, "RoRebuildServer", "GameConfig", "ServerData", "Script", "Warps"));
+    PlayerBuild build;
+    string buildSource;
+    if (File.Exists(args[2]))
+    {
+        build = System.Text.Json.JsonSerializer.Deserialize<PlayerBuild>(File.ReadAllText(args[2]), DuelStore.JsonOptions)!;
+        buildSource = args[2];
+    }
+    else
+    {
+        var duels = Path.Combine(repo, "Other", "RoBotClient", "bot-duels");
+        var who = args[2].Split('@'); // "Bot3" or "Bot3@mjolnir_06": the latest build recorded (on that map)
+        var record = DuelStore.ReadAll(duels).Where(r => r.Build != null && r.Character.EndsWith(who[0], StringComparison.OrdinalIgnoreCase)
+                && (who.Length == 1 || string.Equals(r.Map, who[1], StringComparison.OrdinalIgnoreCase)))
+            .MaxBy(r => r.EngagedAtUtc) ?? throw new ArgumentException($"no duel record with a build for '{args[2]}' in {duels}");
+        build = record.Build!;
+        buildSource = $"{record.Character}'s build recorded {record.EngagedAtUtc:yyyy-MM-dd HH:mm}Z on {record.Map}";
+    }
+    // The bot's own skill rules (BotBehaviorConfig.SkillScript) from bot-configs.json, or --script.
+    var script = "";
+    var noAutoAttack = false;
+    var configs = Path.Combine(repo, "Other", "RoBotClient", "bot-configs.json");
+    if (!File.Exists(args[2]) && File.Exists(configs))
+    {
+        var botName = args[2].Split('@')[0];
+        foreach (var entry in System.Text.Json.JsonDocument.Parse(File.ReadAllText(configs)).RootElement.EnumerateObject())
+            if (entry.Name.EndsWith(" " + botName, StringComparison.OrdinalIgnoreCase) && entry.Value.ValueKind == System.Text.Json.JsonValueKind.Object)
+            {
+                if (entry.Value.TryGetProperty("SkillScript", out var s) && s.ValueKind == System.Text.Json.JsonValueKind.String) script = s.GetString() ?? "";
+                if (entry.Value.TryGetProperty("NoAutoAttack", out var n) && n.ValueKind is System.Text.Json.JsonValueKind.True) noAutoAttack = true;
+            }
+    }
+    var scriptAt = Array.IndexOf(args, "--script");
+    if (scriptAt > 0 && scriptAt + 1 < args.Length) script = args[scriptAt + 1].Replace(';', '\n');
+    var options = new HuntSimOptions(args[1], build, double.Parse(args[3], System.Globalization.CultureInfo.InvariantCulture) * 60, int.Parse(args[4]),
+        SkillScript: script, NoAutoAttack: noAutoAttack);
+    var started = System.Diagnostics.Stopwatch.StartNew();
+    var sim = new HuntSimulator(options, data);
+    sim.Run();
+    Console.WriteLine($"Build source: {buildSource}. Wall time {started.Elapsed.TotalSeconds:F1}s.");
+    Console.WriteLine(sim.Report());
+    var traceAt = Array.IndexOf(args, "--trace");
+    if (traceAt > 0 && traceAt + 1 < args.Length) { File.WriteAllLines(args[traceAt + 1], sim.Trace); Console.WriteLine($"Trace: {sim.Trace.Count} events -> {args[traceAt + 1]}"); }
+    if (args.Contains("--check"))
+    {
+        Console.WriteLine("\n== Verification ==");
+        Console.WriteLine("Invariants enforced during the run (any violation throws): every step is to an adjacent walkable cell without cutting a wall corner; "
+            + "every candidate is within view (21 cells); every fight starts in melee range; a killed monster stays dead until a respawn delay inside its rule; "
+            + "the clock equals walking + fighting + idle time.");
+        Console.WriteLine($"Clock: {sim.WanderSeconds:F3} wander + {sim.ApproachSeconds:F3} walk-up + {sim.FightSeconds:F3} fight + {sim.IdleSeconds:F3} idle = "
+            + $"{sim.WanderSeconds + sim.ApproachSeconds + sim.FightSeconds + sim.IdleSeconds:F3}s of {options.DurationSeconds:F0}s; "
+            + $"{sim.Steps} steps = {sim.Steps - sim.DiagonalSteps} x 0.15s + {sim.DiagonalSteps} x 0.212s = {(sim.Steps - sim.DiagonalSteps) * 0.15 + sim.DiagonalSteps * 0.15 * 1.4142:F3}s walked");
+        Console.WriteLine("Example obstacle: " + (sim.ObstacleExample ?? "none drawn"));
+        Console.WriteLine("Example respawn: " + (sim.RespawnExample ?? "no respawn within the run"));
+        foreach (var example in sim.Examples) Console.WriteLine("Example " + example);
+        var again = new HuntSimulator(options, data);
+        again.Run();
+        var other = new HuntSimulator(options with { Seed = options.Seed + 1 }, data);
+        other.Run();
+        Console.WriteLine($"Determinism: seed {options.Seed} twice -> {sim.Fingerprint()} / {again.Fingerprint()} ({(sim.Fingerprint() == again.Fingerprint() && sim.Exp == again.Exp ? "identical" : "DIFFERENT")}); "
+            + $"seed {options.Seed + 1} -> {other.Fingerprint()}, {other.Kills} kills / {other.Exp} exp vs {sim.Kills} / {sim.Exp}");
+        Console.WriteLine("\nSkill evidence (first trace lines per skill: the rule firing, then what the server did):");
+        foreach (var skill in sim.RuleFired.Keys)
+        {
+            var name = skill.ToString();
+            var first = sim.Trace.FindIndex(l => l.Contains($"rule fires: {name} "));
+            if (first < 0) continue;
+            foreach (var line in sim.Trace.Skip(first).Take(12).Where(l => l.Contains(name) || l.Contains("engage") || l.Contains("killed")).Take(6))
+                Console.WriteLine("  " + line);
+            var effect = sim.Trace.FirstOrDefault(l => l.Contains($"{name}: executed"));
+            if (effect != null && !sim.Trace.Skip(first).Take(12).Contains(effect)) Console.WriteLine("  ... " + effect);
+            Console.WriteLine();
+        }
+        Console.WriteLine("\nFirst 40 trace events:");
+        foreach (var line in sim.Trace.Take(40)) Console.WriteLine("  " + line);
+    }
     return;
 }
 

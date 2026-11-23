@@ -102,9 +102,6 @@ public sealed partial class BotBehavior
     // ---- ServerForecast On: decisions ----
 
     private const int ShortlistSize = 4; // PickTarget's nearest huntable monsters get a server forecast
-    // ponytail: guessed cap on simulated deaths + timeouts for a fight without potions to count as winnable; the
-    // WinMargin damage check bounds the mean, this bounds the tail. Re-fit from On-mode deaths if any appear.
-    private const double MaxServerLossRate = 0.05;
     // ponytail: guessed. Monster skill damage below this share of its total is within the duel validator's tolerance
     // (shadow duels against Caramel, Metaller, Drainliar stayed consistent); re-fit from per-monster On-mode errors.
     private const double MaxMonsterSkillShare = 0.2;
@@ -221,10 +218,7 @@ public sealed partial class BotBehavior
     private BattleForecast ServerBattleForecast(Snapshot snap, BattleForecast old, DuelPrediction p)
     {
         var buffer = EstimatePotionHpBuffer(snap);
-        var canWin = p.WinRate > 0 && snap.SelfHp > 0
-            && (p.Attacks.Mean <= _config.MaxRoundsToKill || p.DamageTaken.Mean <= 0)
-            && p.DamageTaken.Mean <= _config.WinMargin * (snap.SelfHp + buffer)
-            && (buffer > 0 || p.DeathRate + p.TimeoutRate <= MaxServerLossRate);
+        var canWin = HuntPolicy.ServerCanWin(p, snap.SelfHp, buffer, _config.WinMargin, _config.MaxRoundsToKill);
         return old with
         {
             CanWin = canWin, SecondsToKillMonster = p.Seconds.Mean, ExpectedDamageTaken = p.DamageTaken.Mean,

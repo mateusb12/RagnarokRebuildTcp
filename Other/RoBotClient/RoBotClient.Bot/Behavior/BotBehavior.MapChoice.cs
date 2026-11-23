@@ -611,7 +611,7 @@ public sealed partial class BotBehavior
                 }
                 if (huntableCount <= 0) return default;
                 // Walking to the next target: about the spacing between monsters we can beat (the rest are just scenery).
-                var findSeconds = 0.15 * Math.Sqrt(area / huntableCount);
+                var findSeconds = HuntPolicy.MapSearchSecondsPerKill(area, huntableCount);
                 var seconds = fightSeconds + recoverSeconds + huntableCount * findSeconds;
                 // Exp/h is the slower of: how fast the bot kills, and how fast the area refills (7 Thief Bugs on a 6 min respawn run dry).
                 return (Math.Min(exp / seconds, supplyPerSecond) * 3600, exp / huntableCount,

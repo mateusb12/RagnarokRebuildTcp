@@ -1,5 +1,6 @@
 using System.Globalization;
 using RebuildSharedData.Enum;
+using RoBotClient.Bot.GameData;
 
 namespace RoBotClient.Bot.Behavior;
 
@@ -144,76 +145,146 @@ public sealed partial class BotBehavior
         return true;
     }
 
-    /// <summary>Feed SkillPolicy from the live snapshot + the forecast's per-swing damage. 0 = skip this cast.</summary>
-    private int SkillPolicyLevel(Snapshot snap, MonsterInfo target, CharacterSkill skill, int maxLevel, bool pinLevel)
+    /// <summary>What a skill-rule choice reads besides the snapshot: the game data, whether the bot auto-attacks, and its
+    /// expected damage per auto-attack on a monster (unpoisoned / poisoned). Live: the bot's own forecast; offline: the
+    /// server-code one (HuntSimulator).</summary>
+    internal sealed record SkillChoiceInputs(GameDatabase? Data, bool NoAutoAttack, Func<MonsterInfo, bool, double> SwingDamage);
+
+    /// <summary>Feed SkillPolicy from the snapshot + the forecast's per-swing damage. 0 = skip this cast.</summary>
+    private static int SkillPolicyLevel(Snapshot snap, MonsterInfo target, CharacterSkill skill, int maxLevel, bool pinLevel, SkillChoiceInputs inputs)
     {
+        var data = inputs.Data;
         var debuff = SkillPolicy.AppliedDebuff(skill);
         var hasDebuff = debuff != null && snap.EntityStatuses.TryGetValue(target.Id, out var set) && set.Contains(debuff.Value);
-        var (autoDmg, hp) = PolicyInputs(snap, target);
+        var (autoDmg, hp) = PolicyInputs(target, inputs);
         Func<int, double>? land = null;
         var poisonedAuto = 0.0;
-        if (debuff == CharacterStatusEffect.Poison && !hasDebuff && _data?.Monster(target.ClassId) is { } mob)
+        if (debuff == CharacterStatusEffect.Poison && !hasDebuff && data?.Monster(target.ClassId) is { } mob)
         {
             var resist = SkillPolicy.PoisonResist(mob.Vit, string.Equals(mob.Special, "Boss", StringComparison.OrdinalIgnoreCase),
                 ElementChart.Parse(mob.Element ?? "").Item1 == SimElement.Undead);
-            var mobLuk = _data.MonsterLuk(target.ClassId);
+            var mobLuk = data.MonsterLuk(target.ClassId);
             land = lv => SkillPolicy.LuckModifiedChance(SkillPolicy.DebuffChance(skill, lv) * resist, snap.SelfLuk, mobLuk);
-            if (!_config.NoAutoAttack && autoDmg > 0)
-            {
-                var f = Forecast(snap, target, poisoned: true);
-                poisonedAuto = f.ExpectedDamagePerSwing;
-            }
+            if (!inputs.NoAutoAttack && autoDmg > 0)
+                poisonedAuto = inputs.SwingDamage(target, true);
         }
-        return SkillPolicy.ChooseLevel(skill, maxLevel, pinLevel, _data?.SkillInfo(skill)?.SpCost,
+        return SkillPolicy.ChooseLevel(skill, maxLevel, pinLevel, data?.SkillInfo(skill)?.SpCost,
             hp, hasDebuff, autoDmg, snap.SelfSp, SkillPolicy.SpIsFree(snap.SelfSp, snap.SelfMaxSp, snap.SelfInt),
             land, snap.SelfAttackInterval > 0.05 ? snap.SelfAttackInterval : 1.5, poisonedAuto);
     }
 
     /// <summary>Expected damage per auto-attack (0 for NoAutoAttack) and the target's HP (MaxHp 0 = not seen yet: fresh mob).</summary>
-    private (double AutoDmg, int Hp) PolicyInputs(Snapshot snap, MonsterInfo target)
+    private static (double AutoDmg, int Hp) PolicyInputs(MonsterInfo target, SkillChoiceInputs inputs)
     {
-        var autoDmg = 0.0;
-        if (!_config.NoAutoAttack)
-        {
-            var f = Forecast(snap, target);
-            autoDmg = f.ExpectedDamagePerSwing;
-        }
-        var hp = target.MaxHp > 0 ? target.Hp : _data?.Monster(target.ClassId)?.HP ?? target.Hp;
+        var autoDmg = inputs.NoAutoAttack ? 0.0 : inputs.SwingDamage(target, false);
+        var hp = target.MaxHp > 0 ? target.Hp : inputs.Data?.Monster(target.ClassId)?.HP ?? target.Hp;
         return (autoDmg, hp);
     }
 
-    private bool AoeWorthIt(Snapshot snap, MonsterInfo target, CharacterSkill skill, int level, int enemiesInArea)
+    private static bool AoeWorthIt(Snapshot snap, MonsterInfo target, CharacterSkill skill, int level, int enemiesInArea,
+        SkillChoiceInputs inputs, IReadOnlyList<SkillRule> rules, Func<CharacterSkill, int> knownLevel)
     {
         if (enemiesInArea >= 2 || SkillPolicy.SelfBuff(skill, level) is not { } buff) return enemiesInArea >= 2;
         if (snap.SelfStatuses.Contains(buff.Status)) return false;
-        var (autoDmg, hp) = PolicyInputs(snap, target);
+        var (autoDmg, hp) = PolicyInputs(target, inputs);
         if (autoDmg <= 0) return false; // the buff rides on auto-attacks
         // Buff element vs the target, relative to the neutral swing autoDmg already includes.
-        var (ele, eleLv) = ElementChart.Parse(_data?.Monster(target.ClassId)?.Element ?? "");
+        var (ele, eleLv) = ElementChart.Parse(inputs.Data?.Monster(target.ClassId)?.Element ?? "");
         var eleMod = ElementChart.GetModifier(buff.Element, ele, eleLv) / (double)Math.Max(1, ElementChart.GetModifier(SimElement.Neutral, ele, eleLv));
         var interval = snap.SelfAttackInterval > 0.05 ? snap.SelfAttackInterval : 1.5;
         var saved = SkillPolicy.BuffCastHitsSaved(skill, level, hp, autoDmg, interval, eleMod);
-        var cost = SkillPolicy.SpCost(_data?.SkillInfo(skill)?.SpCost, level);
-        return SkillPolicy.AoeWorthIt(skill, level, enemiesInArea, false, saved, cost, BestSingleTargetSwingsPerSp(snap, target, autoDmg, hp));
+        var cost = SkillPolicy.SpCost(inputs.Data?.SkillInfo(skill)?.SpCost, level);
+        return SkillPolicy.AoeWorthIt(skill, level, enemiesInArea, false, saved, cost,
+            BestSingleTargetSwingsPerSp(snap, hp, autoDmg, inputs, rules, knownLevel));
     }
 
     /// <summary>Best swings-saved-per-SP among the script's single-target damage rules on this target: the SP a buff
     /// cast competes with. 0 when the script has none (or none would fire).</summary>
-    private double BestSingleTargetSwingsPerSp(Snapshot snap, MonsterInfo target, double autoDmg, int hp)
+    private static double BestSingleTargetSwingsPerSp(Snapshot snap, int hp, double autoDmg, SkillChoiceInputs inputs,
+        IReadOnlyList<SkillRule> rules, Func<CharacterSkill, int> knownLevel)
     {
         var best = 0.0;
         var spFree = SkillPolicy.SpIsFree(snap.SelfSp, snap.SelfMaxSp, snap.SelfInt);
-        foreach (var r in GetSkillRules())
+        foreach (var r in rules)
         {
             if (r.Target != SkillCastTarget.Enemy || SkillPolicy.Aoe(r.Skill) != null || SkillPolicy.DamageMultiplier(r.Skill, 1) <= 0) continue;
-            if (!KnowsSkill(r.Skill, out var known)) continue;
-            var costs = _data?.SkillInfo(r.Skill)?.SpCost;
+            var known = knownLevel(r.Skill);
+            if (known <= 0) continue;
+            var costs = inputs.Data?.SkillInfo(r.Skill)?.SpCost;
             var lv = SkillPolicy.ChooseLevel(r.Skill, r.Level > 0 ? Math.Min(r.Level, known) : known, r.Level > 0, costs,
                 hp, false, autoDmg, snap.SelfSp, spFree);
             if (lv <= 0) continue;
             best = Math.Max(best, (double)SkillPolicy.HitsSaved(hp, autoDmg, autoDmg * SkillPolicy.DamageMultiplier(r.Skill, lv)) / SkillPolicy.SpCost(costs, lv));
         }
         return best;
+    }
+
+    /// <summary>The rule TickSkillsAsync fires this tick, without I/O: the first enemy/self/ground rule that is off its
+    /// local throttle, known, whose conditions hold, at a level SkillPolicy finds worth the SP (area skills: enough
+    /// enemies in the blast, or a buff worth casting) and whose zeny cost <paramref name="zenyBlock"/> lets through
+    /// (it returns the skip reason). Every skipped rule adds its reason to <paramref name="skipReasons"/>.
+    /// The live bot and the offline hunt simulator (HuntSimulator) both decide here.</summary>
+    internal static (SkillRule Rule, int Level)? ChooseSkillRule(IReadOnlyList<SkillRule> rules, Snapshot snap, MonsterInfo target,
+        SkillChoiceInputs inputs, Func<CharacterSkill, int> knownLevel, Func<CharacterSkill, bool> throttled,
+        Func<CharacterSkill, int, string?> zenyBlock, List<string> skipReasons)
+    {
+        foreach (var rule in rules)
+        {
+            if (rule.Target == SkillCastTarget.Ally) continue; // ally rules are handled in TickAllyRulesAsync
+            if (throttled(rule.Skill))
+            {
+                skipReasons.Add($"{rule.Skill}: local cooldown");
+                continue;
+            }
+            var knownLv = knownLevel(rule.Skill);
+            if (knownLv <= 0)
+            {
+                skipReasons.Add($"{rule.Skill}: not known by this bot");
+                continue;
+            }
+            if (FailedCondition(rule.Conditions, snap, target) is { } failed)
+            {
+                skipReasons.Add($"{rule.Skill}: {failed}");
+                continue;
+            }
+
+            var level = rule.Level > 0 ? Math.Min(rule.Level, knownLv) : knownLv;
+            if (level <= 0)
+            {
+                skipReasons.Add($"{rule.Skill}: level resolves to 0");
+                continue;
+            }
+
+            if (SkillPolicy.Aoe(rule.Skill) is { } aoe)
+            {
+                var center = aoe.OnSelf ? snap.SelfPos : target.Pos;
+                var hit = 0;
+                foreach (var m in snap.Monsters)
+                    if ((m.MaxHp <= 0 || m.Hp > 0) && Math.Max(Math.Abs(m.Pos.X - center.X), Math.Abs(m.Pos.Y - center.Y)) <= aoe.Radius) hit++;
+                if (!AoeWorthIt(snap, target, rule.Skill, level, hit, inputs, rules, knownLevel))
+                {
+                    skipReasons.Add($"{rule.Skill}: area skill would hit {hit} enemy (and its buff is up or not worth the SP here)");
+                    continue;
+                }
+            }
+            else if (rule.Target == SkillCastTarget.Enemy)
+            {
+                level = SkillPolicyLevel(snap, target, rule.Skill, level, rule.Level > 0, inputs);
+                if (level <= 0)
+                {
+                    skipReasons.Add($"{rule.Skill}: not worth the SP (debuff already up, or saves no swing)");
+                    continue;
+                }
+            }
+
+            if (zenyBlock(rule.Skill, level) is { } broke)
+            {
+                skipReasons.Add($"{rule.Skill}: {broke}");
+                continue;
+            }
+            return (rule, level);
+        }
+        return null;
     }
 
     private MonsterInfo? FindMostInjuredVisiblePlayer()
@@ -255,67 +326,24 @@ public sealed partial class BotBehavior
         if (DateTime.UtcNow < _nextSkill) return false;
 
         // Collect skip reasons per rule so the user can see WHY their script didn't fire (deduped below).
-        List<string>? skipReasons = null;
-        foreach (var rule in rules)
-        {
-            if (rule.Target == SkillCastTarget.Ally) continue; // ally rules are handled in TickAllyRulesAsync
-            if (_skillCooldown.TryGetValue(rule.Skill, out var nextOk) && DateTime.UtcNow < nextOk)
+        var skipReasons = new List<string>();
+        var inputs = new SkillChoiceInputs(_data, _config.NoAutoAttack, (m, poisoned) => Forecast(snap, m, poisoned).ExpectedDamagePerSwing);
+        var choice = ChooseSkillRule(rules, snap, target, inputs,
+            skill => KnowsSkill(skill, out var known) ? known : 0,
+            skill => _skillCooldown.TryGetValue(skill, out var nextOk) && DateTime.UtcNow < nextOk,
+            (skill, level) =>
             {
-                (skipReasons ??= new()).Add($"{rule.Skill}: local cooldown");
-                continue;
-            }
-            if (!KnowsSkill(rule.Skill, out var knownLevel))
-            {
-                (skipReasons ??= new()).Add($"{rule.Skill}: not known by this bot");
-                continue;
-            }
-            if (FailedCondition(rule.Conditions, snap, target) is { } failed)
-            {
-                (skipReasons ??= new()).Add($"{rule.Skill}: {failed}");
-                continue;
-            }
-
-            var level = rule.Level > 0 ? Math.Min(rule.Level, knownLevel) : knownLevel;
-            if (level <= 0)
-            {
-                (skipReasons ??= new()).Add($"{rule.Skill}: level resolves to 0");
-                continue;
-            }
-
-            if (SkillPolicy.Aoe(rule.Skill) is { } aoe)
-            {
-                var center = aoe.OnSelf ? snap.SelfPos : target.Pos;
-                var hit = 0;
-                foreach (var m in snap.Monsters)
-                    if ((m.MaxHp <= 0 || m.Hp > 0) && Math.Max(Math.Abs(m.Pos.X - center.X), Math.Abs(m.Pos.Y - center.Y)) <= aoe.Radius) hit++;
-                if (!AoeWorthIt(snap, target, rule.Skill, level, hit))
-                {
-                    (skipReasons ??= new()).Add($"{rule.Skill}: area skill would hit {hit} enemy (and its buff is up or not worth the SP here)");
-                    continue;
-                }
-            }
-            else if (rule.Target == SkillCastTarget.Enemy)
-            {
-                level = SkillPolicyLevel(snap, target, rule.Skill, level, pinLevel: rule.Level > 0);
-                if (level <= 0)
-                {
-                    (skipReasons ??= new()).Add($"{rule.Skill}: not worth the SP (debuff already up, or saves no swing)");
-                    continue;
-                }
-            }
-
-            var zenyCost = SkillZenyCost(rule.Skill, level);
-            if (zenyCost > 0)
-            {
+                var zenyCost = SkillZenyCost(skill, level);
+                if (zenyCost <= 0) return null;
                 if (_skillZenyLeft < 0) _skillZenyLeft = ConvenienceBudget(_bot.WithState(w => w.Self.Zeny), ZenyForTripHome(snap));
                 if (zenyCost > _skillZenyLeft)
-                {
-                    (skipReasons ??= new()).Add($"{rule.Skill}: zeny budget spent ({_skillZenyLeft}z left of this shop trip's share, needs {zenyCost}z)");
-                    continue;
-                }
+                    return $"zeny budget spent ({_skillZenyLeft}z left of this shop trip's share, needs {zenyCost}z)";
                 _skillZenyLeft -= zenyCost;
-            }
-
+                return null;
+            },
+            skipReasons);
+        if (choice is var (rule, level))
+        {
             _nextSkill = DateTime.UtcNow.AddSeconds(0.25); // global skill throttle: 250ms between any two casts
             var coolSecs = rule.EveryCooldown > 0 ? rule.EveryCooldown : 1.5;
             _skillCooldown[rule.Skill] = DateTime.UtcNow.AddSeconds(coolSecs);

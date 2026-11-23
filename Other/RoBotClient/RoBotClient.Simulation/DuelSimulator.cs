@@ -121,7 +121,7 @@ public sealed record DuelPrediction(
 /// </summary>
 public static class DuelSimulator
 {
-    private static readonly FieldInfo RandomField = typeof(GameRandom).GetField("local", BindingFlags.NonPublic | BindingFlags.Static)
+    internal static readonly FieldInfo RandomField = typeof(GameRandom).GetField("local", BindingFlags.NonPublic | BindingFlags.Static)
         ?? throw new MissingFieldException(nameof(GameRandom), "local");
 
     private static readonly Dictionary<CharacterSkill, RoRebuildServer.Simulation.Skills.SkillHandlerBase> SkillHandlers = new()
@@ -388,7 +388,7 @@ public static class DuelSimulator
             entity.AddStatusEffect(StatusEffectState.NewStatusEffect(status.Status, (float)status.Seconds, status.Value1));
     }
 
-    private static readonly FieldInfo MonsterLastDamageField =
+    internal static readonly FieldInfo MonsterLastDamageField =
         typeof(Monster).GetField("timeSinceLastDamage", BindingFlags.NonPublic | BindingFlags.Instance)!;
 
     private static void SetClock(double seconds)
@@ -417,7 +417,7 @@ public static class DuelSimulator
 
     /// <summary>Removes every status effect (running their expiry handlers, which undo their stat changes) and
     /// returns the container to its pool, so a trial starts from the state the previous one began with.</summary>
-    private static bool ClearStatusEffects(CombatEntity entity)
+    internal static bool ClearStatusEffects(CombatEntity entity)
     {
         if (!entity.TryGetStatusContainer(out var container)) return true;
         container.RemoveAll();
@@ -427,7 +427,7 @@ public static class DuelSimulator
     }
 
     /// <summary>The cooldown CombatEntity.ApplyCooldownForAttackAction puts between a monster's swings.</summary>
-    private static double MonsterAttackInterval(CombatEntity monster)
+    internal static double MonsterAttackInterval(CombatEntity monster)
     {
         monster.Character.AttackCooldown = 0;
         monster.ApplyCooldownForAttackAction();
@@ -453,13 +453,15 @@ public static class DuelSimulator
             probe.Time - Time.ElapsedTimeFloat,
             monster.CombatEntity.GetStat(CharacterStat.MaxHp), (float)MonsterAttackInterval(monster.CombatEntity),
             monsterProbe.Time - Time.ElapsedTimeFloat,
-            // Whether the monster's AI state machine (MonsterAI.csv) can ever perform an attack: plants and the
-            // like never do.
-            DataManager.GetAiStateMachine(monster.MonsterBase.AiType).Any(entry => entry.OutputCheck == MonsterOutputCheck.OutPerformAttack));
+            FightsBack(monster));
     }
 
+    /// <summary>Whether the monster's AI state machine (MonsterAI.csv) can ever perform an attack: plants and the like never do.</summary>
+    internal static bool FightsBack(Monster monster) =>
+        DataManager.GetAiStateMachine(monster.MonsterBase.AiType).Any(entry => entry.OutputCheck == MonsterOutputCheck.OutPerformAttack);
+
     // World.CreatePlayer + the character-load half of it, minus the map, network and database parts.
-    private static Player CreatePlayer(PlayerBuild build)
+    internal static Player CreatePlayer(PlayerBuild build)
     {
         var entity = EntityManager.New(EntityType.Player);
         var character = entity.Get<WorldObject>();
@@ -515,7 +517,7 @@ public static class DuelSimulator
     }
 
     // World.CreateMonster minus map placement and minions.
-    private static Monster CreateMonster(MonsterDatabaseInfo info)
+    internal static Monster CreateMonster(MonsterDatabaseInfo info)
     {
         var entity = EntityManager.New(EntityType.Monster);
         var character = entity.Get<WorldObject>();

@@ -65,6 +65,8 @@ public static class ServerCombatRuntime
             var dataConfig = ServerConfig.DataConfig;
             dataConfig.DataPath = Path.GetFullPath(Path.Combine(serverProjectDirectory, dataConfig.DataPath));
             dataConfig.CachePath = Path.GetFullPath(Path.Combine(serverProjectDirectory, dataConfig.CachePath));
+            // Map walk files (MapWalkData, the ServerWorld's maps); the config may carry Windows separators.
+            dataConfig.WalkPathData = Path.GetFullPath(Path.Combine(serverProjectDirectory, (dataConfig.WalkPathData ?? "").Replace('\\', '/')));
             ServerLogger.SetLogger(new LoggerConfiguration().MinimumLevel.Warning().WriteTo.Console().CreateLogger());
 
             ScriptVersion = ScriptStamp();

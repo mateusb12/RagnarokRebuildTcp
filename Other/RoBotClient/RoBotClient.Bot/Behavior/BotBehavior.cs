@@ -546,18 +546,11 @@ public sealed partial class BotBehavior
     private double ExpPerSecond(Snapshot snap, MonsterInfo m, BattleForecast f, int distance)
     {
         var exp = _data?.Monster(m.ClassId)?.Exp ?? 0;
-        return exp / Math.Max(0.1, f.SecondsToKillMonster + distance * _bot.SelfSecondsPerCell + RestSeconds(snap, f));
+        return HuntPolicy.ExpPerSecond(exp, f.SecondsToKillMonster, distance, _bot.SelfSecondsPerCell, RestSeconds(snap, f));
     }
 
-    /// <summary>Seconds of sitting to regenerate the HP the forecast says this fight costs. Mirrors the server's
-    /// Player.HpRegenTick: (MaxHp/50 + Vit/5)*(200+Vit)/200 per tick, a tick every 3 s sitting and doubled.
-    /// ponytail: ignores potions, AddHpRecoveryPercent and Increased HP Recovery, so it overstates the cost
-    /// for bots with those; fold them in if such bots start avoiding fights they'd win cheaply.</summary>
-    private static double RestSeconds(Snapshot snap, BattleForecast f)
-    {
-        var perTick = Math.Max(1, (snap.SelfMaxHp / 50 + snap.SelfVit / 5) * (200 + snap.SelfVit) / 200);
-        return f.ExpectedDamageTaken / (perTick * 2 / 3.0);
-    }
+    /// <summary>Seconds of sitting to regenerate the HP the forecast says this fight costs (HuntPolicy.RestSeconds).</summary>
+    private static double RestSeconds(Snapshot snap, BattleForecast f) => HuntPolicy.RestSeconds(snap.SelfMaxHp, snap.SelfVit, f.ExpectedDamageTaken);
 
     private MonsterInfo? PickTarget(Snapshot snap, out BattleForecast chosen)
     {
@@ -684,9 +677,7 @@ public sealed partial class BotBehavior
         // Reachability check uses the danger overlay too — a target that's only reachable through a kill-
         // you mob's aggro should be treated as effectively unreachable for safety.
         var path = map.FindPath(snap.SelfPos.X, snap.SelfPos.Y, gx, gy, 6000, MakePathCost(snap.Map));
-        // A mob across a wall is in view but the walk loops away from it: it leaves view mid-detour, we wander back,
-        // see it, re-engage (resetting the stuck clock) — Bot2 ping-ponged with a Stainer 60-76 cells of walk away.
-        return path != null && path.Count - 1 <= Math.Max(30, 2.5 * Dist(snap.SelfPos, target));
+        return path != null && HuntPolicy.DetourAcceptable(path.Count - 1, Dist(snap.SelfPos, target));
     }
 
     /// <summary>Build a per-cell HAZARD-ONLY cost closure — for path searches where the goal itself is
@@ -2130,9 +2121,9 @@ public sealed partial class BotBehavior
 
     private static int Dist(Position a, Position b) => Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
 
-    private sealed record MonsterInfo(int Id, int ClassId, string Name, Position Pos, int Hp, int MaxHp);
+    internal sealed record MonsterInfo(int Id, int ClassId, string Name, Position Pos, int Hp, int MaxHp);
 
-    private sealed class Snapshot
+    internal sealed class Snapshot
     {
         public Snapshot Clone() => (Snapshot)MemberwiseClone(); // shallow: the lists are read-only after From()
 

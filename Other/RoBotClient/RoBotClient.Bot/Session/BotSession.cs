@@ -900,13 +900,40 @@ public sealed class BotSession : IAsyncDisposable
     {
         if (_conn == null) return Task.CompletedTask;
         Telemetry.Record(TelemetryEventType.SkillCast, World.Self.Level, $"{skill}@enemy", level);
+        return _conn.SendPacketAsync(SkillOnTargetPacket(skill, level, targetId), ct);
+    }
+
+    /// <summary>The skill packets as they go on the wire; the offline simulator hands the same bytes to the server's handler.</summary>
+    public static PacketWriter SkillOnTargetPacket(CharacterSkill skill, int level, int targetId)
+    {
         var w = new PacketWriter();
         w.WritePacketType(PacketType.Skill);
         w.Write((byte)SkillTarget.Enemy);
         w.Write(targetId);
         w.Write((byte)skill);
         w.Write((byte)level);
-        return _conn.SendPacketAsync(w, ct);
+        return w;
+    }
+
+    public static PacketWriter SkillSelfPacket(CharacterSkill skill, int level)
+    {
+        var w = new PacketWriter();
+        w.WritePacketType(PacketType.Skill);
+        w.Write((byte)SkillTarget.Self);
+        w.Write((short)skill);
+        w.Write((byte)level);
+        return w;
+    }
+
+    public static PacketWriter SkillGroundPacket(CharacterSkill skill, int level, int x, int y)
+    {
+        var w = new PacketWriter();
+        w.WritePacketType(PacketType.Skill);
+        w.Write((byte)SkillTarget.Ground);
+        w.Write(new Position(x, y));
+        w.Write((byte)skill);
+        w.Write((byte)level);
+        return w;
     }
 
     /// <summary>Cast a self-targeted skill (buff, heal-self). Note: the self path encodes the skill id as a
@@ -915,12 +942,7 @@ public sealed class BotSession : IAsyncDisposable
     {
         if (_conn == null) return Task.CompletedTask;
         Telemetry.Record(TelemetryEventType.SkillCast, World.Self.Level, $"{skill}@self", level);
-        var w = new PacketWriter();
-        w.WritePacketType(PacketType.Skill);
-        w.Write((byte)SkillTarget.Self);
-        w.Write((short)skill);
-        w.Write((byte)level);
-        return _conn.SendPacketAsync(w, ct);
+        return _conn.SendPacketAsync(SkillSelfPacket(skill, level), ct);
     }
 
     /// <summary>Cast a ground-targeted skill at a cell (AoE / placed skills). The server requires line of
@@ -929,13 +951,7 @@ public sealed class BotSession : IAsyncDisposable
     {
         if (_conn == null) return Task.CompletedTask;
         Telemetry.Record(TelemetryEventType.SkillCast, World.Self.Level, $"{skill}@ground({x},{y})", level);
-        var w = new PacketWriter();
-        w.WritePacketType(PacketType.Skill);
-        w.Write((byte)SkillTarget.Ground);
-        w.Write(new Position(x, y));
-        w.Write((byte)skill);
-        w.Write((byte)level);
-        return _conn.SendPacketAsync(w, ct);
+        return _conn.SendPacketAsync(SkillGroundPacket(skill, level, x, y), ct);
     }
 
     /// <summary>Create a new party with the given name. Server requirement: Basic Mastery level 6+.
