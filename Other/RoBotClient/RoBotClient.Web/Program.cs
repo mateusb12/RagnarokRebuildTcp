@@ -28,6 +28,7 @@ builder.Services.AddSingleton(new MonsterSprites(
 
 builder.Services.AddSingleton(sp => new RoBotClient.Web.Features.Simulation.SimSprites(
     ResolveRepoSubdir(Path.Combine("RebuildClient", "Assets")), sp.GetRequiredService<MonsterSprites>()));
+builder.Services.AddSingleton(new RoBotClient.Web.Features.Simulation.SimEffects(ResolveRepoSubdir(Path.Combine("RebuildClient", "Assets"))));
 
 // Persistent registry of (account, password, character) tuples — populated when a bot enters the world, so
 // the UI and MCP can later "reconnect" to a previously-used character without remembering credentials.
@@ -129,6 +130,8 @@ app.MapGet("/monster-anim/{name}", (string name, MonsterSprites sprites) =>
 
 // Simulation tab: raw RO sprites (headgear, weapons, shields) for the bot's look (sim-sprites.js decodes them).
 app.MapGet("/sim-sprite/{**path}", (string path, RoBotClient.Web.Features.Simulation.SimSprites s) => s.Serve(path));
+// Simulation tab: the client's STR effects (Assets/Effects/{name}.asset) as JSON for sim-effects.js.
+app.MapGet("/sim-effect/{name}", (string name, RoBotClient.Web.Features.Simulation.SimEffects s) => s.Serve(name));
 // Simulation tab: a saved offline replay, for the page's replay viewer (sim.js).
 app.MapGet("/sim-replay/{name}", (string name, RoBotClient.Web.Features.Simulation.SimRunner runner) =>
     runner.PathOf(name) is { } path ? Results.File(path, "application/json") : Results.NotFound());

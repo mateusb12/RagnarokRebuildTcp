@@ -6,6 +6,7 @@
 
 const Sprites = await import("./sim-sprites.js" + new URL(import.meta.url).search); // visual-only sprite code
 const { animOf, drawLayers, dpr, font, lastLE } = Sprites;
+const Effects = await import("./sim-effects.js" + new URL(import.meta.url).search); // the client's STR skill effects
 
 const COLORS = {
     bg: "#10131a", walkable: "#3a4254", blocked: "#191c24", self: "#3b9dff", monster: "#e5484d", target: "#ffe066",
@@ -76,6 +77,7 @@ class Viewer {
         this.mobLife = new Map();  // id -> [{t, alive, x, y, dt?, dir?}]: dt > 0 a step of a wander that took dt to arrive at t
         this.mobHp = new Map();    // id -> [{t, hp}]
         this.spriteIx = Sprites.indexMonsters(rp);
+        this.effects = Effects.index(rp);
         this.drops = new Map(); // mob id (0: the bot) -> HP drops [{t, before, after}], for the HP bars' white trail
         for (const e of rp.events) if ((e.kind === "hit" || e.kind === "hurt") && e.amount > 0 && e.hpLeft >= 0) {
             const k = e.kind === "hurt" ? 0 : e.mob; let l = this.drops.get(k); if (!l) this.drops.set(k, l = []);
@@ -383,6 +385,7 @@ class Viewer {
         Sprites.drawHpBar(g, b.x, b.y + br + 7, 28, 4, vit.hp / this.rp.maxHp, this.trailAt(0, t, vit.hp, this.rp.maxHp));
         this.bar(g, b.x - 14, b.y + br + 8, 28, 3, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff");
         this.hoverTargets.push({ x: b.x, y: b.y, r: br + 3, id: 0, text: "bot (" + me.cx + "," + me.cy + ") HP " + vit.hp + "/" + this.rp.maxHp + " SP " + vit.sp + "/" + this.rp.maxSp + " · " + ACTIVITY[act].label });
+        Effects.draw(g, this, this.effects, t);
         const ev = this.rp.events;
         // Damage numbers and the skill shout (sim-sprites.js, ported from the client; the minimap draws them the same way).
         const sh = Math.max(22, Math.min(72, z * 2.6)), NV = { ctx: g, spriteHeight: sh * dpr() }, combos = new Set();
