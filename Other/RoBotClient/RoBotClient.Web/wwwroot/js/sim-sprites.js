@@ -81,16 +81,16 @@ export function monsterFrame(a, dir, { dead = null, atk = Infinity, hit = Infini
     return { frame, alpha };
 }
 
-/** Layers for a monster at t. The simulator has no monster facing: it faces the bot while fighting it (a swing or flinch
- *  within 3 s), else south. px: screen pixels per sprite pixel; the client draws sprites at 50 px per tile, scaled 1.5
+/** Layers for a monster at t: it faces the bot while fighting it (a swing or flinch within 3 s), else the way it last
+ *  walked (m.dir; south before it ever moved), walking while m.walk (its seconds per cell). px: screen pixels per sprite pixel; the client draws sprites at 50 px per tile, scaled 1.5
  *  (x Size for monsters). */
 export function monsterLayers(ix, a, id, m, t, me, s, px) {
     const flinchAt = (() => { const l = ix.hits.get(id); const i = l ? lastLE(l, t) : -1; return i >= 0 ? l[i] : -Infinity; })();
     const sw = (() => { const l = ix.swings.get(id); const i = l ? lastLE(l, t, x => x.t0) : -1; return i >= 0 ? l[i] : null; })();
-    const dir = (sw && t - sw.t0 < 3) || t - flinchAt < 3 || !m.alive ? facing(me.x - m.x, me.y - m.y) : 0;
+    const dir = (sw && t - sw.t0 < 3) || t - flinchAt < 3 || !m.alive ? facing(me.x - m.x, me.y - m.y) : m.dir ?? 0;
     // ServerControllable.SetAttackAnimationSpeed: AnimSpeed = motionTime / (AttackFrameTime / 1000), so the attack frame lands with the damage.
     const speed = sw && sw.motion > 0 && a.attackFrameTime > 0 ? sw.motion * 1000 / a.attackFrameTime : 1;
-    const pose = monsterFrame(a, dir, { dead: m.alive ? null : (t - m.diedAt) * 1000, atk: sw ? (t - sw.t0) * 1000 : Infinity, hit: (t - flinchAt) * 1000, speed }, t * 1000);
+    const pose = monsterFrame(a, dir, { dead: m.alive ? null : (t - m.diedAt) * 1000, atk: sw ? (t - sw.t0) * 1000 : Infinity, hit: (t - flinchAt) * 1000, speed, walk: !!m.walk }, m.walk ? t / m.walk * 6.808 * 24 : t * 1000); // walk loop: as map.js
     const layers = pose ? place(a, pose.frame, 0, 0, s.x, s.y + 2, px * (a.size || 1), pose.alpha) : [];
     return layers.length ? { layers, box: box(layers) } : null;
 }

@@ -85,6 +85,11 @@ if (mode == "huntsim")
         SkillScript: script, NoAutoAttack: botConfig?.NoAutoAttack ?? false, Config: botConfig, ConfigSource: configSource);
     var started = System.Diagnostics.Stopwatch.StartNew();
     var sim = new HuntSimulator(options, data);
+    if (args.Contains("--progress")) // for the dashboard's progress bar (SimRunner): "progress N" on stderr per whole percent
+    {
+        var last = -1;
+        sim.OnProgress = f => { if ((int)(f * 100) is var p && p != last) Console.Error.WriteLine($"progress {last = p}"); };
+    }
     sim.Run();
     Console.WriteLine($"Build source: {buildSource}. Wall time {started.Elapsed.TotalSeconds:F1}s.");
     Console.WriteLine(sim.Report());
@@ -103,16 +108,15 @@ if (mode == "huntsim")
         Console.WriteLine("\n== Verification ==");
         Console.WriteLine("Invariants enforced during the run (any violation throws): every step is to an adjacent walkable cell without cutting a wall corner; "
             + "every candidate is within view (21 cells); every fight starts in melee range; a killed monster stays dead until a respawn delay inside its rule; "
-            + "the clock equals walking + fighting + idle + resting time.");
-        Console.WriteLine($"Clock: {sim.WanderSeconds:F3} wander + {sim.ApproachSeconds:F3} walk-up + {sim.FightSeconds:F3} fight + {sim.IdleSeconds:F3} idle + {sim.RestSeconds:F3} rest = "
-            + $"{sim.WanderSeconds + sim.ApproachSeconds + sim.FightSeconds + sim.IdleSeconds + sim.RestSeconds:F3}s of {options.DurationSeconds:F0}s; "
+            + "the clock equals walking + fighting + idle + resting + fleeing time.");
+        Console.WriteLine($"Clock: {sim.WanderSeconds:F3} wander + {sim.ApproachSeconds:F3} walk-up + {sim.FightSeconds:F3} fight + {sim.IdleSeconds:F3} idle + {sim.RestSeconds:F3} rest + {sim.FleeSeconds:F3} flee = "
+            + $"{sim.WanderSeconds + sim.ApproachSeconds + sim.FightSeconds + sim.IdleSeconds + sim.RestSeconds + sim.FleeSeconds:F3}s of {options.DurationSeconds:F0}s; "
             + $"{sim.Steps} steps = {sim.Steps - sim.DiagonalSteps} x 0.15s + {sim.DiagonalSteps} x 0.212s = {(sim.Steps - sim.DiagonalSteps) * 0.15 + sim.DiagonalSteps * 0.15 * 1.4142:F3}s walked");
         Console.WriteLine("Example obstacle: " + (sim.ObstacleExample ?? "none drawn"));
         Console.WriteLine("Example respawn: " + (sim.RespawnExample ?? "no respawn within the run"));
         foreach (var example in sim.Examples) Console.WriteLine("Example " + example);
         var again = new HuntSimulator(options, data);
-        again.Run();
-        var other = new HuntSimulator(options with { Seed = options.Seed + 1 }, data);
+        again.Run();        var other = new HuntSimulator(options with { Seed = options.Seed + 1 }, data);
         other.Run();
         Console.WriteLine($"Determinism: seed {options.Seed} twice -> {sim.Fingerprint()} / {again.Fingerprint()} ({(sim.Fingerprint() == again.Fingerprint() && sim.Exp == again.Exp ? "identical" : "DIFFERENT")}); "
             + $"seed {options.Seed + 1} -> {other.Fingerprint()}, {other.Kills} kills / {other.Exp} exp vs {sim.Kills} / {sim.Exp}");

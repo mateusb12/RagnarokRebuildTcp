@@ -22,11 +22,23 @@ public sealed class SimRunner(string repoRoBot)
     public string Directory { get; } = Path.Combine(repoRoBot, "sim-replays");
     public string HostDll => Path.Combine(repoRoBot, "RoBotClient.Host", "bin", "Debug", "net9.0", "RoBotClient.Host.dll");
     public Status Current { get { lock (_lock) return _status; } }
+    /// <summary>The running hunt's progress in whole percent (huntsim --progress), -1 before its first report.</summary>
+    public int Percent => _percent;
+    private volatile int _percent = -1;
 
     /// <summary>Saved runs, newest first.</summary>
     public List<string> Runs() => System.IO.Directory.Exists(Directory)
         ? new DirectoryInfo(Directory).GetFiles("*.json").OrderByDescending(f => f.LastWriteTimeUtc).Select(f => Path.GetFileNameWithoutExtension(f.Name)).ToList()
         : new();
+
+    /// <summary>Deletes every saved run (sim-replays/*.json); returns how many. Nothing while a run is writing one.</summary>
+    public int DeleteAll()
+    {
+        lock (_lock) if (_status.Running) return 0;
+        var files = System.IO.Directory.Exists(Directory) ? System.IO.Directory.GetFiles(Directory, "*.json") : [];
+        foreach (var f in files) File.Delete(f);
+        return files.Length;
+    }
 
     /// <summary>A saved run's file, or null for a name that isn't one (names come from the browser).</summary>
     public string? PathOf(string name) =>
@@ -51,6 +63,7 @@ public sealed class SimRunner(string repoRoBot)
         {
             if (_status.Running) return false;
             _status = new Status(true, r, DateTime.UtcNow, null, null, "");
+            _percent = -1;
         }
         Changed?.Invoke();
         _ = Task.Run(() => RunAsync(r));
@@ -72,12 +85,21 @@ public sealed class SimRunner(string repoRoBot)
                 RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false,
                 WorkingDirectory = Path.GetDirectoryName(HostDll)!,
             };
-            foreach (var a in new[] { HostDll, "huntsim", r.Map, r.Bot, r.Minutes.ToString(System.Globalization.CultureInfo.InvariantCulture), r.Seed.ToString(), "--replay", file })
+            foreach (var a in new[] { HostDll, "huntsim", r.Map, r.Bot, r.Minutes.ToString(System.Globalization.CultureInfo.InvariantCulture), r.Seed.ToString(), "--replay", file, "--progress" })
                 psi.ArgumentList.Add(a);
             if (r.Script != null) { psi.ArgumentList.Add("--script"); psi.ArgumentList.Add(r.Script.Replace("\r", "").Replace('\n', ';')); }
             using var p = Process.Start(psi)!;
             var stdout = p.StandardOutput.ReadToEndAsync();
-            var stderr = p.StandardError.ReadToEndAsync();
+            var stderr = Task.Run(async () =>
+            {
+                var rest = new System.Text.StringBuilder();
+                while (await p.StandardError.ReadLineAsync() is { } line)
+                {
+                    if (line.StartsWith("progress ") && int.TryParse(line[9..], out var pct)) _percent = pct;
+                    else rest.AppendLine(line);
+                }
+                return rest.ToString();
+            });
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(10));
             try { await p.WaitForExitAsync(cts.Token); }
             catch (OperationCanceledException) { p.Kill(true); throw new TimeoutException("the run took over 10 minutes and was stopped"); }

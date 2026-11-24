@@ -31,6 +31,10 @@ public sealed class HuntReplay
     public required List<ReplayMob> Mobs { get; init; }
     public required List<ReplayStep> Track { get; init; }
     public required List<ReplayVitals> Vitals { get; init; }
+    /// <summary>Monster walks, compact (thousands per run): [mob id, start s, seconds per cell, start x, start y, steps(, 1)], steps
+    /// one digit per cell, an index into HuntSimulator.StepDirs (0 north, clockwise); a diagonal step takes x1.4142. Without
+    /// the trailing 1: a planned wander (later events can cut it short); with it: steps the server AI walked, as they happened.</summary>
+    public List<object[]>? MobMoves { get; init; }
     public required List<ReplayEvent> Events { get; init; }
     public required ReplaySummary Summary { get; init; }
     public required List<ReplayCapability> Capabilities { get; init; }

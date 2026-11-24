@@ -11,8 +11,7 @@ namespace RoBotClient.Bot.Behavior;
 public sealed partial class BotBehavior
 {
     // The server's attack range test: straight-line distance rounded to whole cells (DistanceCache.IntDistance).
-    private static int ServerDistance(int x0, int y0, int x1, int y1) =>
-        (int)Math.Round(Math.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)));
+    private static int ServerDistance(int x0, int y0, int x1, int y1) => HuntPolicy.ServerDistance(x0, y0, x1, y1);
 
     private DateTime _nextFiringWalk;
     private Position _firingWalkGoal;
@@ -22,16 +21,7 @@ public sealed partial class BotBehavior
         _data?.Monster(target.ClassId) is { } db && IsMonsterImmobile(db) && InferAttackRange(snap) > db.Range + 1;
 
     // A fixed monster other than the target that would hit someone standing on (x, y). One cell of margin for rounding.
-    private bool InOtherFixedReach(Snapshot snap, int x, int y, int targetId)
-    {
-        foreach (var m in snap.Monsters)
-        {
-            if (m.Id == targetId || (m.MaxHp > 0 && m.Hp <= 0)) continue;
-            if (_data?.Monster(m.ClassId) is not { } db || !IsMonsterImmobile(db)) continue;
-            if (ServerDistance(x, y, m.Pos.X, m.Pos.Y) <= db.Range + 1) return true;
-        }
-        return false;
-    }
+    private bool InOtherFixedReach(Snapshot snap, int x, int y, int targetId) => HuntPolicy.InOtherFixedReach(_data, snap.Monsters, x, y, targetId);
 
     private bool IsFiringCell(Snapshot snap, WalkMap map, MonsterInfo target, int reach, int range, int x, int y)
     {

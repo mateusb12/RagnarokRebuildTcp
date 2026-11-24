@@ -928,35 +928,15 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     /// crossing that one is fine since it's where we want to go.</summary>
     private int FurthestStraightLineSafeStep(string map, int fromX, int fromY,
         System.Collections.Generic.IReadOnlyList<(int x, int y)> path, int maxStep,
-        (int x, int y)? allowedPortalCell = null)
-    {
-        if (_data == null) return maxStep;
-        for (var i = maxStep; i >= 1; i--)
-        {
-            var (tx, ty) = path[i];
-            if (!WalkMayCrossPortal(map, fromX, fromY, tx, ty, allowedPortalCell))
-                return i;
-        }
-        return 0;
-    }
+        (int x, int y)? allowedPortalCell = null) =>
+        HuntPolicy.FurthestStraightLineSafeStep(_data, map, fromX, fromY, path, maxStep, allowedPortalCell);
 
     /// <summary>True if the server's walk from (x0,y0) to (x1,y1) could step on a warp footprint other than the
     /// goal portal. The server runs its own pathfinder rather than a straight line (from alberta's (102,153) it
     /// went diagonal first, into the shop warp at 98,153, and the bots bounced in and out forever), so test the
     /// whole box between the two points: on open ground every shortest 8-way path stays inside it.</summary>
-    private bool WalkMayCrossPortal(string map, int x0, int y0, int x1, int y1, (int x, int y)? allowedPortalCell)
-    {
-        if (_data == null || (x0 == x1 && y0 == y1)) return false;
-        int minX = Math.Min(x0, x1), maxX = Math.Max(x0, x1), minY = Math.Min(y0, y1), maxY = Math.Max(y0, y1);
-        foreach (var f in _data.World.PortalFootprintsOn(map))
-        {
-            if (f.maxX < minX || f.minX > maxX || f.maxY < minY || f.minY > maxY) continue;
-            if (allowedPortalCell is { } a && a.x >= f.minX - 1 && a.x <= f.maxX + 1 && a.y >= f.minY - 1 && a.y <= f.maxY + 1)
-                continue; // goal portal: crossing it is the point
-            return true;
-        }
-        return false;
-    }
+    private bool WalkMayCrossPortal(string map, int x0, int y0, int x1, int y1, (int x, int y)? allowedPortalCell) =>
+        HuntPolicy.WalkMayCrossPortal(_data, map, x0, y0, x1, y1, allowedPortalCell);
 
     private string _lastReachabilityLog = "";
     private string _lastTravelLog = "";

@@ -169,6 +169,11 @@ public static class DuelSimulator
 
     public static bool IsKnownMonster(int monsterClassId) => DataManager.MonsterIdLookup.ContainsKey(monsterClassId);
 
+    /// <summary>MonsterBase.MoveSpeed (seconds per cell) when its AI (MonsterAI.csv) ever starts a random move; else -1 (plants, eggs).</summary>
+    public static double MonsterMoveSpeed(int monsterClassId) =>
+        DataManager.MonsterIdLookup.TryGetValue(monsterClassId, out var m)
+        && DataManager.GetAiStateMachine(m.AiType).Any(entry => entry.OutputCheck == MonsterOutputCheck.OutRandomMoveStart) ? m.MoveSpeed : -1;
+
     /// <summary>The server-derived stats of this build against this monster, without fighting.</summary>
     public static CombatSheet Inspect(PlayerBuild build, int monsterClassId, IReadOnlyList<ActiveStatus>? statuses = null)
     {

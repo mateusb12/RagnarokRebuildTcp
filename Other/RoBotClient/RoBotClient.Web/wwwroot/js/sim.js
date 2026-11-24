@@ -14,22 +14,23 @@ const COLORS = {
 const ACTIVITY = {
     wander: { label: "wandering", color: "#8e7cc3" }, approach: { label: "walking to target", color: "#ffe066" },
     fight: { label: "fighting", color: "#e5484d" }, rest: { label: "resting", color: "#3b9dff" },
-    idle: { label: "wedged / idle", color: "#6c757d" }, none: { label: "deciding", color: "#2b303b" },
+    idle: { label: "wedged / idle", color: "#6c757d" }, flee: { label: "fleeing", color: "#ff8c42" }, none: { label: "deciding", color: "#2b303b" },
 };
 const CATEGORY = {
-    decision: ["pick", "nopick", "wander", "idle", "cast-decision", "attack-decision", "sit", "stand"],
-    combat: ["engage", "kill", "death", "fight-end", "hit", "hurt", "executed", "rejected", "queued", "no-effect", "castbar", "reach", "abandon", "knockback"],
+    decision: ["pick", "nopick", "wander", "idle", "cast-decision", "attack-decision", "sit", "stand", "flee", "flee-move", "flee-end", "threat"],
+    combat: ["engage", "kill", "death", "fight-end", "hit", "hurt", "executed", "rejected", "queued", "no-effect", "castbar", "reach", "abandon", "knockback", "aggro", "ai", "monster-cast"],
     recovery: ["regen", "sit-refused", "stand-refused"],
     world: ["spawn", "area-start", "area-end", "area-status", "world", "sighting", "route", "start", "end", "note"],
     problem: ["failed"],
 };
 const KNOWN = new Set(Object.values(CATEGORY).flat());
 const MINOR = new Set(["hit", "hurt", "regen", "spawn", "attack-decision", "route", "area-status", "world", "castbar", "reach"]);
-const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon"]);
+const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon", "aggro", "flee", "flee-end", "threat"]);
 const BADGE = {
     pick: "text-bg-success", nopick: "text-bg-warning", wander: "text-bg-secondary", idle: "text-bg-secondary", kill: "text-bg-success",
     death: "text-bg-danger", failed: "text-bg-danger", rejected: "text-bg-warning", "no-effect": "text-bg-warning", sit: "text-bg-info", stand: "text-bg-info",
     "cast-decision": "text-bg-primary", executed: "text-bg-primary", engage: "text-bg-light", hurt: "text-bg-danger", hit: "text-bg-dark",
+    aggro: "text-bg-danger", "monster-cast": "text-bg-danger", flee: "text-bg-warning", "flee-move": "text-bg-warning", threat: "text-bg-warning", "flee-end": "text-bg-secondary",
 };
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -72,7 +73,7 @@ class Viewer {
         const rp = this.rp;
         rp.events.forEach((e, i) => e.i = i);
         this.mobs = new Map(rp.mobs.map(m => [m.id, m]));
-        this.mobLife = new Map();  // id -> [{t, alive, x, y}]
+        this.mobLife = new Map();  // id -> [{t, alive, x, y, dt?, dir?}]: dt > 0 a step of a wander that took dt to arrive at t
         this.mobHp = new Map();    // id -> [{t, hp}]
         this.spriteIx = Sprites.indexMonsters(rp);
         this.drops = new Map(); // mob id (0: the bot) -> HP drops [{t, before, after}], for the HP bars' white trail
@@ -81,14 +82,29 @@ class Viewer {
             l.push({ t: e.t, before: e.hpLeft + e.amount, after: e.hpLeft });
         }
         const push = (map, id, v) => { let a = map.get(id); if (!a) map.set(id, a = []); a.push(v); };
-        const die = (id, t) => { const l = this.mobLife.get(id); const p = l?.[l.length - 1]; if (p?.alive) push(this.mobLife, id, { t, alive: false, x: p.x, y: p.y }); };
+        // A wander's steps are pushed ahead of time; anything that happens to the monster first (fight, death, knockback) cuts them.
+        // Steps the server AI walked (real) are recorded as they happened and are never cut.
+        const cut = (id, t) => { const l = this.mobLife.get(id); while (l?.length && l[l.length - 1].t > t && !l[l.length - 1].real) l.pop(); return l?.[l.length - 1]; };
+        const die = (id, t) => { const p = cut(id, t); if (p?.alive) push(this.mobLife, id, { t, alive: false, x: p.x, y: p.y, dir: p.dir }); };
         this.areas = [];           // {t0, t1, x, y, skill, text}
         const openAreas = new Map();
-        for (const e of rp.events) {
-            if (e.kind === "spawn") { push(this.mobLife, e.mob, { t: e.t, alive: true, x: e.x, y: e.y }); push(this.mobHp, e.mob, { t: e.t, hp: this.mobs.get(e.mob)?.maxHp ?? 1 }); }
-            else if (e.kind === "knockback" && e.mob) { if (this.mobLife.get(e.mob)) push(this.mobLife, e.mob, { t: e.t, alive: true, x: e.x, y: e.y }); }
+        // Wanders (rp.mobMoves, compact) merge into the timeline; on a tie the move comes first so an engage at that instant cuts it.
+        const D = [[0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1], [-1, 0], [-1, 1]]; // HuntSimulator.StepDirs
+        const moves = (rp.mobMoves || []).map(([mob, t, speed, x, y, steps, real]) => ({ kind: "mob-move", mob, t, speed, x, y, steps, real: !!real }));
+        for (const e of [...moves, ...rp.events].sort((a, b) => a.t - b.t)) {
+            if (e.kind === "spawn") { cut(e.mob, e.t); push(this.mobLife, e.mob, { t: e.t, alive: true, x: e.x, y: e.y }); push(this.mobHp, e.mob, { t: e.t, hp: this.mobs.get(e.mob)?.maxHp ?? 1 }); }
+            else if (e.kind === "knockback" && e.mob) { if (cut(e.mob, e.t)) push(this.mobLife, e.mob, { t: e.t, alive: true, x: e.x, y: e.y }); }
             else if (e.kind === "hit" && e.mob) { push(this.mobHp, e.mob, { t: e.t, hp: e.hpLeft }); if (e.hpLeft === 0) die(e.mob, e.t); }
             else if (e.kind === "kill" && e.mob) die(e.mob, e.t);
+            else if (e.kind === "engage" && e.mob) cut(e.mob, e.t);
+            else if (e.kind === "mob-move") {
+                if (!cut(e.mob, e.t)?.alive) continue;
+                let { t, x, y } = e;
+                for (const c of e.steps) {
+                    const [dx, dy] = D[c], dt = e.speed * (dx && dy ? 1.4142 : 1);
+                    push(this.mobLife, e.mob, { t: t += dt, alive: true, x: x += dx, y: y += dy, dt, spd: e.speed, dir: Sprites.facing(dx, dy), real: e.real });
+                }
+            }
             else if (e.kind === "area-start") { const a = { t0: e.t, t1: rp.duration, x: e.x, y: e.y, skill: e.skill, text: e.text }; this.areas.push(a); openAreas.set(e.detail?.entity, a); }
             else if (e.kind === "area-end") { const a = openAreas.get(e.detail?.entity); if (a) { a.t1 = e.t; openAreas.delete(e.detail?.entity); } }
         }
@@ -97,7 +113,9 @@ class Viewer {
         let cur = "none", from = 0, fightMob = 0;
         const to = (act, t) => { if (act === cur) return; if (t > from) this.segments.push({ t0: from, t1: t, act: cur }); cur = act; from = t; };
         for (const e of rp.events) {
-            if (e.kind === "route") to(e.detail?.approach ? "approach" : "wander", e.t);
+            if (e.kind === "route") to(e.detail?.approach ? "approach" : e.detail?.flee ? "flee" : "wander", e.t);
+            else if (e.kind === "flee") to("flee", e.t);
+            else if (e.kind === "flee-end") to("none", e.t);
             else if (e.kind === "engage") { to("fight", e.t); fightMob = e.mob; }
             else if (cur === "fight" && ((e.kind === "kill" && e.mob === fightMob) || e.kind === "fight-end" || e.kind === "death")) to("none", e.t);
             else if (e.kind === "sit") to("rest", e.t);
@@ -123,7 +141,8 @@ class Viewer {
     mobAt(id, t) {
         const l = this.mobLife.get(id); if (!l) return null;
         const i = lastLE(l, t, s => s.t); if (i < 0) return null;
-        const s = l[i];
+        let s = l[i]; const n = l[i + 1];
+        if (s.alive && n?.dt > 0 && t > n.t - n.dt) { const f = (t - (n.t - n.dt)) / n.dt; s = { ...s, x: s.x + (n.x - s.x) * f, y: s.y + (n.y - s.y) * f, dir: n.dir, walk: n.spd, real: n.real }; }
         const h = this.mobHp.get(id); const j = h ? lastLE(h, t, s => s.t) : -1;
         return { ...s, hp: j >= 0 ? h[j].hp : this.mobs.get(id).maxHp, diedAt: s.alive ? null : s.t };
     }
@@ -602,7 +621,7 @@ class Viewer {
             case "sit": {
                 h += why(d.lowOnHpSp ? "HP" + (d.spCounts ? " or SP" : "") + " is under RestBelowPercent " + pct(d.restBelow) + " with RestWhenNoPotions on (HuntPolicy.ShouldSit)." : "rest to win: a monster in view is too strong at the current HP but winnable at full HP (HuntPolicy.ShouldSit).");
                 h += '<table class="table table-sm small mb-1"><tbody><tr><td>HP</td><td>' + pct(d.hpFraction) + "</td></tr><tr><td>SP</td><td>" + pct(d.spFraction) + (d.spCounts ? "" : " (not counted: this bot doesn't kill with spells)")
-                    + "</td></tr><tr><td>Stands at</td><td>HP and SP at or above " + pct(d.standAt) + ", or when hit</td></tr><tr><td>Threatened</td><td>never here (monsters don't move or aggress)</td></tr></tbody></table>";
+                    + "</td></tr><tr><td>Stands at</td><td>HP and SP at or above " + pct(d.standAt) + ", when hit, or when threatened</td></tr><tr><td>Threatened</td><td>" + (d.threatened ? "yes" : "no: no aggressive monster (or one that hit it) within 3 cells, no hazard in view") + " (HuntPolicy.Threatened)</td></tr></tbody></table>";
                 const st = ev.slice(e.i + 1).find(x => x.kind === "stand"); if (st) h += "<div>Stood up: " + this.link(st) + "</div>";
                 break;
             }
@@ -611,12 +630,14 @@ class Viewer {
                 h += "<div>Sat " + n1(d.seconds) + " s; the server's regen gave +" + d.regenHp + " HP, +" + d.regenSp + " SP.</div>";
                 break;
             case "death":
-                h += why("the player's HP reached 0 under the hits below. The fight forecast gave a " + pct(d.forecastWinRate || 0) + " win rate.");
+                h += why("the player's HP reached 0 under the hits below" + (d.forecastWinRate != null ? "; the target's fight forecast gave a " + pct(d.forecastWinRate) + " win rate" : "") + "."
+                    + (d.killer ? " Blamed on " + this.mobLink(d.killer) + " (the last attacker, as live): its class is avoided as a target for a while (live rule)." : ""));
                 h += '<div class="fw-semibold">Last hits taken</div><ul class="ps-3">' + this.lastHurtBefore(e.t).map(x => "<li>" + this.link(x) + "</li>").join("") + "</ul>";
-                h += '<div class="text-secondary">Not modelled: the death penalty and the return trip. The bot is revived on the spot at full HP.</div>';
+                h += '<div class="text-secondary">Not modelled: the death penalty and the walk back from the save point. The bot is revived at full HP at the run\'s start cell.</div>';
                 break;
             case "engage":
-                h += why("the bot reached attack range of its target.");
+                h += why(d.why === "cornered" ? "cornered by a hazard with no way out: the live flee fights back (HuntPolicy.ChooseFlee)." : "the bot reached attack range of its target.");
+                if (d.targetingPlayer?.length) h += "<div>Already targeting the bot (their own server AI): " + d.targetingPlayer.map(id => this.mobLink(id)).join(", ") + ". Each swings on its own cooldown.</div>";
                 h += "<div>Forecast (server-code duels from full HP): win " + pct(d.forecastWinRate) + ", " + n1(d.forecastSeconds) + " s, −" + (d.forecastDamageTaken || 0).toFixed(0) + " HP, " + n1(d.forecastAttacks) + " attacks.</div>"
                     + "<div>" + (d.rules ? d.rules + " skill rule(s); " : "No skill script; ") + (d.noAutoAttack ? "NoAutoAttack: skills only." : "auto-attacks when no rule fires.") + (d.statuses ? " Statuses up: " + esc(d.statuses) : "") + "</div>";
                 break;
@@ -624,7 +645,31 @@ class Viewer {
                 h += "<div>+" + d.exp + " base EXP" + (d.byArea ? ", killed by area damage" : ", " + n1(d.fightSeconds) + " s fight, " + d.actions + " actions (" + d.skillActions + " skills), " + d.damageTaken + " damage taken") + ". Respawns at " + n1(d.respawnAt) + " s.</div>";
                 break;
             case "hurt":
-                h += why(e.mob ? this.mobLink(e.mob) + " swung back (only the fight's target attacks here)." : "no monster swings outside a fight: a ground effect.");
+                h += why(e.mob ? this.mobLink(e.mob) + (d.target ? ", the bot's target," : ", not the bot's target,") + " attacked it" + (e.skill ? " with " + esc(e.skill) : "")
+                    + ": its own AI on the game server (Monster.Update, MonsterAI.csv) chose to. Every monster targeting the bot swings on its own cooldown." : "a ground effect.");
+                break;
+            case "aggro":
+                h += why("the monster's own AI on the game server picked the bot as its target: " + esc((e.text.match(/\(([^()]*)\)$/) || [])[1] || "") + ".");
+                h += "<div>AI " + esc(d.ai || "?") + (d.aggressive ? ", aggressive: it looks for players within its sight (ScanDist " + d.scanDist + ") on its own" : ", not aggressive: it only answers attacks (or helps its kind)") + ". Nothing in the simulator decides this; the server's Monster.Update runs on it while it is near the bot.</div>";
+                break;
+            case "ai": case "monster-cast":
+                h += why("the monster's own AI on the game server (Monster.Update" + (e.kind === "monster-cast" ? " and its skill handler" : "") + ").");
+                break;
+            case "flee": case "flee-move": {
+                h += why(e.kind === "flee" ? "an aggressive monster the forecast at the current HP loses to has the bot inside its danger zone: the live AvoidHazardsAsync drops everything and flees." : "the flee's move this tick (HuntPolicy.ChooseFlee, the live AvoidHazardsAsync's move).");
+                h += '<table class="table table-sm small mb-1"><tbody>'
+                    + "<tr><td>Hazard</td><td>" + (d.hazard ? this.mobLink(d.hazard) : esc(d.name)) + " (" + esc(d.ai || "") + ")</td></tr>"
+                    + "<tr><td>Distance</td><td>" + d.distance + " cells; danger radius " + d.radius + " (ScanDist " + d.scanDist + " + 2), +" + d.buffer + " while fleeing</td></tr>"
+                    + "<tr><td>Forecast</td><td>" + esc(d.engine) + " says lose at HP " + d.hp + "/" + d.maxHp + (d.veto ? ": " + esc(d.veto) : "") + "</td></tr>"
+                    + "<tr><td>Move</td><td>" + esc(d.action) + (d.action === "Hold" ? "" : " to (" + d.x + "," + d.y + ")") + "</td></tr></tbody></table>";
+                const end = ev.slice(e.i + 1).find(x => x.kind === "flee-end"); if (end) h += "<div>Flee ended: " + this.link(end) + "</div>";
+                break;
+            }
+            case "threat":
+                h += why("the live tick runs AvoidHazardsAsync first: " + (e.text.includes("hit by") ? "a hit stops a walk with no target, so the next tick can pick what's hitting it." : "a hazard covering the bot interrupts any walk."));
+                break;
+            case "sit-refused":
+                if (d.why) h += why("it wants to rest but HuntPolicy.ShouldSit refuses while threatened: " + esc(d.why) + ".");
                 break;
             case "failed":
                 h += '<div class="alert alert-danger small mb-0">A runtime error: game server code threw here. What it did to the player was undone and the skill withheld for the rest of the run, so this result is incomplete.</div>';
@@ -645,7 +690,7 @@ class Viewer {
         const evs = this.rp.events.filter(e => e.t <= this.t + 1e-6 && ((e.mob === id && e.kind !== "hit") || ((e.kind === "pick" || e.kind === "nopick") && e.detail.candidates.some(c => c.mob === id)))).slice(-14);
         let h = '<div class="d-flex justify-content-between"><span class="fw-semibold">' + esc(m.name) + " #" + id + '</span><a href="#" data-now="1">world now</a></div>';
         h += '<table class="table table-sm small mb-2"><tbody>'
-            + "<tr><td>At " + fmtT(this.t) + "</td><td>" + (s ? (s.alive ? "alive at (" + s.x + "," + s.y + "), HP " + s.hp + "/" + m.maxHp : "dead") : "not spawned yet") + "</td></tr>"
+            + "<tr><td>At " + fmtT(this.t) + "</td><td>" + (s ? (s.alive ? "alive at (" + Math.round(s.x) + "," + Math.round(s.y) + ")" + (s.walk ? (s.real ? ", walking (its server AI)" : ", wandering") : "") + ", HP " + s.hp + "/" + m.maxHp : "dead") : "not spawned yet") + "</td></tr>"
             + "<tr><td>Level / EXP</td><td>" + m.level + " / " + m.exp + "</td></tr>"
             + "<tr><td>Forecast</td><td>" + esc(m.forecast) + "</td></tr>"
             + "<tr><td>Spawn</td><td>" + (m.pinned ? "pinned area (" + m.area.join(",") + ")" : "anywhere on the map") + ", respawn " + esc(m.respawn) + "</td></tr></tbody></table>";

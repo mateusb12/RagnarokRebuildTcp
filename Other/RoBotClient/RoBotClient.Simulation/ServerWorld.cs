@@ -9,6 +9,7 @@ using RebuildSharedData.Enum.EntityStats;
 using RebuildSharedData.Networking;
 using RebuildZoneServer.Networking;
 using RoRebuildServer.Data.MapData;
+using RoRebuildServer.Data.Monster;
 using RoRebuildServer.Simulation.Util;
 using RoRebuildServer.Data;
 using RoRebuildServer.EntityComponents;
@@ -56,7 +57,7 @@ public sealed class SkillLedger
     public readonly List<string> RolledBack = new(); // player state a failed call had changed and that was put back
 }
 
-/// <param name="Outcome">1 target killed, -1 the player died, 0 time ran out, 2 the target got out of straight-line reach.</param>
+/// <param name="Outcome">1 target killed, -1 the player died, 0 time ran out, 2 the target got out of straight-line reach, 3 the player left (PlayerChoice.Leave).</param>
 /// <param name="Killed">Every monster that died in the encounter (the target and anything area damage finished).</param>
 public sealed record EncounterResult(int Outcome, double Seconds, int DamageTaken, int Actions, int SkillActions, IReadOnlyList<int> Killed);
 
@@ -69,8 +70,9 @@ public sealed record EncounterResult(int Outcome, double Seconds, int DamageTake
 /// <param name="HpLeft">hit: the entity's HP after it.</param>
 /// <summary>Motion: for hits, the server's attack motion time (DamageInfo.AttackMotionTime): the swing started that long before the
 /// damage landed. For a cast bar, Amount is its length in ms.</summary>
+/// <param name="Source">hit on the player: the monster whose attack or skill it was (DamageInfo.Source); ai: the entity the monster now targets.</param>
 public sealed record WorldEvent(double At, string Kind, string? Text, int Entity = 0, CharacterSkill Skill = CharacterSkill.None,
-    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1, double Motion = 0, int Hits = 1);
+    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1, double Motion = 0, int Hits = 1, int Source = 0);
 
 /// <summary>The player's choice when it may act: an auto-attack, a skill packet (the bytes the live bot sends), or
 /// nothing yet (a pure caster with no rule ready re-decides a moment later).</summary>
@@ -78,6 +80,9 @@ public readonly record struct PlayerChoice(CharacterSkill Skill, byte[]? Packet,
 {
     public static readonly PlayerChoice AutoAttack = new(CharacterSkill.None, null, 0, false);
     public static readonly PlayerChoice Hold = new(CharacterSkill.None, null, 0, true);
+    /// <summary>Break off the fight (the live bot's flee drops its target): Fight returns outcome 3.</summary>
+    public static readonly PlayerChoice Leave = new(CharacterSkill.None, null, -1, true);
+    public bool IsLeave => Length == -1;
 }
 
 /// <summary>
@@ -92,15 +97,17 @@ public readonly record struct PlayerChoice(CharacterSkill Skill, byte[]? Packet,
 /// dispatches through SkillHandler.ExecuteSkill to the skill's handler. Cast bars finish in CombatEntity.Update, the
 /// same call that runs status effects. A queued cast resumes through Player.UpdateWithQueuedCast.
 ///
-/// What the simulation still drives itself (the server's frame loop and AI are not run):
+/// Monsters handed over with ActivateMonster run their own server AI: every 10 ms frame they get WorldObject.Update
+/// (movement, Monster.Update with its MonsterAI.csv state machine and skill handler, CombatEntity.Update), as
+/// Instance.Update gives every entity. Their attacks and skills queue damage on the player like any other.
+/// What the simulation still drives itself:
 /// - the clock: events are taken earliest-first (damage landing, cast finishing, a 0.25 s status tick, the player's
-///   next action slot, the target's next swing);
-/// - the monster's side: only the current target swings back (CombatEntity.PerformMeleeAttack on the interval
-///   ApplyCooldownForAttackAction gives it), monsters don't move, cast skills or assist;
+///   next action slot, a server frame while any monster AI or world event is live);
+/// - which monsters run their AI (the caller's boundary) and the player's walking;
 /// - damage goes through the server's UpdateDamageQueue (status reactions, knockback on the walk data, cast
 ///   interruption) unless it is lethal: Monster.Die (rewards, drops, respawn) and Player.Die are not run;
-/// - a knocked-back target is walked back into attack range in a straight line at the player's move speed (the live
-///   server walks the player through TargetForAttack's path; monster AI, which would walk it back, is not run).
+/// - a target out of the player's reach is walked to in a straight line at the player's move speed (the live server walks
+///   the player through TargetForAttack's path); a knocked-back monster under AI walks back by itself.
 /// World events (ground effects, walls, traps, the area of effect they register) are the server's own: a handler calls
 /// World.CreateEvent, the event's behaviour class runs its InitEvent/OnTimer/OnAoEInteraction, AreaOfEffect ticks in
 /// Map.Update, and Npc.EndEvent/World.FullyRemoveEntity clean them up. What this class supplies is the server frame
@@ -138,6 +145,15 @@ public sealed class ServerWorld
 
     private readonly Instance _instance;
     private double _nextFrame = double.PositiveInfinity;
+    private static readonly FieldInfo NextMoveUpdateField = typeof(Monster).GetField("nextMoveUpdate", BindingFlags.NonPublic | BindingFlags.Instance)!;
+    // OutPerformAttack's marks after PerformMeleeAttack: timeLastCombat = now, timeOfStartChase = float.MaxValue.
+    private static readonly FieldInfo TimeLastCombatField = typeof(Monster).GetField("timeLastCombat", BindingFlags.NonPublic | BindingFlags.Instance)!;
+    private static readonly FieldInfo TimeOfStartChaseField = typeof(Monster).GetField("timeOfStartChase", BindingFlags.NonPublic | BindingFlags.Instance)!;
+    // Monsters whose own server AI runs (ActivateMonster): on every frame they get the server's per-entity update,
+    // WorldObject.Update (movement, Monster.Update, CombatEntity.Update), as Instance.Update gives every entity.
+    private readonly List<Monster> _active = new();
+    private readonly HashSet<int> _aiFailed = new(); // their AI threw once: not run again (reported in Failures)
+    private bool _eventsLive;
     // Live server event entities -> the skill whose execution created them (children inherit the parent's skill).
     private readonly Dictionary<Entity, (CharacterSkill Skill, double Born, string Kind, int Id)> _events = new();
 
@@ -170,8 +186,8 @@ public sealed class ServerWorld
     public Action<WorldEvent>? OnEvent;
 
     private void Emit(string kind, string? text, int entity = 0, CharacterSkill skill = CharacterSkill.None, int amount = 0, int amount2 = 0,
-        int hpLeft = -1, int x = -1, int y = -1, double motion = 0, int hits = 1) =>
-        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y, motion, hits));
+        int hpLeft = -1, int x = -1, int y = -1, double motion = 0, int hits = 1, int source = 0) =>
+        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y, motion, hits, source));
 
     static ServerWorld()
     {
@@ -194,6 +210,7 @@ public sealed class ServerWorld
         _random = new Random(seed);
         lock (ServerCombatRuntime.Gate)
         {
+            EmptyEntityPools();
             Enter();
             // The map's own config would run its spawn script (World.CreateMonster): hide it while the map is built.
             var configs = DataManager.MapConfigs;
@@ -224,14 +241,16 @@ public sealed class ServerWorld
 
     // ---- world state ----
 
-    /// <summary>Places a server monster entity of this class on the map; returns its entity id.</summary>
-    public int AddMonster(int classId, int x, int y)
+    /// <summary>Places a server monster entity of this class on the map; returns its entity id. <paramref name="lockArea"/>:
+    /// its spawn rule keeps it inside its spawn area (LockToSpawn), as World.CreateMonster sets from the MapSpawnRule.</summary>
+    public int AddMonster(int classId, int x, int y, (int MinX, int MinY, int MaxX, int MaxY)? lockArea = null)
     {
         lock (ServerCombatRuntime.Gate)
         {
             Enter();
             var monster = DuelSimulator.CreateMonster(DataManager.MonsterIdLookup[classId]);
             monster.Character.Position = new Position(x, y);
+            if (lockArea is { } a) (monster.LockMovementToSpawn, monster.MoveLockZone) = (true, new Area(a.MinX, a.MinY, a.MaxX, a.MaxY));
             var entity = monster.Entity;
             _map.AddEntity(ref entity, false);
             Register(entity);
@@ -246,6 +265,8 @@ public sealed class ServerWorld
         {
             Enter();
             if (!_monsters.Remove(id, out var monster)) return;
+            _active.Remove(monster);
+            _aiSeen.Remove(id);
             DuelSimulator.ClearStatusEffects(monster.CombatEntity);
             var entity = monster.Entity;
             _map.RemoveEntity(ref entity, CharacterRemovalReason.Dead, false);
@@ -263,6 +284,9 @@ public sealed class ServerWorld
 
     /// <summary>Server event entities alive now (ground effects, wall pieces...).</summary>
     public int LiveEvents => _events.Count;
+
+    /// <summary>Hidden from the player (Hiding, Cloaking): the live client doesn't see it.</summary>
+    public bool HiddenFromPlayer(int id) => _monsters.TryGetValue(id, out var m) && m.CombatEntity.IsHiddenTo(_player.CombatEntity);
 
     public (int Hp, int MaxHp) MonsterHp(int id) =>
         _monsters.TryGetValue(id, out var m) ? (m.CombatEntity.GetStat(CharacterStat.Hp), m.CombatEntity.GetStat(CharacterStat.MaxHp)) : (0, 0);
@@ -286,6 +310,67 @@ public sealed class ServerWorld
         }
     }
 
+    /// <summary>Moves a monster on the server map (its idle wandering, run by the simulator).</summary>
+    public void MoveMonster(int id, int x, int y)
+    {
+        lock (ServerCombatRuntime.Gate)
+        {
+            Enter();
+            if (!_monsters.TryGetValue(id, out var m)) return;
+            var ch = m.Character;
+            if (ch.Position.X == x && ch.Position.Y == y) return;
+            _map.ChangeEntityPosition3(ch, ch.WorldPosition, new Position(x, y), false);
+        }
+    }
+
+    /// <summary>Hands the monster to its own server AI from now on: placed at (x, y), its idle timer (the AI's
+    /// nextMoveUpdate) set to <paramref name="nextMoveAt"/>, and a random move the caller had under way continued by the
+    /// server (TryMove, StateRandomMove, as OutRandomMoveStart leaves it). Every later frame runs WorldObject.Update on it.
+    /// False when its AI already failed once (it stays with the caller).</summary>
+    public bool ActivateMonster(int id, int x, int y, double nextMoveAt, (int X, int Y)? walkingTo)
+    {
+        lock (ServerCombatRuntime.Gate)
+        {
+            Enter();
+            if (!_monsters.TryGetValue(id, out var m) || _aiFailed.Contains(id)) return false;
+            if (_active.Contains(m)) return true;
+            var ch = m.Character;
+            if (ch.Position.X != x || ch.Position.Y != y) _map.ChangeEntityPosition3(ch, ch.WorldPosition, new Position(x, y), false);
+            NextMoveUpdateField.SetValue(m, (float)nextMoveAt);
+            if (walkingTo is { } to && ch.TryMove(new Position(to.X, to.Y), 0)) m.CurrentAiState = MonsterAiState.StateRandomMove;
+            _active.Add(m);
+            if (double.IsPositiveInfinity(_nextFrame)) _nextFrame = Clock + FrameSeconds;
+            return true;
+        }
+    }
+
+    /// <summary>Gives the monster back to the caller's idle wander when its AI is at rest: StateIdle, no target, not
+    /// walking, not casting, not just attacked. Returns its idle timer (nextMoveUpdate) to carry on with.</summary>
+    public bool TryDeactivateMonster(int id, out double nextMoveAt)
+    {
+        nextMoveAt = 0;
+        lock (ServerCombatRuntime.Gate)
+        {
+            if (!_monsters.TryGetValue(id, out var m) || !_active.Contains(m)) return false;
+            if (m.CurrentAiState != MonsterAiState.StateIdle || !m.Target.IsNull() || m.Character.IsMoving || m.CombatEntity.IsCasting || m.WasAttacked) return false;
+            nextMoveAt = (float)NextMoveUpdateField.GetValue(m)!;
+            _active.Remove(m);
+            return true;
+        }
+    }
+
+    public bool IsAiActive(int id) => _monsters.TryGetValue(id, out var m) && _active.Contains(m);
+    public int ActiveMonsters => _active.Count;
+    /// <summary>The player's attack range (CharacterStat.Range, at least 1).</summary>
+    public int AttackRange => Math.Max(1, _player.CombatEntity.GetStat(CharacterStat.Range));
+
+    /// <summary>What the monster's server AI is doing: its state machine state and the entity it targets (0 none).</summary>
+    public (string State, int Target) MonsterAi(int id) =>
+        _monsters.TryGetValue(id, out var m) ? (m.CurrentAiState.ToString(), m.Target.TryGet<WorldObject>(out var t) ? t.Id : 0) : ("", 0);
+
+    /// <summary>A cell step of a monster the server AI walks: (entity, x, y, virtual time, MoveSpeed s/cell).</summary>
+    public Action<int, int, int, double, double>? OnMonsterStep;
+
     /// <summary>Full HP and SP: a character entering the map, and the death stand-in (Revive).</summary>
     public void Restore()
     {
@@ -305,6 +390,7 @@ public sealed class ServerWorld
             DuelSimulator.ClearStatusEffects(_player.CombatEntity);
             _player.CombatEntity.CancelCast(true);
             _player.Character.QueuedAction = QueuedAction.None;
+            _player.CombatEntity.DamageQueue.Clear(); // hits still in flight at the death
             Restore();
         }
     }
@@ -327,11 +413,13 @@ public sealed class ServerWorld
     /// expiring) on the server's own update every 0.25 s while there are any, world events keep running on server frames
     /// (a ground effect left behind can still hit monsters), and the server's regen ticks (as every SetClock).
     /// <paramref name="walking"/>: the time was spent walking, which the server's regen reads as CharacterState.Moving.
-    /// Returns the monsters that died meanwhile.</summary>
+    /// Monsters under their own AI act meanwhile (they walk, chase and attack on server frames). Returns the monsters
+    /// that died meanwhile. When the player's HP runs out on the way (PlayerDied), the clock stops at that moment.</summary>
     public IReadOnlyList<int> Advance(double until, bool walking = false)
     {
         if (until < Clock - 1e-9) throw new InvalidOperationException($"clock going back: {Clock} -> {until}");
         var killed = new List<int>();
+        PlayerDied = false;
         lock (ServerCombatRuntime.Gate)
         {
             Enter();
@@ -341,6 +429,9 @@ public sealed class ServerWorld
         }
         return killed;
     }
+
+    /// <summary>The last Advance stopped because the player died (Player.Die is not run: the caller revives it).</summary>
+    public bool PlayerDied { get; private set; }
 
     private void AdvanceTo(double until, List<int> killed)
     {
@@ -364,7 +455,12 @@ public sealed class ServerWorld
                     if (killedBy != CharacterSkill.None) Ledger(killedBy).KillingBlows++;
                     RemoveMonster(id);
                 }
-                if (self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0) self.SetStat(CharacterStat.Hp, 1); // ponytail: a walk-time death is kept alive at 1 HP
+                if (self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0)
+                {
+                    PlayerDied = true;
+                    ServerCombatRuntime.ResetPacketQueue();
+                    return;
+                }
                 continue;
             }
             if (_nextFrame <= t) { Frame(); continue; }
@@ -388,9 +484,13 @@ public sealed class ServerWorld
             var target = _monsters[targetId];
             var enemy = target.CombatEntity;
             var start = Clock;
-            var interval = DuelSimulator.MonsterAttackInterval(enemy);
-            var fightsBack = DuelSimulator.FightsBack(target);
-            var nextMonster = double.PositiveInfinity;
+            // The target answers through its own AI (attacked -> chase -> attack, its skills), as does every other monster
+            // under AI that targets the player: several attackers each swing on their own cooldown.
+            if (!_active.Contains(target) && !_aiFailed.Contains(targetId))
+            {
+                _active.Add(target);
+                if (double.IsPositiveInfinity(_nextFrame)) _nextFrame = Clock + FrameSeconds;
+            }
             var nextTick = HasStatuses() ? Clock + StatusTickSeconds : double.PositiveInfinity;
             var holdUntil = double.NegativeInfinity;
             var pending = CharacterSkill.None; // the skill whose cast bar is up or that the server queued
@@ -404,11 +504,11 @@ public sealed class ServerWorld
                 var landing = EarliestLanding();
                 var castDone = self.IsCasting ? self.CastingTime + Epsilon : double.PositiveInfinity;
                 var ready = self.IsCasting ? double.PositiveInfinity : Math.Max(_player.Character.AttackCooldown, holdUntil) + Epsilon;
-                var t = Math.Max(Clock, Math.Min(Math.Min(Math.Min(landing, castDone), _nextFrame), Math.Min(Math.Min(ready, nextMonster), nextTick)));
+                var t = Math.Max(Clock, Math.Min(Math.Min(Math.Min(landing, castDone), _nextFrame), Math.Min(ready, nextTick)));
                 if (t - start > maxSeconds) { SetClock(start + maxSeconds); break; } // cut off: time still passes to the limit
-                if (++steps > 100_000) // a fight is hundreds of events; this many means one isn't consuming itself
+                if (++steps > 2_000_000) // a fight is hundreds of events and 100 frames a second; this many means one isn't consuming itself
                     throw new InvalidOperationException($"encounter stuck at {t:F3}s: landing {landing:F3}, cast {castDone:F3}, ready {ready:F3}, "
-                        + $"monster {nextMonster:F3}, tick {nextTick:F3}, frame {_nextFrame:F3}, queued {_player.Character.QueuedAction}, player queue {self.DamageQueue.Count}, pending {pending}");
+                        + $"tick {nextTick:F3}, frame {_nextFrame:F3}, queued {_player.Character.QueuedAction}, player queue {self.DamageQueue.Count}, pending {pending}");
                 SetClock(t);
 
                 if (landing <= t)
@@ -417,15 +517,19 @@ public sealed class ServerWorld
                     foreach (var (id, monster) in _monsters.ToList())
                     {
                         if (monster.CombatEntity.DamageQueue.Count == 0) continue;
-                        var dealt = LandOnMonster(monster, out var killedBy);
-                        if (dealt > 0 && monster == target && fightsBack && double.IsPositiveInfinity(nextMonster)) nextMonster = t; // retaliation
+                        LandOnMonster(monster, out var killedBy);
                         if (monster.CombatEntity.GetStat(CharacterStat.Hp) > 0) continue;
                         killed.Add(id);
                         if (killedBy != CharacterSkill.None) Ledger(killedBy).KillingBlows++;
                         RemoveMonster(id);
                         if (id == targetId) outcome = 1;
                     }
-                    if (outcome == 0 && self.DamageQueue.Count > 0 && LandOnPlayer(self) < 0) outcome = -1;
+                    if (outcome == 0 && self.DamageQueue.Count > 0)
+                    {
+                        var due = LandOnPlayer(self);
+                        if (due < 0) outcome = -1;
+                        else taken += due;
+                    }
                     continue;
                 }
 
@@ -441,8 +545,8 @@ public sealed class ServerWorld
                     Observe(pending, enemy, () =>
                     {
                         self.Update();
-                        foreach (var monster in _monsters.Values.ToList())
-                            if (monster.CombatEntity.TryGetStatusContainer(out _)) monster.CombatEntity.Update();
+                        foreach (var monster in _monsters.Values.ToList()) // monsters under AI get theirs in the frame
+                            if (!_active.Contains(monster) && monster.CombatEntity.TryGetStatusContainer(out _)) monster.CombatEntity.Update();
                     });
                     nextTick = HasStatuses() ? t + StatusTickSeconds : double.PositiveInfinity;
                     continue;
@@ -463,6 +567,7 @@ public sealed class ServerWorld
                     }
 
                     var choice = decide();
+                    if (choice.IsLeave) { outcome = 3; break; }
                     if (choice.Wait)
                     {
                         holdUntil = t + StatusTickSeconds;
@@ -482,6 +587,14 @@ public sealed class ServerWorld
                         // Rejected, queued or blocked: the live bot's auto-attack carries on (the server keeps swinging
                         // while a cast waits out the after-cast delay).
                     }
+                    if (enemy.IsHiddenTo(self))
+                    {
+                        // Cloaking/Hiding (a Frilldora's): the client stops seeing it and the live bot drops it; the server
+                        // refuses the attack (Player.PerformAttack: IsHiddenTo).
+                        Emit("abandon", $"{target.Character.Name} hid ({enemy.BodyState}): out of sight, fight abandoned as the live bot loses it", target.Character.Id);
+                        outcome = 2;
+                        break;
+                    }
                     var range = Math.Max(1, self.GetStat(CharacterStat.Range));
                     var steps2 = StepsIntoRange(target.Character.Position, range);
                     if (steps2 == 0 && DistanceCache.IntDistance(_player.Character.Position, target.Character.Position) > range)
@@ -498,30 +611,17 @@ public sealed class ServerWorld
                         continue;
                     }
                     if (!PerformAttack(_player, target.Character))
-                        throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position}");
+                        throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position};");
                     actions++;
                     continue;
                 }
 
-                // The target's swing (it only fights back once hit, not while disabled, and only within its own reach:
-                // monsters don't walk here, so a player knocked, slid or teleported away is out of it).
-                if (enemy.GetStat(CharacterStat.Disabled) > 0 || !target.Character.StateCanAttack || !self.IsValidTarget(enemy)
-                    || DistanceCache.IntDistance(target.Character.Position, _player.Character.Position) > Math.Max(1, target.MonsterBase.Range))
-                {
-                    nextMonster = t + StatusTickSeconds;
-                    continue;
-                }
-                var before = self.DamageQueue.Count;
-                enemy.PerformMeleeAttack(self);
-                for (var i = before; i < self.DamageQueue.Count; i++)
-                    if (self.DamageQueue[i].IsDamageResult) taken += self.DamageQueue[i].Damage * Math.Max(1, (int)self.DamageQueue[i].HitCount);
-                nextMonster = t + interval;
             }
 
             // A cast still up when the fight ends is dropped (its target is gone): the live one fails validation.
             if (self.IsCasting) self.CancelCast(true);
             _player.Character.QueuedAction = QueuedAction.None;
-            self.DamageQueue.Clear();
+            self.DamageQueue.RemoveAll(d => !d.Source.IsAlive()); // swings of monsters that died; the others' still land
             ServerCombatRuntime.ResetPacketQueue();
             return new EncounterResult(outcome, Clock - start, taken, actions, skillActions, killed);
         }
@@ -649,9 +749,10 @@ public sealed class ServerWorld
         var results = 0;
         var motion = 0.0;
         var hits = 1; // Double Attack: one result with HitCount 2 (the dashboard splits the numbers by it)
+        var cutoff = DueCutoff();
         foreach (var d in combat.DamageQueue)
         {
-            if (d.Time > Time.ElapsedTimeFloat || !d.IsDamageResult) continue;
+            if (d.Time >= cutoff || !d.IsDamageResult) continue;
             results++;
             motion = Math.Max(motion, d.AttackMotionTime);
             hits = Math.Max(hits, (int)d.HitCount);
@@ -797,6 +898,7 @@ public sealed class ServerWorld
             }
             TrackNewEvents(skill);
         }
+        UpdateMonsters();
         World.Instance.PerformRemovals();
         foreach (var (entity, ev) in _events.ToList())
         {
@@ -808,9 +910,12 @@ public sealed class ServerWorld
             book.EventsEnded++;
             book.EventSeconds += Clock - ev.Born;
         }
-        if (!WorldActive()) // the server drops removed entities a frame late (Instance.DoRemovals), so this is the frame after the last one ended
+        if (_eventsLive && _events.Count == 0 && _instance.Entities.Count == 0) // the server drops removed entities a frame late (Instance.DoRemovals), so this is the frame after the last one ended
+        {
+            _eventsLive = false;
             Emit("world", $"world: all events ended and removed; instance entity list {_instance.Entities.Count}, map chunks holding an area of effect "
                             + ((int[])ActiveAoEChunksField.GetValue(_map)!).Count(c => c > 0));
+        }
         // Statuses the events put on the player (a protective ground effect, say) are booked to their skill.
         var gained = StatusSet(self).Except(selfBefore).ToList();
         if (gained.Count > 0)
@@ -823,7 +928,90 @@ public sealed class ServerWorld
         ScheduleFrame();
     }
 
-    private bool WorldActive() => _events.Count > 0 || _instance.Entities.Count > 0;
+    private bool WorldActive() => _events.Count > 0 || _instance.Entities.Count > 0 || _active.Count > 0;
+
+    /// <summary>The server's per-entity update (WorldObject.Update) for every monster under its own AI, in the order they
+    /// were handed over: walking a step (PerformMoveUpdate2), its damage queue (empty: what is due was landed before this
+    /// frame), Monster.Update (the AI state machine of MonsterAI.csv and its skill handler) and CombatEntity.Update (cast
+    /// bars, statuses). What it changed is reported: a cell step, a new target, a cast bar.</summary>
+    private void UpdateMonsters()
+    {
+        for (var i = 0; i < _active.Count; i++)
+        {
+            var m = _active[i];
+            var ch = m.Character;
+            if (!ch.IsActive) continue;
+            var casting = m.CombatEntity.IsCasting;
+            // What the AI had at the end of its last frame: a target or a cell can also change between frames (attacked:
+            // damage landing runs NotifyOfAttack -> the InAttacked transition; knockback), reported on the next frame.
+            var (target, state, pos) = _aiSeen.TryGetValue(ch.Id, out var seen) ? seen : (Entity.Null, m.CurrentAiState, ch.Position);
+            var attacked = m.WasAttacked;
+            var cooldown = ch.AttackCooldown;
+            var queued = QueuedFrom(ch.Entity);
+            try
+            {
+                ch.Update();
+            }
+            catch (Exception e)
+            {
+                _aiFailed.Add(ch.Id);
+                _active.RemoveAt(i--);
+                try { ch.StopMovingImmediately(); } catch { /* best effort */ }
+                Fail(CharacterSkill.None, $"monster AI: {ch.Name} #{ch.Id} in {state} (WorldObject.Update)", e, new List<string> { $"{ch.Name} #{ch.Id} AI stopped for the rest of the run" });
+                continue;
+            }
+            TrackNewEvents(CharacterSkill.None); // a monster skill's ground effect
+            if (ch.Position != pos) OnMonsterStep?.Invoke(ch.Id, ch.Position.X, ch.Position.Y, Clock, ch.MoveSpeed);
+            _aiSeen[ch.Id] = (m.Target, m.CurrentAiState, ch.Position);
+            if (m.Target != target)
+            {
+                var to = m.Target.TryGet<WorldObject>(out var tch) ? tch : null;
+                var dist = to != null ? ch.Position.SquareDistance(to.Position) : 0;
+                Emit("ai", to != null
+                        ? $"{ch.Name} #{ch.Id} AI: {state} -> {m.CurrentAiState}, targets {(to.Type == CharacterType.Player ? "the player" : to.Name)} {dist} cells away ({AiReason(m, state, attacked, to)})"
+                        : $"{ch.Name} #{ch.Id} AI: {state} -> {m.CurrentAiState}, dropped its target"
+                          + (m.CurrentAiState == MonsterAiState.StateIdle ? $" (lost sight: chase range {m.ChaseSight})" : ""),
+                    ch.Id, x: ch.Position.X, y: ch.Position.Y, source: to?.Id ?? 0);
+            }
+            if (m.CombatEntity.IsCasting && !casting)
+            {
+                var cast = m.CombatEntity.CastingSkill;
+                Emit("monster-cast", $"{ch.Name} #{ch.Id} casts {cast.Skill} L{cast.Level} ({m.CombatEntity.CastingTime - Time.ElapsedTimeFloat:F2}s cast bar)", ch.Id, cast.Skill,
+                    amount: (int)((m.CombatEntity.CastingTime - Time.ElapsedTimeFloat) * 1000), x: ch.Position.X, y: ch.Position.Y);
+            }
+            // A swing at the player that missed: the server only sends it (AttackMulti), a 0-damage result is never queued.
+            // Reported where its damage would have landed, as a hit's (CalculateCombatResult: Time + sprite timing).
+            if (m.Target == _player.Entity && !m.CombatEntity.IsCasting && ch.AttackCooldown > cooldown
+                && (float)TimeLastCombatField.GetValue(m)! == Time.ElapsedTimeFloat && (float)TimeOfStartChaseField.GetValue(m)! == float.MaxValue
+                && QueuedFrom(ch.Entity) == queued)
+            {
+                var ce = m.CombatEntity;
+                var motion = Math.Min(ce.GetTiming(TimingStat.SpriteAttackTiming),
+                    Math.Max(ce.GetTiming(TimingStat.AttackDelayTime), ce.GetTiming(TimingStat.AttackMotionTime)));
+                OnEvent?.Invoke(new WorldEvent(Clock + motion, "hit", null, PlayerId, CharacterSkill.None, 0, 1, Hp, -1, -1, motion, 1, ch.Id));
+            }
+        }
+    }
+
+    private int QueuedFrom(Entity source) => _player.CombatEntity.DamageQueue.Count(d => d.Source == source);
+
+    private static WorldObject? Character(Entity e) => e.TryGet<WorldObject>(out var w) ? w : null;
+    private readonly Dictionary<int, (Entity Target, MonsterAiState State, Position Pos)> _aiSeen = new();
+
+    /// <summary>Which transition of its MonsterAI.csv state machine can have picked this target, from the state it was in:
+    /// attacked (InAttacked), an ally of its kind fighting it (InAllyInCombat), or the target search (InTargetSearch: in
+    /// AttackSight with line of sight).</summary>
+    private string AiReason(Monster m, MonsterAiState from, bool attacked, WorldObject to)
+    {
+        var entries = DataManager.GetAiStateMachine(m.MonsterBase.AiType).Where(e => e.InputState == from).Select(e => e.InputCheck).ToHashSet();
+        if (attacked) return $"it was attacked: {m.MonsterBase.AiType} {from} InAttacked";
+        if (entries.Contains(MonsterInputCheck.InAllyInCombat)
+            && _monsters.Values.Any(o => o != m && o.MonsterBase == m.MonsterBase && o.Target == m.Target && o.CurrentAiState == MonsterAiState.StateAttacking))
+            return $"an ally of its kind is fighting it: {m.MonsterBase.AiType} {from} InAllyInCombat";
+        if (entries.Contains(MonsterInputCheck.InTargetSearch))
+            return $"target search: {m.MonsterBase.AiType} {from} InTargetSearch, sight {m.AttackSight}, chase {m.ChaseSight}";
+        return $"{m.MonsterBase.AiType} {from}";
+    }
 
     private void ScheduleFrame() => _nextFrame = WorldActive() ? Clock + FrameSeconds : double.PositiveInfinity;
 
@@ -840,6 +1028,7 @@ public sealed class ServerWorld
             if (!ch.IsActive) continue;
             var kind = ch.Type is CharacterType.NPC or CharacterType.BattleNpc ? ch.Npc.Behavior?.GetType().Name ?? ch.Name : ch.Type.ToString();
             _events[entity] = (skill, Clock, kind, ch.Id);
+            _eventsLive = true;
             if (skill != CharacterSkill.None)
             {
                 var book = Ledger(skill);
@@ -918,14 +1107,35 @@ public sealed class ServerWorld
     private int LandOnPlayer(CombatEntity self)
     {
         int due = 0, results = 0;
-        var motion = 0.0;
+        // Per attacker (DamageInfo.Source) and skill, in queue order: several monsters can land on the same moment.
+        var bySource = new List<(int Source, CharacterSkill Skill, int Damage, int Results, double Motion)>();
+        var cutoff = DueCutoff();
         foreach (var d in self.DamageQueue)
-            if (d.Time <= Time.ElapsedTimeFloat && d.IsDamageResult) { due += d.Damage * Math.Max(1, (int)d.HitCount); results++; motion = Math.Max(motion, d.AttackMotionTime); }
+        {
+            if (d.Time >= cutoff || !d.IsDamageResult) continue;
+            var damage = d.Damage * Math.Max(1, (int)d.HitCount);
+            due += damage;
+            results++;
+            var source = Character(d.Source)?.Id ?? 0;
+            var k = bySource.FindIndex(b => b.Source == source && b.Skill == d.AttackSkill);
+            if (k < 0) bySource.Add((source, d.AttackSkill, damage, 1, d.AttackMotionTime));
+            else bySource[k] = (source, d.AttackSkill, bySource[k].Damage + damage, bySource[k].Results + 1, Math.Max(bySource[k].Motion, d.AttackMotionTime));
+        }
+        void Report(int hpBefore, int hpAfter)
+        {
+            var left = hpBefore;
+            foreach (var b in bySource)
+            {
+                left = Math.Max(Math.Max(0, hpAfter), left - b.Damage);
+                Emit("hit", null, PlayerId, b.Skill, b.Damage, b.Results, left, motion: b.Motion, source: b.Source);
+            }
+        }
         if (due >= Hp)
         {
+            var before = Hp;
             self.SetStat(CharacterStat.Hp, 0);
             self.DamageQueue.Clear();
-            Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: 0, motion: motion);
+            Report(before, -1);
             return -1;
         }
         Time.ElapsedTimeFloat += (float)Epsilon; // UpdateDamageQueue applies what is strictly due
@@ -941,9 +1151,14 @@ public sealed class ServerWorld
             Fail(CharacterSkill.None, "damage landing on the player (UpdateDamageQueue)", e, new List<string> { $"player HP set to {hp - due} without the failed step" });
         }
         finally { Time.ElapsedTimeFloat = (float)Clock; }
-        if (results > 0) Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: Hp, motion: motion);
+        if (results > 0) Report(hp, Hp);
         return due;
     }
+
+    /// <summary>What UpdateDamageQueue lands below: AttackUpdate takes Time &lt; ElapsedTimeFloat, called here with Epsilon added.
+    /// Counting with the same cutoff keeps a lethal hit out of the server's own Monster.Die (a Cookie's landed within Epsilon:
+    /// counted as not due, then killed it inside UpdateDamageQueue, where RewardExperience threw).</summary>
+    private static float DueCutoff() => Time.ElapsedTimeFloat + (float)Epsilon;
 
     private double EarliestLanding()
     {
@@ -975,7 +1190,24 @@ public sealed class ServerWorld
     private void Register(Entity entity) =>
         ((Dictionary<int, Entity>)EntityListField.GetValue(World.Instance)!)[entity.Get<WorldObject>().Id] = entity;
 
-    private void Enter() => DuelSimulator.RandomField.SetValue(null, _random); // this run's GameRandom stream
+    /// <summary>Entering server code: this run's GameRandom stream and this world's clock on the server's static Time (another
+    /// world, or a forecast, may have left its own there: a monster created then would schedule its first AI update on it).</summary>
+    /// <summary>A world starts from fresh server entities, as a newly started server does: components a previous world (or
+    /// a forecast) returned to the server's pools keep fields their Reset doesn't clear (an attack cooldown, an AI timer),
+    /// which the monster AI reads, so a second run in one process would differ from the first.</summary>
+    private static void EmptyEntityPools()
+    {
+        var pools = (Array)typeof(EntityComponentManager).GetField("componentPool", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
+        foreach (var pool in pools)
+            pool.GetType().GetField("count", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(pool, 0);
+    }
+
+    private void Enter()
+    {
+        DuelSimulator.RandomField.SetValue(null, _random);
+        Time.ElapsedTime = Clock;
+        Time.ElapsedTimeFloat = (float)Clock;
+    }
 
     /// <summary>Moves the clock, running the player's per-frame timers from Player.Update over the time that passed: the
     /// input-action delay and the server's own regen (UpdateRegenTick: its 6 s ticks, sitting and walking rates, the

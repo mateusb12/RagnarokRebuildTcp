@@ -244,13 +244,15 @@ public sealed class GameDatabase
                     if (!spawn.Success || map == "" || line.Contains("Boss") || line.Contains("Mvp")) continue;
                     int G(int i) => I(spawn.Groups[i].Value);
                     if (!_spawnAreas.TryGetValue(map, out var list)) _spawnAreas[map] = list = new();
-                    list.Add(new SpawnArea(spawn.Groups[1].Value, G(2), G(3) - G(5), G(4) - G(6), G(3) + G(5), G(4) + G(6)));
+                    list.Add(new SpawnArea(spawn.Groups[1].Value, G(2), G(3) - G(5), G(4) - G(6), G(3) + G(5), G(4) + G(6),
+                        line.Contains("LockedArea") || line.Contains("LockToSpawnZone")));
                 }
             }
     }
 
-    /// <summary>A spawn pinned to a rectangle (inclusive cells) instead of anywhere on the map.</summary>
-    public sealed record SpawnArea(string MonsterCode, int Count, int MinX, int MinY, int MaxX, int MaxY);
+    /// <summary>A spawn pinned to a rectangle (inclusive cells) instead of anywhere on the map.
+    /// Locked: LockedArea / LockToSpawnZone, the monster also wanders only inside it (Monster.LockMovementToSpawn).</summary>
+    public sealed record SpawnArea(string MonsterCode, int Count, int MinX, int MinY, int MaxX, int MaxY, bool Locked = false);
     private readonly Dictionary<string, List<SpawnArea>> _spawnAreas = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _punishesRanged = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, double> _attackDelay = new();

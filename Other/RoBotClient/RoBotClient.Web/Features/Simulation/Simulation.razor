@@ -88,7 +88,13 @@
         @{ var st = Runner.Current; }
         @if (st.Running)
         {
-            <div class="mt-2 small"><span class="spinner-border spinner-border-sm me-2"></span>Simulating @st.Request!.Bot on @st.Request.Map, @st.Request.Minutes min, seed @st.Request.Seed… @((DateTime.UtcNow - st.StartedUtc).TotalSeconds.ToString("0"))s</div>
+            <div class="mt-2 small">
+                <span class="spinner-border spinner-border-sm me-2"></span>Simulating @st.Request!.Bot on @st.Request.Map, @st.Request.Minutes min, seed @st.Request.Seed… @((DateTime.UtcNow - st.StartedUtc).TotalSeconds.ToString("0"))s
+                @(Runner.Percent >= 100 ? " · writing the replay…" : Runner.Percent >= 0 ? $" · {Runner.Percent}%" : " · loading the game data…")
+                <div class="progress mt-1" style="height: 8px; max-width: 32rem;">
+                    <div class="progress-bar" style="width: @(Math.Max(0, Runner.Percent))%"></div>
+                </div>
+            </div>
         }
         else if (st.Error != null)
         {
@@ -104,6 +110,7 @@
                 <select class="form-select form-select-sm" style="max-width:32rem" value="@_selected" @onchange="e => Select((string)e.Value!)">
                     @foreach (var r in _runs) { <option value="@r">@r</option> }
                 </select>
+                <button class="btn btn-sm btn-outline-danger text-nowrap" title="Delete every saved run" disabled="@Runner.Current.Running" @onclick="DeleteAll">🗑 Delete all</button>
             </div>
         }
     </div>
@@ -297,6 +304,14 @@
     });
 
     private void Select(string name) { Load(name); }
+
+    private async Task DeleteAll()
+    {
+        if (!await JS.InvokeAsync<bool>("confirm", $"Delete all {_runs.Count} saved runs? This can't be undone.")) return;
+        Runner.DeleteAll();
+        _runs = Runner.Runs();
+        _replay = null; _selected = null; _loadError = null;
+    }
 
     private void Load(string name)
     {

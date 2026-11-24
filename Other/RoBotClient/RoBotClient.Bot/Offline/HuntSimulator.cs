@@ -31,8 +31,10 @@ public sealed record HuntSimOptions(string Map, PlayerBuild Build, double Durati
 /// server entities on a real server Map, the bot's skill rules are chosen by the live rule engine
 /// (BotBehavior.ChooseSkillRule) and sent as the live packets to the server's own skill handler, so any skill executes
 /// through the server's generic path; HP, SP, statuses and cooldowns carry from fight to fight and through rests.
-/// Not modelled (each is listed in the report): monsters stand still between spawn and death (no wandering, chasing,
-/// aggression or assisting), looting, potions and inventory, other players, hazards and fleeing, deaths' return trip.
+/// Monsters near the bot run the game server's own AI (ServerWorld.ActivateMonster: target search, chase, attack, assist,
+/// monster skills); distant ones wander by a copy of its idle AI (Wander), handed over at the view boundary (Boundary).
+/// The bot reacts by the live rules (HuntPolicy: hazards, flee, threatened rest, group pulls), checked every step.
+/// Not modelled (each is listed in the report): looting, potions and inventory (so no Fly Wings), other players, deaths' return trip.
 /// </summary>
 public sealed class HuntSimulator
 {
@@ -41,6 +43,7 @@ public sealed class HuntSimulator
     public const double DiagonalFactor = 1.4142;    // WorldObject: a diagonal step takes MoveSpeed * 1.4142
     private const int MeleeRange = 1;
     private const int ReachExpansions = 6000;       // IsReachable's A* budget
+    private const int MaxChaseRepaths = 30;         // ponytail: then give the target up; live has no such count
 
     private sealed class Mob
     {
@@ -54,6 +57,16 @@ public sealed class HuntSimulator
         public int Life;                            // spawns so far; one encounter per life
         public int ServerId;                        // its server entity in the ServerWorld (0: unknown to the server data)
         public double DiedAt, RespawnAt;
+        public bool Locked;                         // wanders only inside its spawn area (LockMovementToSpawn)
+        public double Speed = -1;                   // MonsterBase.MoveSpeed, s/cell; negative: never moves
+        public double NextMoveAt;                   // idle until then (the AI's nextMoveUpdate)
+        public List<(int x, int y)>? Path;          // the random move under way, Path[PathIdx] the next cell
+        public int PathIdx;
+        public double StepAt;                       // when the next cell is reached
+        public int SyncedX = -1, SyncedY = -1;      // where the server map last had it (synced lazily: SyncServer)
+        public bool Active;                         // its own server AI runs it (ServerWorld.ActivateMonster); else Wander does
+        public object[]? Move;                      // its open HuntReplay.MobMoves entry (a wander, or server steps being appended)
+        public double MoveEnd;                      // when that entry's last step arrives
     }
 
     /// <summary>CanWin: at full HP (the map-level "huntable" view); target picks re-check P at the current HP, as live.</summary>
@@ -73,6 +86,7 @@ public sealed class HuntSimulator
     private readonly WalkMap _walk;
     private readonly BotBehaviorConfig _cfg;
     private readonly Random _rng;
+    private readonly Random _mobRng;                // monster wandering: its own stream, so it doesn't shift the bot's draws
     private readonly List<Mob> _mobs = new();
     private readonly Dictionary<int, Forecast> _forecasts = new();
     private CombatSheet? _sheet;
@@ -119,7 +133,27 @@ public sealed class HuntSimulator
     private readonly List<ReplayEvent> _events = new();
     private readonly List<ReplayStep> _track = new();
     private readonly List<ReplayVitals> _vitals = new();
-    private Mob? _fightTarget;                      // who swings at the player right now (only the target fights back)
+    private readonly List<object[]> _moves = new();     // HuntReplay.MobMoves
+    /// <summary>A wander step's direction, by its digit in HuntReplay.MobMoves.</summary>
+    public static readonly (int dx, int dy)[] StepDirs = { (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1) };
+    private Mob? _fightTarget;                      // the target of the fight under way
+    private int _startX, _startY;                   // where the run started: the stand-in for the save point after a death
+    // The live bot's hazard state (BotBehavior._hazards, _seenHazards, _fleeThreats, Mode == Fleeing), on the virtual clock.
+    // Ids are server entity ids, as in the BotBehavior.MonsterInfo the shared rules read.
+    private readonly List<(Position pos, int radius, string name, string engine, int id)> _hazards = new();
+    private readonly Dictionary<int, (Position pos, int radius, double at)> _seenHazards = new();
+    private readonly Dictionary<int, (int x, int y, int radius)> _immobileSeen = new();
+    private readonly HashSet<int> _fleeThreats = new();
+    private bool _fleeing;
+    private string _lastFleeLog = "";
+    private const double HazardMemorySeconds = 30;  // BotBehavior.HazardMemory
+    private readonly Queue<(double At, int Hp)> _hpHistory = new(); // BotBehavior.NoteHp: the last 5 s
+    private readonly HashSet<int> _hitMe = new();   // server ids that damaged the player (BotSession.HasHitMe)
+    private Mob? _lastAttacker;                     // BotSession.LastAttackerName: who a death is blamed on
+    private readonly Dictionary<int, double> _avoidUntil = new(); // BotBehavior._avoidClasses: class -> virtual time
+    public int Flees, FleeTicks, FightsLeft, Aggros, WalkInterruptions, Ambushes;
+    public double FleeSeconds;
+    private int _peakActive;
     private object? _pickDetail;                    // the last target decision's candidates, for its event
 
     public HuntSimulator(HuntSimOptions options, GameDatabase data)
@@ -129,6 +163,7 @@ public sealed class HuntSimulator
         _cfg = options.Config ?? new BotBehaviorConfig();
         _walk = data.GetWalkMap(options.Map) ?? throw new ArgumentException($"No walk map for '{options.Map}'.");
         _rng = new Random(options.Seed);
+        _mobRng = new Random(unchecked(options.Seed * 7919 + 17));
         _visits = new int[(_walk.Width + 7) / 8, (_walk.Height + 7) / 8];
         var errors = new List<string>();
         _rules = BotBehavior.ParseSkillScript(options.SkillScript ?? "", errors);
@@ -157,14 +192,26 @@ public sealed class HuntSimulator
     /// the replay at its own server time, with the player's HP/SP right after it.</summary>
     private void OnWorld(WorldEvent e)
     {
-        if (e.Text != null) Trace.Add($"[{Math.Max(_t, _world.Clock),8:F2}s] ({_x},{_y}) {e.Text}");
         var mob = _byServerId.TryGetValue(e.Entity, out var m) ? m : null;
+        // The server names monsters by entity id; the replay by its own ids.
+        if (mob != null && e.Text != null && e.Kind is "ai" or "monster-cast") e = e with { Text = e.Text.Replace($"#{e.Entity}", $"#{mob.Id}") };
+        if (e.Text != null) Trace.Add($"[{Math.Max(_t, _world.Clock),8:F2}s] ({_x},{_y}) {e.Text}");
         var onPlayer = e.Entity == _world.PlayerId;
-        var kind = e.Kind == "hit" && onPlayer ? "hurt" : e.Kind;
+        var kind = e.Kind == "hit" && onPlayer ? "hurt" : e.Kind == "ai" && e.Source == _world.PlayerId ? "aggro" : e.Kind;
         var skill = e.Skill != CharacterSkill.None ? e.Skill.ToString() : null;
+        var attacker = kind == "hurt" && _byServerId.TryGetValue(e.Source, out var src) ? src : null;
+        if (kind == "hurt")
+        {
+            if (attacker != null && e.Amount > 0) { _hitMe.Add(e.Source); _lastAttacker = attacker; }
+            NoteHp(e.At);
+        }
+        if (kind == "aggro") Aggros++;
+        if (kind == "hurt" && attacker != null && e.Amount > 0) _hurts++;
         var text = e.Text ?? kind switch
         {
-            "hurt" => (_fightTarget != null ? $"{Name(_fightTarget)} #{_fightTarget.Id}" : "no monster swings outside a fight: a ground effect")
+            "hurt" => (attacker != null ? $"{Name(attacker)} #{attacker.Id}" + (attacker == _fightTarget ? "" : attacker.Db.Ai is { } ai ? $" ({ai}, not the target)" : " (not the target)")
+                          : "a ground effect")
+                      + (skill != null ? $" {skill}" : "")
                       + (e.Amount == 0 ? " missed the player" : $" hit the player for {e.Amount} -> HP {e.HpLeft}/{_world.MaxHp}"),
             "hit" => $"{skill ?? "auto-attack"} on {(mob != null ? $"{Name(mob)} #{mob.Id}" : $"entity {e.Entity}")}: "
                      + (e.Amount == 0 ? "miss" : $"{e.Amount} damage") + $" -> HP {e.HpLeft}",
@@ -173,8 +220,11 @@ public sealed class HuntSimulator
             "no-effect" => $"{skill}: the server took the packet without an error, but nothing observable happened (no SP spent, no cast bar, no status, no attack, no damage)",
             _ => e.Kind,
         };
-        _events.Add(new ReplayEvent(e.At, kind, text, kind == "hurt" ? _fightTarget?.Id ?? 0 : mob?.Id ?? 0, e.X, e.Y, e.Amount, e.HpLeft, skill,
-            kind.StartsWith("area") ? new { entity = e.Entity } : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) }
+        if (kind is "aggro" or "ai" && mob != null) CloseMove(mob); // what follows is a new stretch of its walk
+        _events.Add(new ReplayEvent(e.At, kind, text, kind == "hurt" ? attacker?.Id ?? 0 : mob?.Id ?? 0, e.X, e.Y, e.Amount, e.HpLeft, skill,
+            kind.StartsWith("area") ? new { entity = e.Entity } : kind is "aggro" or "ai" && mob != null ? new { ai = mob.Db.Ai, scanDist = mob.Db.ScanDist, aggressive = HuntPolicy.IsAggressive(mob.Db), serverAi = true }
+            : kind == "hurt" && attacker != null ? new { attacker = attacker.Id, target = attacker == _fightTarget, motion = Math.Round(e.Motion, 3) }
+            : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) }
             : e.Hits > 1 ? new { motion = Math.Round(e.Motion, 3), hits = e.Hits } : e.Motion > 0 ? new { motion = Math.Round(e.Motion, 3) } : null)); // motion: the swing began that long before; hits: Double Attack (sprites only)
         Vitals(e.At);
     }
@@ -211,8 +261,9 @@ public sealed class HuntSimulator
                     {
                         var a = areas[0];
                         areas.RemoveAt(0);
-                        (mob.MinX, mob.MinY, mob.MaxX, mob.MaxY, mob.Pinned) = (a.MinX, a.MinY, a.MaxX, a.MaxY, true);
+                        (mob.MinX, mob.MinY, mob.MaxX, mob.MaxY, mob.Pinned, mob.Locked) = (a.MinX, a.MinY, a.MaxX, a.MaxY, true, a.Locked);
                     }
+                    if (DuelSimulator.IsKnownMonster(db.Id)) mob.Speed = DuelSimulator.MonsterMoveSpeed(db.Id);
                     _mobs.Add(mob);
                     Stats(mob).Population++;
                     Spawn(mob);
@@ -238,10 +289,12 @@ public sealed class HuntSimulator
     private void Place(Mob m, int x, int y)
     {
         (m.X, m.Y, m.Alive) = (x, y, true);
+        (m.Path, m.NextMoveAt) = (null, _t); // a fresh monster's nextMoveUpdate has passed: it moves on its first AI update
         m.Life++;
         Note("spawn", $"{Name(m)} #{m.Id} {(m.Life == 1 ? "spawned" : "respawned")} at ({x},{y})", m.Id, x: x, y: y);
         if (!DuelSimulator.IsKnownMonster(m.Db.Id)) return;
-        m.ServerId = _world.AddMonster(m.Db.Id, x, y); // a fresh server entity per life: full HP, no statuses
+        m.ServerId = _world.AddMonster(m.Db.Id, x, y, m.Locked ? (m.MinX, m.MinY, m.MaxX, m.MaxY) : null); // a fresh server entity per life: full HP, no statuses
+        (m.SyncedX, m.SyncedY, m.Active, m.Move) = (x, y, false, null);
         _byServerId[m.ServerId] = m;
     }
 
@@ -258,6 +311,120 @@ public sealed class HuntSimulator
                 + $"(delay {delay:F1}s within its rule [{m.RespawnMin:F0}s, {m.RespawnMax:F0}s]), back at ({m.X},{m.Y})"
                 + (m.Pinned ? $" inside its pinned area ({m.MinX},{m.MinY})-({m.MaxX},{m.MaxY})" : ""));
         }
+        Wander();
+    }
+
+    /// <summary>The server's idle AI for every monster nobody fights, up to now: wait 4-6 s (OutWaitStart), then walk to a
+    /// random cell (OutRandomMoveStart), one cell per MoveSpeed (x1.4142 diagonal), and wait again. Monsters walk through
+    /// each other: only the destination avoids occupied cells, as FindRandomMoveTargetInArea does.</summary>
+    private void Wander()
+    {
+        foreach (var m in _mobs)
+        {
+            if (!m.Alive || m.Speed <= 0 || m.Active) continue; // under its own server AI: the server walks it
+            while (true)
+            {
+                if (m.Path != null)
+                {
+                    if (m.StepAt > _t) break;
+                    (m.X, m.Y) = m.Path[m.PathIdx++];
+                    if (m.PathIdx < m.Path.Count) { m.StepAt += StepSeconds(m, m.Path[m.PathIdx]); continue; }
+                    m.Path = null;
+                    m.NextMoveAt = m.StepAt + 4 + _mobRng.NextDouble() * 2;
+                    continue;
+                }
+                if (m.NextMoveAt > _t) break;
+                var at = m.NextMoveAt;
+                var path = (m.Locked ? RandomMove(m, m.MinX, m.MinY, m.MaxX, m.MaxY, 10) : null) ?? RandomMove(m, 0, 0, _walk.Width - 1, _walk.Height - 1, 20);
+                if (path == null) { m.NextMoveAt = at + 1; continue; } // ponytail: the AI retries on its next update; 1 s stands in for its tick
+                (m.Path, m.PathIdx, m.StepAt) = (path, 1, at + StepSeconds(m, path[1]));
+                _moves.Add(m.Move = new object[] { m.Id, Math.Round(at, 3), Math.Round(m.Speed, 3), path[0].x, path[0].y,
+                    string.Concat(path.Skip(1).Select((c, i) => (char)('0' + Array.IndexOf(StepDirs, (c.x - path[i].x, c.y - path[i].y))))) });
+            }
+        }
+    }
+
+    /// <summary>Puts wandered monsters where they are on the server map. Only when the server is about to act on them (a
+    /// fight, a live ground effect): moving it every step costs more than the rest of the run (Map visibility updates).</summary>
+    private void SyncServer()
+    {
+        foreach (var m in _mobs)
+            if (m.Alive && m.ServerId != 0 && (m.X, m.Y) != (m.SyncedX, m.SyncedY))
+            {
+                _world.MoveMonster(m.ServerId, m.X, m.Y);
+                (m.SyncedX, m.SyncedY) = (m.X, m.Y);
+            }
+    }
+
+    /// <summary>The boundary between the two monster modes. Within the server's view distance of the player (21, where
+    /// Monster.Update wakes a monster's AI: IsAiActive once it has a visible player) a monster is handed to its own server
+    /// AI, with its cell, its idle timer and the random move it was on. It is handed back to Wander only once it is out of
+    /// view again AND its AI is at rest (idle, no target, not walking, not attacked): a chase or a fight never ends at the
+    /// boundary. One authority at a time: Wander skips active monsters, and the server only updates active ones.</summary>
+    private void Boundary()
+    {
+        _peakActive = Math.Max(_peakActive, _world.ActiveMonsters);
+        foreach (var m in _mobs)
+        {
+            if (!m.Alive || m.ServerId == 0) continue;
+            var d = Dist(_x, _y, m.X, m.Y);
+            if (!m.Active && d <= ViewDistance)
+            {
+                var walkingTo = m.Path != null ? m.Path[^1] : ((int, int)?)null;
+                if (!_world.ActivateMonster(m.ServerId, m.X, m.Y, m.Path != null ? _world.Clock : m.NextMoveAt, walkingTo)) continue;
+                if (m.Path != null && m.Move != null) m.Move[5] = ((string)m.Move[5])[..(m.PathIdx - 1)]; // the steps it took; the server walks the rest
+                (m.Active, m.Path, m.Move, m.SyncedX, m.SyncedY) = (true, null, null, m.X, m.Y);
+            }
+            else if (m.Active && d > ViewDistance && _world.TryDeactivateMonster(m.ServerId, out var nextMoveAt))
+                (m.Active, m.NextMoveAt, m.Path, m.Move) = (false, nextMoveAt, null, null);
+        }
+    }
+
+    /// <summary>A cell step the server AI made (ServerWorld.OnMonsterStep): the monster's position, and the replay's walk
+    /// (consecutive steps at its speed append to one MobMoves entry, flagged as steps the server walked).</summary>
+    private void OnMonsterStep(int serverId, int x, int y, double at, double speed)
+    {
+        if (!_byServerId.TryGetValue(serverId, out var m)) return;
+        var (dx, dy) = (x - m.X, y - m.Y);
+        (m.X, m.Y, m.SyncedX, m.SyncedY) = (x, y, x, y);
+        var dir = Array.IndexOf(StepDirs, (dx, dy));
+        if (dir < 0) { m.Move = null; return; } // not one cell (pushed, teleported): the next step starts afresh
+        var step = speed * (dx != 0 && dy != 0 ? DiagonalFactor : 1);
+        if (m.Move != null && m.Move.Length == 7 && Math.Abs(m.MoveEnd - (at - step)) <= 0.03 && (double)m.Move[2] == Math.Round(speed, 3))
+            m.Move[5] = (string)m.Move[5] + (char)('0' + dir);
+        else
+        {
+            _moves.Add(m.Move = new object[] { m.Id, Math.Round(at - step, 3), Math.Round(speed, 3), x - dx, y - dy, ((char)('0' + dir)).ToString(), 1 });
+            m.MoveEnd = at - step;
+        }
+        m.MoveEnd += step;
+    }
+
+    private static void CloseMove(Mob m) => m.Move = null;
+
+    private void NoteHp(double at)
+    {
+        _hpHistory.Enqueue((at, _world.Hp));
+        while (_hpHistory.Count > 0 && at - _hpHistory.Peek().At > 5) _hpHistory.Dequeue();
+    }
+
+    private static double StepSeconds(Mob m, (int x, int y) next) => m.Speed * (next.x != m.X && next.y != m.Y ? DiagonalFactor : 1);
+
+    /// <summary>FindRandomMoveTargetInArea: a cell within 9 of the monster, clipped to the area; the first quarter of the
+    /// attempts refuse one 2 or fewer cells away or occupied (and, as the server, retry that same cell); TryMove needs a
+    /// walkable cell and a path of at most PathFinder.MaxDistance (20) steps.</summary>
+    private List<(int x, int y)>? RandomMove(Mob m, int minX, int minY, int maxX, int maxY, int attempts)
+    {
+        int x0 = Math.Max(minX, m.X - 9), y0 = Math.Max(minY, m.Y - 9), x1 = Math.Min(maxX, m.X + 9), y1 = Math.Min(maxY, m.Y + 9);
+        if (x0 > x1 || y0 > y1) return null;
+        int x = _mobRng.Next(x0, x1 + 1), y = _mobRng.Next(y0, y1 + 1);
+        for (var i = 0; i < attempts; i++)
+        {
+            if (i < attempts / 4f && (Dist(m.X, m.Y, x, y) <= 2 || (x, y) == (_x, _y) || _mobs.Any(o => o.Alive && o.X == x && o.Y == y))) continue;
+            if ((x, y) != (m.X, m.Y) && _walk.IsWalkable(x, y) && _walk.FindPath(m.X, m.Y, x, y, 2000) is { Count: > 1 and <= 21 } path) return path;
+            (x, y) = (_mobRng.Next(x0, x1 + 1), _mobRng.Next(y0, y1 + 1));
+        }
+        return null;
     }
 
     private bool HuntableAliveAnywhere() => _mobs.Any(m => m.Alive && ForecastOf(m).CanWin && m.Db.Exp > 0);
@@ -277,13 +444,218 @@ public sealed class HuntSimulator
             canWin ? "" : $"win {p.WinRate:P0}, dmg taken {p.DamageTaken.Mean:F0}/{p.Sheet.MaxHp}, {p.Attacks.Mean:F0} attacks", p.DamagePerAction.Mean, p);
     }
 
+
+    // ---- threats: the live hazard, flee, rest and pull rules (HuntPolicy), on this world's server-code forecasts ----
+
+    private Position Self => new(_x, _y);
+
+    /// <summary>The monsters in view as the live Snapshot holds them (server ids, HP from the server entities).</summary>
+    private List<BotBehavior.MonsterInfo> ViewMonsters()
+    {
+        var list = new List<BotBehavior.MonsterInfo>();
+        foreach (var m in _mobs)
+            if (m.Alive && m.ServerId != 0 && Dist(_x, _y, m.X, m.Y) <= ViewDistance && !_world.HiddenFromPlayer(m.ServerId))
+            {
+                var (hp, maxHp) = _world.MonsterHp(m.ServerId);
+                list.Add(new BotBehavior.MonsterInfo(m.ServerId, m.Db.Id, m.Db.Name, new Position(m.X, m.Y), hp, maxHp));
+            }
+        return list;
+    }
+
+    /// <summary>BotBehavior.ComputeHazards: every aggressive monster in view (HuntPolicy.HazardCandidate) the forecast at the
+    /// current HP loses to, or the one being fled, is a hazard of HuntPolicy.HazardRadius; remembered for 30 s.</summary>
+    private void ComputeHazards()
+    {
+        _hazards.Clear();
+        foreach (var m in _mobs)
+        {
+            if (!m.Alive || m.ServerId == 0 || Dist(_x, _y, m.X, m.Y) > ViewDistance) continue;
+            if (!HuntPolicy.HazardCandidate(_cfg, m.Db.Id, m.Db)) continue;
+            var f = ForecastOf(m);
+            var loses = !f.Known || !HuntPolicy.ServerCanWin(f.P!, _world.Hp, 0, _cfg.WinMargin, _cfg.MaxRoundsToKill);
+            var fleeingIt = _fleeing && _fleeThreats.Contains(m.ServerId);
+            if (!HuntPolicy.IsHazard(loses, fleeingIt)) continue;
+            var radius = HuntPolicy.HazardRadius(m.Db);
+            _hazards.Add((new Position(m.X, m.Y), radius, m.Db.Name, loses ? "server" : "earlier (still fleeing it)", m.ServerId));
+            _seenHazards[m.ServerId] = (new Position(m.X, m.Y), radius, _t);
+        }
+        foreach (var (id, h) in _seenHazards.ToList())
+            if (_t - h.at > HazardMemorySeconds) _seenHazards.Remove(id);
+        foreach (var m in ViewMonsters())
+            if (HuntPolicy.ImmobileZone(_data.Monster(m.ClassId), m.Pos) is { } zone) _immobileSeen[m.Id] = zone;
+    }
+
+    /// <summary>BotBehavior.HazardZones: in view and remembered.</summary>
+    private List<(int x, int y, int radius)> HazardZones() =>
+        _hazards.Select(h => (h.pos.X, h.pos.Y, h.radius)).Concat(_seenHazards.Values.Select(h => (h.pos.X, h.pos.Y, h.radius))).ToList();
+
+    /// <summary>BotBehavior.MakePathCost: hazard zones, fixed monsters' reach and the portal buffer priced on A*.</summary>
+    private Func<int, int, float>? PathCost()
+    {
+        var zones = HazardZones();
+        zones.AddRange(_immobileSeen.Values);
+        return HuntPolicy.PathCost(_data, _o.Map, zones, _cfg.PortalSafeDistance);
+    }
+
+    private bool ApproachNearHazard(Mob m, out int hazard, out string where)
+    {
+        var zones = _hazards.Select(h => (h.id, h.pos, h.radius)).Concat(_seenHazards
+            .Where(s => _hazards.All(h => h.id != s.Key) && Dist(_x, _y, s.Value.pos.X, s.Value.pos.Y) > s.Value.radius)
+            .Select(s => (id: s.Key, s.Value.pos, s.Value.radius))).ToList();
+        return HuntPolicy.ApproachNearHazard(Self, new Position(m.X, m.Y), zones, out hazard, out where);
+    }
+
+    /// <summary>BotBehavior.Ambushed: HP dropped from its peak in the last 5 s by 15%+ of max, or at all under 35%.</summary>
+    private bool Ambushed(out string why)
+    {
+        why = "";
+        if (_hpHistory.Count == 0) return false;
+        var lost = _hpHistory.Max(h => h.Hp) - _world.Hp;
+        if (lost <= 0) return false;
+        why = $"lost {lost} HP in 5s, at {_world.Hp}/{_world.MaxHp}";
+        return BotBehavior.IsAmbushed(_world.Hp + lost, _world.Hp, _world.MaxHp);
+    }
+
+    /// <summary>The flee the live AvoidHazardsAsync would make now (HuntPolicy.NearestHazardInReach, then ChooseFlee), or
+    /// null when no hazard covers the bot. No walk goal (WalkPathTowardAsync isn't used for hunting on the home map, so
+    /// live never sidesteps there either) and no Fly Wing (no inventory here).</summary>
+    private (int Index, int Distance, FleeAction Action)? FleeDecision()
+    {
+        ComputeHazards();
+        var (idx, d) = HuntPolicy.NearestHazardInReach(_hazards, Self, _fleeing);
+        if (idx < 0) return null;
+        var hz = _hazards[idx];
+        var action = HuntPolicy.ChooseFlee(_data, _o.Map, _walk, Self, _hazards, idx, d, walkGoal: null, HazardZones(), PathCost(), ViewMonsters(),
+            hurt: () => (Ambushed(out var why), why), // ponytail: KillsMeFast (the hand-formula hit) isn't evaluated: it only gates a Fly Wing, which needs an inventory
+            canFlyWing: () => false);
+        return (idx, d, action);
+    }
+
+    /// <summary>One live tick of AvoidHazardsAsync when a hazard covers the bot: the flee starts (or goes on) and its move is
+    /// carried out for one tick: a walk of at least a step toward its waypoint, a fight back when cornered, or holding
+    /// position. False when no hazard is in reach (an ongoing flee ends).</summary>
+    private bool FleeIfThreatened()
+    {
+        if (FleeDecision() is not var (idx, d, action))
+        {
+            if (_fleeing)
+            {
+                Log("Hazard no longer in range — resuming normal behavior.", "flee-end");
+                _fleeing = false;
+            }
+            _fleeThreats.Clear();
+            _lastFleeLog = "";
+            return false;
+        }
+        var hz = _hazards[idx];
+        var threat = _byServerId.GetValueOrDefault(hz.id);
+        if (!_fleeing)
+        {
+            Flees++;
+            Log($"Avoiding '{hz.name}' (aggressive, {hz.engine} forecast says I'd lose) — fleeing. It's {d} cells away "
+                + $"(danger radius {hz.radius}), I'm at ({_x},{_y}), it's at ({hz.pos.X},{hz.pos.Y}).", "flee", threat?.Id ?? 0, FleeDetail(hz, d, action));
+        }
+        _fleeing = true;
+        _fleeThreats.Add(hz.id);
+        _wanderDest = null;
+        FleeTicks++;
+        if (action.LogKind != _lastFleeLog && action.Message.Length > 0)
+        {
+            _lastFleeLog = action.LogKind;
+            Log(action.Message, "flee-move", threat?.Id ?? 0, FleeDetail(hz, d, action));
+        }
+        switch (action.Kind)
+        {
+            case FleeKind.FightBack when _byServerId.TryGetValue(action.MonsterId, out var cornering):
+                Fight(cornering, why: "cornered");
+                break;
+            case FleeKind.Hold or FleeKind.FightBack or FleeKind.FlyWing:
+                Wait(LiveTickSeconds, flee: true);
+                break;
+            default:
+                var path = _walk.FindPath(_x, _y, action.X, action.Y, ReachExpansions); // the server walks the waypoint its own way
+                if (path is not { Count: > 1 }) { Wait(LiveTickSeconds, flee: true); break; }
+                Walk(path, WalkKind.Flee, stopOnSighting: false, maxSeconds: LiveTickSeconds);
+                break;
+        }
+        return true;
+    }
+
+    private object FleeDetail((Position pos, int radius, string name, string engine, int id) hz, int d, FleeAction a)
+    {
+        var f = _byServerId.TryGetValue(hz.id, out var m) ? ForecastOf(m) : null;
+        return new
+        {
+            hazard = m?.Id, name = hz.name, distance = d, radius = hz.radius, buffer = HuntPolicy.HazardBuffer, engine = hz.engine,
+            ai = m?.Db.Ai, scanDist = m?.Db.ScanDist, hp = _world.Hp, maxHp = _world.MaxHp,
+            veto = f?.P != null ? HuntPolicy.ServerWinVeto(f.P, _world.Hp, 0, _cfg.WinMargin, _cfg.MaxRoundsToKill) : "unknown to the server data",
+            action = a.Kind.ToString(), x = a.X, y = a.Y, message = a.Message,
+            rule = "HuntPolicy.ChooseFlee (the live AvoidHazardsAsync's move)",
+        };
+    }
+
+    /// <summary>Time passes standing (a held flee, a wedged wander): the world runs on.</summary>
+    private void Wait(double seconds, bool flee)
+    {
+        var dt = Math.Min(seconds, _o.DurationSeconds - _t);
+        if (dt <= 0) return;
+        _t += dt;
+        if (flee) FleeSeconds += dt; else IdleSeconds += dt;
+        if (!flee && !HuntableAliveAnywhere()) NoHuntableAliveSeconds += dt;
+        Respawns();
+        AdvanceWorld(walking: false);
+    }
+
+    /// <summary>The pack this target would bring as the live EngagementGroup sees it, forecast as one fight on this world's
+    /// engine: each member's server-code duel (kill time, damage taken), killed quickest first while the rest keep hitting
+    /// (BattleSimulator.ForecastGroup's sequence). Wins when every duel is winnable in MaxRoundsToKill and the total damage
+    /// stays within WinMargin of the current HP.</summary>
+    private (bool CanWin, double Damage, string Members) GroupForecast(List<BotBehavior.MonsterInfo> group)
+    {
+        var parts = group.Select(g => (g, f: ForecastOf(g.ClassId))).ToList();
+        var feasible = parts.All(p => p.f.Known && p.f.WinRate > 0 && p.f.Attacks <= _cfg.MaxRoundsToKill);
+        var order = parts.OrderBy(p => p.f.Seconds).ToList();
+        var dps = order.Select(p => p.f.Seconds > 0 ? p.f.DamageTaken / p.f.Seconds : 0).ToList();
+        double remaining = dps.Sum(), damage = 0;
+        for (var i = 0; i < order.Count; i++) { damage += remaining * order[i].f.Seconds; remaining -= dps[i]; }
+        return (feasible && damage <= _cfg.WinMargin * _world.Hp, damage, string.Join(", ", group.Select(g => g.Name)));
+    }
+
+    /// <summary>The player's HP ran out (in a fight, walking or resting): the live death handling's decisions (the killer's
+    /// class avoided for 5 min, 30 if it killed before) and the stand-in for respawning: full HP, statuses cleared, back at
+    /// the run's start cell. The death penalty and the walk back from the save point are not simulated.</summary>
+    private void PlayerDeath(Mob? target, EncounterResult? fight)
+    {
+        Deaths++;
+        var killer = _lastAttacker ?? target;
+        if (killer != null)
+        {
+            Stats(killer).Deaths++;
+            var fresh = !(_avoidUntil.TryGetValue(killer.Db.Id, out var until) && until > _t);
+            _avoidUntil[killer.Db.Id] = _t + 60 * (fresh ? HuntPolicy.AvoidClassMinutes : HuntPolicy.RepeatKillerAvoidMinutes);
+        }
+        Log($"DIED to {(killer != null ? $"{Name(killer)} #{killer.Id}" : "unknown")}" + (target != null && killer != target ? $" while fighting {Name(target)} #{target.Id}" : "")
+            + $"; avoiding {(killer != null ? Name(killer) : "it")} for {(killer != null ? (_avoidUntil[killer.Db.Id] - _t) / 60 : 0):F0} min (live rule). "
+            + $"Revived at full HP at the start cell ({_startX},{_startY}): the death penalty, respawn and return trip are not simulated", "death", killer?.Id ?? 0,
+            new { fightSeconds = fight?.Seconds, damageTaken = fight?.DamageTaken, killer = killer?.Id, target = target?.Id, attackersOnMe = _hitMe.Count,
+                forecastWinRate = target != null ? ForecastOf(target).WinRate : (double?)null });
+        _world.Revive();
+        _world.MovePlayer(_startX, _startY);
+        if ((_x, _y) != (_startX, _startY)) _track.Add(new ReplayStep(Math.Max(_t, _world.Clock) + 0.001, _startX, _startY, 0)); // just after the death, where it fell
+        (_x, _y) = (_startX, _startY);
+        (_fleeing, _lastAttacker, _wanderDest) = (false, null, null);
+        _fleeThreats.Clear();
+        _hpHistory.Clear();
+        Vitals(Math.Max(_t, _world.Clock));
+    }
+
     // ---- the bot ----
 
     private readonly HashSet<(int Id, int Life)> _seenLives = new();
 
     private List<Mob> Visible()
     {
-        var visible = _mobs.Where(m => m.Alive && Dist(_x, _y, m.X, m.Y) <= ViewDistance).ToList();
+        var visible = _mobs.Where(m => m.Alive && Dist(_x, _y, m.X, m.Y) <= ViewDistance && !(m.ServerId != 0 && _world.HiddenFromPlayer(m.ServerId))).ToList();
         foreach (var m in visible)
             if (_seenLives.Add((m.Id, m.Life))) Stats(m).Seen++;
         return visible;
@@ -349,7 +721,7 @@ public sealed class HuntSimulator
 
     /// <summary>What HuntPolicy.PickTarget reads here: the virtual world's monsters, the server-code duel forecast judged
     /// at the player's current HP (as live; no potion buffer: no inventory here; no shadow engine), plain A* to the monster's cell. Nothing is excluded beyond the shared rules: no deaths-avoid list,
-    /// hazards, fixed-monster sniping or group pulls (monsters stand still and don't assist).</summary>
+    /// hazards, fixed-monster sniping or group pulls (monsters don't aggress or assist).</summary>
     private sealed class SimTargets(HuntSimulator s) : ITargetWorld<Mob, Forecast>
     {
         public readonly Dictionary<Mob, List<(int x, int y)>> Paths = new();
@@ -365,7 +737,24 @@ public sealed class HuntSimulator
             return new(m.Db.Id, m.Db.Exp, m.Db.Level, m.Db.HP, m.Db.HP, m.X, m.Y, d); // alive: full HP until engaged
         }
 
-        public TargetReject? Excluded(Mob m) => null;
+        public TargetReject? Excluded(Mob m)
+        {
+            // BotBehavior.LiveTargets.Excluded: the class that killed the bot (time-decayed), then hazards (in or near a
+            // hazard's zone, or the straight walk crosses one). No unreachable blacklist: nothing here gets stuck.
+            if (s._avoidUntil.TryGetValue(m.Db.Id, out var until))
+            {
+                if (s._t >= until) s._avoidUntil.Remove(m.Db.Id);
+                else { Notes[m] = $"killed the bot: avoided until {until:F0}s"; return TargetReject.AvoidedClass; }
+            }
+            if (s.ApproachNearHazard(m, out var hz, out var where))
+            {
+                Notes[m] = $"{where} the zone of {(s._byServerId.TryGetValue(hz, out var h) ? $"{s.Name(h)} #{h.Id}" : "a monster out of view")}";
+                return TargetReject.Hazard;
+            }
+            return null;
+        }
+
+        public readonly Dictionary<Mob, string> Notes = new(); // why an exclusion or a pull veto hit, for the replay
 
         public (TargetForecast<Forecast> Decision, TargetForecast<Forecast> Shadow)? Forecast(Mob m)
         {
@@ -377,13 +766,26 @@ public sealed class HuntSimulator
         }
 
         public bool NoSafeCell(Mob m) => false;
-        public bool PullsLosingGroup(Mob m) => false;
+        // BotBehavior.LiveTargets.PullsLosingGroup: one already hitting us isn't a pull (idling leaves it on us).
+        public bool PullsLosingGroup(Mob m)
+        {
+            var info = new BotBehavior.MonsterInfo(m.ServerId, m.Db.Id, m.Db.Name, new Position(m.X, m.Y), m.Db.HP, m.Db.HP);
+            var snipes = HuntPolicy.IsImmobile(m.Db) && s._world.AttackRange > m.Db.Range + 1;
+            var group = HuntPolicy.EngagementGroup(s._data, s.ViewMonsters(), s.Self, info, standsAtTarget: !snipes);
+            if (group.Count <= 1 || s._hitMe.Contains(m.ServerId)) return false;
+            var g = s.GroupForecast(group);
+            if (g.CanWin) return false;
+            Notes[m] = $"would pull {group.Count - 1} more ({g.Members}): ~{g.Damage:F0} damage vs WinMargin {s._cfg.WinMargin} x HP {s._world.Hp}";
+            return true;
+        }
 
         public bool Reachable(Mob m)
         {
-            var path = s._walk.FindPath(s._x, s._y, m.X, m.Y, ReachExpansions);
-            if (path == null || !HuntPolicy.DetourAcceptable(path.Count - 1, Dist(s._x, s._y, m.X, m.Y))) return false;
-            Paths[m] = path;
+            // As live IsReachable: A* with the hazard/portal cost (a target only reachable through a kill-you zone isn't);
+            // the walk itself is the server's attack-walk, which takes the plain shortest way.
+            var costed = s._walk.FindPath(s._x, s._y, m.X, m.Y, ReachExpansions, s.PathCost());
+            if (costed == null || !HuntPolicy.DetourAcceptable(costed.Count - 1, Dist(s._x, s._y, m.X, m.Y))) return false;
+            Paths[m] = s._walk.FindPath(s._x, s._y, m.X, m.Y, ReachExpansions) ?? costed;
             return true;
         }
 
@@ -399,10 +801,14 @@ public sealed class HuntSimulator
                 TargetReject.Unknown => f!.Why,
                 TargetReject.TooStrong => restable ? "too strong at current HP" : "too strong",
                 TargetReject.Unreachable => "unreachable or long detour",
+                TargetReject.AvoidedClass => "avoided: it killed the bot",
+                TargetReject.Hazard => "near a dangerous monster",
+                TargetReject.Swarm => "would pull a group it loses to",
                 _ => why.ToString(),
             };
             var veto = why == TargetReject.TooStrong ? HuntPolicy.ServerWinVeto(f!.P!, s._world.Hp, 0, s._cfg.WinMargin, s._cfg.MaxRoundsToKill) : null;
-            Rejects.Add((m, veto != null ? $"{label}: {veto}" + (restable ? " (winnable at full HP: rest to win)" : "") : label));
+            Rejects.Add((m, veto != null ? $"{label}: {veto}" + (restable ? " (winnable at full HP: rest to win)" : "")
+                : Notes.TryGetValue(m, out var note) ? $"{label}: {note}" : label));
             s.Reject(m, label);
             if (why == TargetReject.TooStrong && !restable) s.Example("too strong", $"{s.Name(m)}: {f!.Why}");
         }
@@ -433,33 +839,63 @@ public sealed class HuntSimulator
         return null;
     }
 
-    /// <summary>Walks the path one cell at a time; returns early (false) when a monster enters view and stopOnSighting.</summary>
-    private bool Walk(List<(int x, int y)> path, bool approach, bool stopOnSighting)
+    private enum WalkKind { Wander, Approach, Flee }
+    private enum WalkStop { Arrived, Sighting, TargetMoved, Threat, Hit, Died, Time }
+    private int _hurts; // monster hits that landed on the player (OnWorld), to tell a step on which the bot was hit
+
+    /// <summary>Walks the path one cell at a time. Every step the server world runs to the new moment with the player on
+    /// its new cell (monsters under AI chase and attack meanwhile) and the boundary is re-drawn. Like the live tick, a
+    /// hazard covering the bot stops any walk but a flee (AvoidHazardsAsync runs first, every tick); a hit stops a walk
+    /// with no target (the live PickTarget runs every tick off-target: what's hitting it is a candidate now); a new
+    /// monster in view stops a wander (stopOnSighting); the chased target moving stops an approach (re-path).</summary>
+    private WalkStop Walk(List<(int x, int y)> path, WalkKind kind, bool stopOnSighting, Mob? chase = null, double maxSeconds = double.PositiveInfinity)
     {
+        var approach = kind == WalkKind.Approach;
+        var goal = chase != null ? (chase.X, chase.Y) : default;
         var detour = path.Count - 1 - Dist(path[0].x, path[0].y, path[^1].x, path[^1].y);
         if (detour > _bestDetour && path.Count > 2 && StraightLineBlocked(path[0].x, path[0].y, path[^1].x, path[^1].y)
             && Crop(path) is var crop && !crop.Contains("too long"))
             (_bestDetour, ObstacleExample) = (detour, $"from ({path[0].x},{path[0].y}) to ({path[^1].x},{path[^1].y}) the straight line crosses blocked cells; "
                 + $"A* walks {path.Count - 1} steps (straight distance {Dist(path[0].x, path[0].y, path[^1].x, path[^1].y)}), every step walkable:\n" + crop);
-        Note("route", $"{(approach ? "walk to the target" : "wander")}: A* route of {path.Count - 1} steps to ({path[^1].x},{path[^1].y})"
-            + (stopOnSighting ? ", stops when a monster comes into view" : ""), detail: new { approach, path = path.SelectMany(c => new[] { c.x, c.y }).ToArray() });
+        Note("route", $"{(approach ? "walk to the target" : kind == WalkKind.Flee ? "flee" : "wander")}: A* route of {path.Count - 1} steps to ({path[^1].x},{path[^1].y})"
+            + (stopOnSighting ? ", stops when a monster comes into view" : ""), detail: new { approach, flee = kind == WalkKind.Flee, path = path.SelectMany(c => new[] { c.x, c.y }).ToArray() });
+        var start = _t;
         for (var i = 1; i < path.Count && _t < _o.DurationSeconds; i++)
         {
+            if (_t - start >= maxSeconds) return WalkStop.Time;
             var (nx, ny) = path[i];
             var diagonal = nx != _x && ny != _y;
             if (!_walk.IsWalkable(nx, ny) || Dist(_x, _y, nx, ny) != 1
                 || (diagonal && (!_walk.IsWalkable(nx, _y) || !_walk.IsWalkable(_x, ny))))
                 throw new InvalidOperationException($"illegal step ({_x},{_y}) -> ({nx},{ny})");
             var dt = SecondsPerCell * (diagonal ? DiagonalFactor : 1);
-            if (!approach && !HuntableAliveAnywhere()) NoHuntableAliveSeconds += dt;
+            if (kind == WalkKind.Wander && !HuntableAliveAnywhere()) NoHuntableAliveSeconds += dt;
             _t += dt;
-            if (approach) ApproachSeconds += dt; else WanderSeconds += dt;
+            if (approach) ApproachSeconds += dt; else if (kind == WalkKind.Flee) FleeSeconds += dt; else WanderSeconds += dt;
             (_x, _y) = (nx, ny);
             _track.Add(new ReplayStep(_t, _x, _y, dt));
             Steps++;
             if (diagonal) DiagonalSteps++;
             _visits[_x / 8, _y / 8]++;
+            _world.MovePlayer(_x, _y);
             Respawns();
+            var hurts = _hurts;
+            if (AdvanceWorld(walking: true)) return WalkStop.Died;
+            if (kind == WalkKind.Flee) continue;
+            if (FleeDecision() is var (hz, hd, _))
+            {
+                WalkInterruptions++;
+                Log($"{(approach ? "approach" : "wander")} interrupted: {_hazards[hz].name} is {hd} cells away (danger radius {_hazards[hz].radius}) and the forecast loses", "threat",
+                    _byServerId.GetValueOrDefault(_hazards[hz].id)?.Id ?? 0);
+                return WalkStop.Threat;
+            }
+            if (chase != null && (chase.X, chase.Y) != goal) return WalkStop.TargetMoved; // it moved: re-path
+            if (!approach && _hurts > hurts)
+            {
+                WalkInterruptions++;
+                Log($"wander interrupted: hit by {(_lastAttacker != null ? $"{Name(_lastAttacker)} #{_lastAttacker.Id}" : "something")}", "threat", _lastAttacker?.Id ?? 0);
+                return WalkStop.Hit;
+            }
             if (!stopOnSighting) continue;
             var now = Visible();
             var entered = now.Where(m => !_inView.Contains(m.Id)).ToList();
@@ -469,26 +905,30 @@ public sealed class HuntSimulator
             ViewEntries += entered.Count;
             Log($"in view: {string.Join(", ", entered.Select(m => $"{Name(m)} #{m.Id} at ({m.X},{m.Y})"))}", "sighting", entered[0].Id,
                 new { entered = entered.Select(m => m.Id).ToArray(), inView = now.Count, viewDistance = ViewDistance });
-            return false;
+            return WalkStop.Sighting;
         }
-        return true;
+        return WalkStop.Arrived;
     }
 
     /// <summary>One encounter in the ServerWorld, from the HP/SP/statuses the last one left: the live rule engine picks
     /// each action, the server executes it. Returns false when the target wasn't killed.</summary>
-    private bool Fight(Mob m)
+    private bool Fight(Mob m, string? why = null)
     {
         Stats(m).Picked++;
-        AdvanceWorld(walking: true); // statuses, world events and regen ran on while walking
+        if (AdvanceWorld(walking: true)) return false; // statuses, world events and regen ran on while walking
         if (!m.Alive) return false; // a ground effect left behind finished it on the way
         _world.MovePlayer(_x, _y);
         var statuses = string.Join(",", _world.StatusesOf(0));
         FightStarts.Add((100.0 * _world.Hp / _world.MaxHp, 100.0 * _world.Sp / Math.Max(1, _world.MaxSp), statuses));
         var fc = ForecastOf(m);
-        Log($"engage {Name(m)} #{m.Id}: HP {_world.Hp}/{_world.MaxHp} SP {_world.Sp}/{_world.MaxSp}" + (statuses.Length > 0 ? $" [{statuses}]" : ""), "engage", m.Id,
+        var onMe = _mobs.Where(o => o != m && o.Alive && o.Active && _world.MonsterAi(o.ServerId).Target == _world.PlayerId).Select(o => o.Id).ToArray();
+        Log($"engage {Name(m)} #{m.Id}" + (why != null ? $" ({why})" : "") + $": HP {_world.Hp}/{_world.MaxHp} SP {_world.Sp}/{_world.MaxSp}" + (statuses.Length > 0 ? $" [{statuses}]" : "")
+            + (onMe.Length > 0 ? $"; {onMe.Length} other monster(s) already targeting the player" : ""), "engage", m.Id,
             new { forecastWinRate = fc.WinRate, forecastSeconds = fc.Seconds, forecastDamageTaken = fc.DamageTaken, forecastAttacks = fc.Attacks,
-                statuses, noAutoAttack = _o.NoAutoAttack, rules = _rules.Count });
+                statuses, noAutoAttack = _o.NoAutoAttack, rules = _rules.Count, why, targetingPlayer = onMe, targetAi = _world.MonsterAi(m.ServerId).State });
+        SyncServer();
         _fightTarget = m;
+        m.Path = null; // attacked: it stops wandering and fights
         var fight = _world.Fight(m.ServerId, () => Decide(m), Math.Min(300, _o.DurationSeconds - _t));
         _fightTarget = null;
         _t = _world.Clock;
@@ -498,22 +938,25 @@ public sealed class HuntSimulator
         Stats(m).DamageTaken += fight.DamageTaken;
         foreach (var id in fight.Killed)
             if (_byServerId.Remove(id, out var dead)) Died(dead, fight, byArea: dead != m);
-        foreach (var (id, mob) in _byServerId) (mob.X, mob.Y) = _world.MonsterPosition(id); // knockback moved them
+        foreach (var (id, mob) in _byServerId) (mob.X, mob.Y, mob.SyncedX, mob.SyncedY) = _world.MonsterPosition(id) is var p ? (p.X, p.Y, p.X, p.Y) : default; // knockback moved them
         if (_world.PlayerPosition != (_x, _y)) _track.Add(new ReplayStep(_t, _world.PlayerPosition.X, _world.PlayerPosition.Y, 0));
         (_x, _y) = _world.PlayerPosition; // the player's own skills or walking into range moved it
         if (fight.Outcome == -1)
         {
-            Deaths++;
-            Stats(m).Deaths++;
-            Log($"DIED to {Name(m)} #{m.Id} (death penalty, respawn and return trip are not simulated; revived at full HP, statuses cleared)", "death", m.Id,
-                new { fightSeconds = fight.Seconds, damageTaken = fight.DamageTaken, forecastWinRate = fc.WinRate });
-            _world.Revive();
-            Vitals(_t);
+            PlayerDeath(m, fight);
+            Boundary();
+            return false;
+        }
+        Boundary();
+        if (fight.Outcome == 3)
+        {
+            FightsLeft++;
+            Log($"fight with {Name(m)} #{m.Id} broken off after {fight.Seconds:F1}s: a hazard covers the bot (the live flee drops the target)", "fight-end", m.Id);
             return false;
         }
         if (fight.Outcome == 2)
         {
-            Log($"fight with {Name(m)} #{m.Id} abandoned after {fight.Seconds:F1}s: moved out of straight-line reach (see trace)", "fight-end", m.Id);
+            Log($"fight with {Name(m)} #{m.Id} abandoned after {fight.Seconds:F1}s: out of straight-line reach or hidden (see the abandon event)", "fight-end", m.Id);
             return false;
         }
         if (fight.Outcome == 0)
@@ -525,11 +968,23 @@ public sealed class HuntSimulator
         return true;
     }
 
-    /// <summary>The server world catches up with the bot's clock; monsters a lingering ground effect killed meanwhile die.</summary>
-    private void AdvanceWorld(bool walking)
+    /// <summary>The server world catches up with the bot's clock; monsters a lingering ground effect killed meanwhile die.
+    /// Monsters under their own AI act meanwhile. True when the player died on the way (handled by PlayerDeath: the world
+    /// then runs on to the bot's clock with the player back at the start cell).</summary>
+    private bool AdvanceWorld(bool walking)
     {
-        foreach (var id in _world.Advance(_t, walking))
-            if (_byServerId.Remove(id, out var dead)) Died(dead, null, byArea: true);
+        var died = false;
+        while (true)
+        {
+            if (_world.LiveEvents > 0) SyncServer(); // a ground effect may hit them where they walked
+            foreach (var id in _world.Advance(_t, walking))
+                if (_byServerId.Remove(id, out var dead)) Died(dead, null, byArea: true);
+            if (!_world.PlayerDied) break;
+            PlayerDeath(_fightTarget, null);
+            died = true;
+        }
+        Boundary();
+        return died;
     }
 
     private void Died(Mob m, EncounterResult? fight, bool byArea)
@@ -557,21 +1012,39 @@ public sealed class HuntSimulator
     private (double Hp, double Sp) RestFractions() =>
         HuntPolicy.RestFractions(_cfg, _o.Build.JobId, _world.Hp, _world.MaxHp, _world.Sp, _world.MaxSp);
 
+    private bool Threatened() => HuntPolicy.Threatened(_data, ViewMonsters(), Self, _hitMe.Contains, _hazards.Count);
+
+    /// <summary>What made Threatened true, in words (for the replay; the decision is HuntPolicy.Threatened's).</summary>
+    private string ThreatText()
+    {
+        if (_hazards.Count > 0) return $"{_hazards[0].name} in view is a hazard (the forecast loses; danger radius {_hazards[0].radius})";
+        var near = ViewMonsters().FirstOrDefault(m => Dist(_x, _y, m.Pos.X, m.Pos.Y) <= HuntPolicy.ThreatReach(_data.Monster(m.ClassId)) && (HuntPolicy.IsAggressive(_data.Monster(m.ClassId)) || _hitMe.Contains(m.Id)));
+        return near == null ? "" : $"{near.Name} {Dist(_x, _y, near.Pos.X, near.Pos.Y)} cells away ({(_hitMe.Contains(near.Id) ? "it has hit the bot" : "aggressive")})";
+    }
+
     private bool SendSit(bool sit)
     {
         var p = BotSession.SitStandPacket(sit);
         return _world.SitStand(p.Message, p.Length);
     }
 
-    /// <summary>The live TickRestAsync on the virtual clock: HuntPolicy.ShouldSit on the player's HP/SP, the client's sit
-    /// packet to the server, then every live tick the server's own regen runs (sitting rate) and HuntPolicy.ShouldStand
-    /// decides; the server refusing a sit is re-sent every 1.5 s as live. Nothing threatens a sitting bot here (monsters
-    /// stand still and don't aggress, no hazards), so 'threatened' is false. Returns whether the bot rested.</summary>
+    /// <summary>The live TickRestAsync on the virtual clock: HuntPolicy.ShouldSit on the player's HP/SP and HuntPolicy.Threatened
+    /// (an aggressive monster or one that hit it within its reach, HuntPolicy.ThreatReach, or a hazard in view, forbids sitting), the client's sit
+    /// packet to the server, then every live tick the world runs on (monsters may come for it), the server's regen runs
+    /// (sitting rate) and HuntPolicy.ShouldStand decides (rested, hit, threatened); the server refusing a sit is re-sent
+    /// every 1.5 s as live. Returns whether the bot rested.</summary>
     private bool RestIfDue()
     {
         var canSit = HuntPolicy.CanSit(_o.Build.JobId, _o.Build.LearnedSkills.GetValueOrDefault(CharacterSkill.BasicMastery));
-        if (!HuntPolicy.ShouldSit(_cfg, RestFractions(), _restToWin, canSit, threatened: false)) return false;
-        AdvanceWorld(walking: true); // the walk up to here
+        if (AdvanceWorld(walking: true)) return false; // the walk up to here
+        ComputeHazards();
+        var threatened = Threatened();
+        if (!HuntPolicy.ShouldSit(_cfg, RestFractions(), _restToWin, canSit, threatened))
+        {
+            if (threatened && (HuntPolicy.LowOnHpSp(_cfg, RestFractions()) || _restToWin) && canSit)
+                Note("sit-refused", $"wants to rest but won't sit: {ThreatText()}", detail: new { threatened = true, why = ThreatText() });
+            return false;
+        }
         var low = HuntPolicy.LowOnHpSp(_cfg, RestFractions());
         var (start, hp0, sp0, regenHp0, regenSp0) = (_t, _world.Hp, _world.Sp, _world.RegenHp, _world.RegenSp);
         Rests++;
@@ -581,7 +1054,7 @@ public sealed class HuntSimulator
             + (low ? $"under {_cfg.RestBelowPercent:P0}" : "rest to win: fights in view are winnable at full HP only") + ")", "sit", detail: new
             {
                 hpFraction = f0.Hp, spFraction = f0.Sp, spCounts = HuntPolicy.KillsWithSpells(_cfg, _o.Build.JobId), restBelow = _cfg.RestBelowPercent,
-                restWhenNoPotions = _cfg.RestWhenNoPotions, lowOnHpSp = low, restToWin = _restToWin, canSit, threatened = false,
+                restWhenNoPotions = _cfg.RestWhenNoPotions, lowOnHpSp = low, restToWin = _restToWin, canSit, threatened,
                 standAt = HuntPolicy.RestedFraction,
             });
         var nextSit = _t + ResitSeconds;
@@ -591,14 +1064,18 @@ public sealed class HuntSimulator
         while (_t < _o.DurationSeconds)
         {
             _t = Math.Min(_t + LiveTickSeconds, _o.DurationSeconds);
-            AdvanceWorld(walking: false);
             Respawns();
+            if (AdvanceWorld(walking: false)) { standReason = "died while sitting"; break; }
             var hit = _world.Hp < lastHp;
             lastHp = _world.Hp;
-            if (HuntPolicy.ShouldStand(_cfg, RestFractions(), _restToWin, hit, threatened: false))
+            ComputeHazards();
+            threatened = Threatened();
+            if (HuntPolicy.ShouldStand(_cfg, RestFractions(), _restToWin, hit, threatened))
             {
                 var f = RestFractions(); // which of ShouldStand's conditions held, for the replay
-                standReason = hit ? "hit while sitting" : f.Hp >= HuntPolicy.RestedFraction && f.Sp >= HuntPolicy.RestedFraction
+                standReason = hit ? $"hit while sitting{(_lastAttacker != null ? $" by {Name(_lastAttacker)} #{_lastAttacker.Id}" : "")}"
+                    : threatened ? $"threatened: {ThreatText()}"
+                    : f.Hp >= HuntPolicy.RestedFraction && f.Sp >= HuntPolicy.RestedFraction
                     ? $"rested: HP {f.Hp:P0} and {(HuntPolicy.KillsWithSpells(_cfg, _o.Build.JobId) ? $"SP {f.Sp:P0}" : "SP (not counted)")} at or above {HuntPolicy.RestedFraction:P0}"
                     : "not resting by config (RestWhenNoPotions off, no rest-to-win)";
                 if (!_world.Sitting || !SendSit(false)) break;
@@ -623,6 +1100,22 @@ public sealed class HuntSimulator
     /// BotBehavior.ChooseSkillRule on a snapshot of what the bot would know, then the rule's packet.</summary>
     private PlayerChoice Decide(Mob target)
     {
+        // The world keeps going around the fight: respawns, the replica's wander, the boundary (a monster walking into
+        // view mid-fight comes under its AI and can join). Then the live tick order: AvoidHazardsAsync before the hunt.
+        _t = Math.Max(_t, _world.Clock);
+        if (_world.PlayerPosition != (_x, _y))
+        {
+            (_x, _y) = _world.PlayerPosition;
+            _track.Add(new ReplayStep(_t, _x, _y, 0));
+        }
+        Respawns();
+        Boundary();
+        if (FleeDecision() is var (hz, hd, flee) && !(flee.Kind == FleeKind.FightBack && flee.MonsterId == target.ServerId))
+        {
+            Note("attack-decision", $"leave the fight: {_hazards[hz].name} is {hd} cells away (danger radius {_hazards[hz].radius}) and the forecast at HP {_world.Hp} loses (the live flee drops the target)",
+                target.Id, FleeDetail(_hazards[hz], hd, flee));
+            return PlayerChoice.Leave;
+        }
         var noRule = _o.NoAutoAttack ? PlayerChoice.Hold : PlayerChoice.AutoAttack;
         var fallback = _o.NoAutoAttack ? "hold (NoAutoAttack: no auto-attack)" : "auto-attack";
         if (_rules.Count == 0) { Note("attack-decision", $"{fallback}: no skill script", target.Id, new { reason = "no skill script" }); return noRule; }
@@ -688,7 +1181,7 @@ public sealed class HuntSimulator
             SelfAttackInterval = _world.AttackDelay, Map = _o.Map,
         };
         foreach (var m in _mobs)
-            if (m.Alive && m.ServerId != 0 && Dist(_x, _y, m.X, m.Y) <= ViewDistance)
+            if (m.Alive && m.ServerId != 0 && Dist(_x, _y, m.X, m.Y) <= ViewDistance && !_world.HiddenFromPlayer(m.ServerId))
             {
                 var (hp, maxHp) = _world.MonsterHp(m.ServerId);
                 s.Monsters.Add(new BotBehavior.MonsterInfo(m.ServerId, m.Db.Id, m.Db.Name, new Position(m.X, m.Y), hp, maxHp));
@@ -700,21 +1193,29 @@ public sealed class HuntSimulator
         return s;
     }
 
+    /// <summary>Share of the virtual duration simulated (0..1), after each step of the main loop.</summary>
+    public Action<double>? OnProgress;
+
     public void Run()
     {
         if (!_walk.TryFindWalkableNear(_walk.Width / 2, _walk.Height / 2, 60, out _x, out _y))
             throw new InvalidOperationException("no walkable start cell");
-        _world = new ServerWorld(_o.Map, _o.Build, _x, _y, _rng.Next()) { OnEvent = OnWorld };
+        _world = new ServerWorld(_o.Map, _o.Build, _x, _y, _rng.Next()) { OnEvent = OnWorld, OnMonsterStep = OnMonsterStep };
+        (_startX, _startY) = (_x, _y);
         _track.Add(new ReplayStep(0, _x, _y, 0));
         Vitals(0);
         if (_world.MapWidth != _walk.Width || _world.MapHeight != _walk.Height)
             throw new InvalidOperationException($"server walk data {_world.MapWidth}x{_world.MapHeight} differs from the client's {_walk.Width}x{_walk.Height}");
         Populate();
         Log($"start on {_o.Map} ({_walk.Width}x{_walk.Height}, {WalkableCells} walkable cells), {_mobs.Count} monsters spawned", "start");
+        Boundary();
         var lookNow = true;
         while (_t < _o.DurationSeconds)
         {
+            OnProgress?.Invoke(_t / _o.DurationSeconds);
             Respawns();
+            // The live tick order: AvoidHazardsAsync before resting and hunting; a flee tick ends the tick.
+            if (FleeIfThreatened()) { lookNow = true; continue; }
             if (lookNow)
             {
                 lookNow = false;
@@ -728,8 +1229,25 @@ public sealed class HuntSimulator
                 {
                     var (mob, path) = p;
                     Log($"target {Name(mob)} #{mob.Id} at ({mob.X},{mob.Y}), {path.Count - 1} steps (of {visible.Count} in view)", "pick", mob.Id, _pickDetail);
-                    Walk(path, approach: true, stopOnSighting: false);
+                    // The target keeps moving until hit (its own AI: wandering, or coming for the bot): follow it, re-pathing
+                    // each time it moves, as the server's attack move does.
+                    var stop = path.Count > 1 ? Walk(path, WalkKind.Approach, stopOnSighting: false, chase: mob) : WalkStop.Arrived;
+                    for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && mob.Alive && _t < _o.DurationSeconds
+                                          && Dist(_x, _y, mob.X, mob.Y) > MeleeRange && repaths < MaxChaseRepaths; repaths++)
+                    {
+                        var again = _walk.FindPath(_x, _y, mob.X, mob.Y, ReachExpansions);
+                        if (again == null) break;
+                        stop = Walk(again.Take(again.FindIndex(c => Dist(c.x, c.y, mob.X, mob.Y) <= MeleeRange) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: mob);
+                    }
                     if (_t >= _o.DurationSeconds) break;
+                    if (stop is WalkStop.Threat or WalkStop.Died || !mob.Alive) { _wanderDest = null; lookNow = true; continue; }
+                    if (Dist(_x, _y, mob.X, mob.Y) > MeleeRange)
+                    {
+                        Log($"lost {Name(mob)} #{mob.Id}: it kept wandering out of reach", "abandon", mob.Id);
+                        _wanderDest = null;
+                        lookNow = true;
+                        continue;
+                    }
                     if (Dist(_x, _y, mob.X, mob.Y) > MeleeRange) throw new InvalidOperationException("fight started out of range");
                     var searched = _t - _lastFightEnd;
                     if (Fight(mob)) SearchPerKill.Add(searched);
@@ -749,10 +1267,7 @@ public sealed class HuntSimulator
                 {
                     // Wedged (WanderAsync's "no reachable destination in 6 attempts"): it retries on its 0.8 s throttle.
                     if (IdleSeconds == 0 || !Trace[^1].Contains("wedged")) Log("wedged: no reachable wander destination in 6 attempts", "idle", detail: new { attempts });
-                    var wait = Math.Min(0.8, _o.DurationSeconds - _t);
-                    _t += wait;
-                    IdleSeconds += wait;
-                    if (!HuntableAliveAnywhere()) NoHuntableAliveSeconds += wait;
+                    Wait(0.8, flee: false);
                     lookNow = true;
                     continue;
                 }
@@ -764,14 +1279,14 @@ public sealed class HuntSimulator
                     attempts,
                 });
             }
-            var route = _walk.FindPath(_x, _y, _wanderDest.Value.X, _wanderDest.Value.Y);
+            var route = _walk.FindPath(_x, _y, _wanderDest.Value.X, _wanderDest.Value.Y, 0, PathCost()); // as WanderAsync: around hazards
             if (route == null) { _wanderDest = null; continue; }
-            Walk(route, approach: false, stopOnSighting: true);
+            Walk(route, WalkKind.Wander, stopOnSighting: true);
             lookNow = true; // stopped for a sighting, or arrived: look either way
         }
-        var accounted = WanderSeconds + ApproachSeconds + FightSeconds + IdleSeconds + RestSeconds;
+        var accounted = WanderSeconds + ApproachSeconds + FightSeconds + IdleSeconds + RestSeconds + FleeSeconds;
         if (Math.Abs(accounted - _t) > 1e-6)
-            throw new InvalidOperationException($"clock {_t:F6}s but walking + fighting + idle + resting = {accounted:F6}s");
+            throw new InvalidOperationException($"clock {_t:F6}s but walking + fighting + idle + resting + fleeing = {accounted:F6}s");
         Log($"end: {Kills} kills, {Exp} exp", "end");
     }
 
@@ -810,7 +1325,9 @@ public sealed class HuntSimulator
         L($"Kills/h {Kills / hours:F0}, EXP/h {Exp / hours:F0} sustained; {Exp / huntHours:F0} EXP/h over the {_o.DurationSeconds - RestSeconds:F0}s not spent sitting");
         double Pct(double s) => 100 * s / _o.DurationSeconds;
         L($"Time: wandering without a target {WanderSeconds:F0}s ({Pct(WanderSeconds):F1}%), walking to targets {ApproachSeconds:F0}s ({Pct(ApproachSeconds):F1}%), "
-          + $"fighting {FightSeconds:F0}s ({Pct(FightSeconds):F1}%), resting {RestSeconds:F0}s ({Pct(RestSeconds):F1}%), wedged/idle {IdleSeconds:F0}s ({Pct(IdleSeconds):F1}%)");
+          + $"fighting {FightSeconds:F0}s ({Pct(FightSeconds):F1}%), resting {RestSeconds:F0}s ({Pct(RestSeconds):F1}%), fleeing {FleeSeconds:F0}s ({Pct(FleeSeconds):F1}%), wedged/idle {IdleSeconds:F0}s ({Pct(IdleSeconds):F1}%)");
+        L($"Threats: monster AIs targeted the bot {Aggros} times; {Flees} flees, {FightsLeft} fights broken off to flee, {WalkInterruptions} walks interrupted (hazard or hit), "
+          + $"{Deaths} deaths; at most {_peakActive} monsters under their server AI at once");
         L($"Search (wander + walk-up) per kill: {Summary(SearchPerKill)}");
         L($"  histogram: {Histogram(SearchPerKill, new[] { 2.0, 5, 10, 20, 40, 80 })}");
         L($"Fight per kill: {(Kills > 0 ? FightSeconds / Math.Max(1, Kills + Deaths) : 0):F2}s mean");
@@ -896,20 +1413,25 @@ public sealed class HuntSimulator
         Add("Spawning", "approximated", "A (re)spawn lands on a uniformly random walkable cell of its area; the server's 9-slice spawn-zone formula is not reproduced.", "Monster density across a big area can differ a little from live.");
         Add("Walking", "approximated", "A* on the walk grid at the base 0.15 s per cell (diagonal x1.414); the bot moves cell to cell, time jumps per step. Inside a fight the player walks into range in a straight line.",
             "No server path smoothing or move lag; a target behind a wall mid-fight is abandoned rather than walked around.");
-        Add("Re-targeting", "approximated", "Targets are re-picked when a monster enters view or after a fight, not every 0.25 s tick as live; once picked, a target is walked to and fought.",
+        Add("Re-targeting", "approximated", "Targets are re-picked when a monster enters view, when a monster hits the bot off-target, after a flee or a fight, not every 0.25 s tick as live; once picked, a target is walked to and fought. Threats are checked every step (0.15 s) and every fight action rather than every 0.25 s tick.",
             "The live bot can switch to a better target mid-walk; this one cannot.");
         Add("Skill timing", "approximated", "Skill rules are evaluated at action slots in a fight, not while walking up to the target as the live tick also does.", "Opening buffs cast on the approach live happen at the first swing here.");
         Add("Target forecast", "approximated", "The pick's forecast is a server-code duel from full HP, judged against the current HP; the live server-forecast mode re-runs it from the current HP. No potion buffer.",
             "Borderline targets at low HP can be judged slightly differently than live.");
         Add("Rest estimate in the score", "approximated", "The target score's rest-time term is HuntPolicy.RestSeconds (live's formula, without recovery skills), not the server regen.", "Scores of damaging targets carry live's rest estimate.");
         Add("Regen timing", "approximated", "The server regen runs in 0.25 s slices of virtual time.", "A regen tick can land up to 0.25 s late.");
-        Add("Monster AI", "absent", "Monsters stand still between spawn and death: no wandering, chasing, aggression, assisting or swarms; live monsters move.",
-            "Encounters happen only when the bot walks up; nothing ambushes it, interrupts a rest or follows it; search times and paths differ from live.");
-        Add("Monster fights", "absent", "Only the target swings back (once hit, within its own reach); area damage hurts neighbours but they don't react; monsters cast no skills.", "Damage taken is the one-on-one melee duel's.");
+        Add("Monster AI", "server", "Every monster within the server's view distance (21) of the bot runs the game server's own AI (WorldObject.Update -> Monster.Update, MonsterAI.csv, its skill handler) on 10 ms server frames: target search, chasing, giving up, attacking, assisting its kind, retaliating, monster skills, random moves.",
+            $"Aggression, chases, packs and monster skills are the server's. This run: {Aggros} times a monster's AI targeted the bot.");
+        Add("Distant monsters", "approximated", "Out of view, a monster's idle wander is a re-implementation of the server's (wait 4-6 s, a random cell within 9, at most 20 steps, locked spawn areas kept); handed to its server AI (cell, idle timer, the move under way) on entering view, and back only once out of view with its AI at rest.",
+            "Nothing out of the bot's view can notice it, which the server agrees with (it wakes a monster's AI only for players in view). The live server keeps an awake monster's AI running out of view; here it falls back to the copy.");
+        Add("Monster fights", "server", "Every monster whose AI targets the bot swings or casts on its own cooldown; damage lands through the server's damage queue, attributed to its attacker.", "Several attackers at once, and the ones that aren't the target, hit as on the server.");
+        Add("Threat reactions", "shared", "The live hazard rules (HuntPolicy: HazardCandidate/IsHazard, HazardRadius, ApproachNearHazard, EngagementGroup, Threatened, ChooseFlee, PathCost) on this world's server-code forecasts, checked every step and every fight action: flee, refuse targets near hazards or pulling a losing pack, refuse to sit or stand up when threatened, fight back when cornered, avoid a killer's class.",
+            $"This run: {Flees} flees ({FleeTicks} flee ticks, {FleeSeconds:F0}s), {FightsLeft} fights broken off, {WalkInterruptions} walks interrupted.");
+        Add("Threat forecasts", "approximated", "Hazards use the server-code duel at the current HP (the live server-forecast engine, not its hand-formula 'old' one); a pack is its members' duels killed quickest first while the rest keep hitting, not BattleSimulator.ForecastGroup's hand formula. Fly Wings don't exist (no inventory), so KillsMeFast isn't evaluated; the flee never winged out.",
+            "Borderline hazards and packs can be judged slightly differently than live; a live bot carrying Fly Wings escapes ambushes this one fights through.");
         Add("Items", "absent", "No potions, looting, zeny or inventory (gemstones, arrows to consume).", "HP comes back only by regen and sitting; skills needing ammo or catalysts are refused by the server.");
         Add("Other players", "absent", "No party (ally rules never fire), no other players competing for monsters.", "Kill-stealing and party support don't exist here.");
-        Add("Hazards and fleeing", "absent", "No hazards, no fleeing, nothing threatens a sitting bot.", "Rests are never interrupted.");
-        Add("Death", "absent", "A death revives at full HP on the spot: no EXP penalty, no save-point return trip.", "A dying build looks better than it would live.");
+        Add("Death", "approximated", "A death (in a fight, walking or sitting) revives at full HP at the run's start cell; the killer's class is avoided as live does. No EXP penalty, no save-point return trip.", "A dying build looks better than it would live.");
         Add("Progression", "absent", "The build is fixed for the whole run: no level-ups, stat or skill points.", "A long run keeps the recorded build's stats, HP and kill speed throughout.");
         // What this run's inputs make of it.
         if (_o.Config == null) Add("Config", "approximated", "No saved config for this bot: the in-code BotBehaviorConfig defaults ran.", "Rest, win and hunt rules may differ from the live bot's.");
@@ -961,7 +1483,7 @@ public sealed class HuntSimulator
             SkillScript = _o.SkillScript ?? "", MaxHp = _world.MaxHp, MaxSp = _world.MaxSp,
             Mobs = _mobs.Select(m => new ReplayMob(m.Id, m.Db.Id, m.Db.Name, m.Db.Level, m.Db.Exp, m.Db.HP, m.Pinned, new[] { m.MinX, m.MinY, m.MaxX, m.MaxY },
                 Respawn(m), ForecastText(ForecastOf(m)))).ToList(),
-            Track = _track, Vitals = _vitals,
+            Track = _track, Vitals = _vitals, MobMoves = _moves,
             Events = _events.OrderBy(e => e.T).ToList(), // stable: back-dated world events (regen caught up at a fight's start) slot in by time
             Summary = summary, Capabilities = Capabilities(), Failures = _world.Failures.ToList(),
             Report = Report(), Fingerprint = Fingerprint(),

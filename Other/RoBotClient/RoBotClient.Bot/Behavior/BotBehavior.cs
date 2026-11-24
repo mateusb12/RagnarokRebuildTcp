@@ -27,9 +27,9 @@ public sealed partial class BotBehavior
     // permanently ban a class — particularly important for low-level bots that may die once and then be
     // unable to hunt the most common mob on their map for the rest of the session.
     private readonly Dictionary<int, DateTime> _avoidClasses = new();
-    private static readonly TimeSpan AvoidClassDuration = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan AvoidClassDuration = TimeSpan.FromMinutes(HuntPolicy.AvoidClassMinutes);
     // Dying to the same class again inside the window means it's no fluke: Bot3 died to Elder Willow on three maps in 4 min.
-    private static readonly TimeSpan RepeatKillerAvoidDuration = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan RepeatKillerAvoidDuration = TimeSpan.FromMinutes(HuntPolicy.RepeatKillerAvoidMinutes);
 
     private int _targetId;
     private int _targetClass = -1;
@@ -716,43 +716,9 @@ public sealed partial class BotBehavior
         // naturally bend around them when possible. (For approaching to engage, the kite FSM picks a
         // cell on the OUTER edge; this overlay only nudges; it doesn't make engagement impossible.)
         AppendImmobileMobZones(hzList);
-        var portalBuffer = Math.Max(0, _config.PortalSafeDistance);
-        // Snapshot the REAL warp footprints (rectangles, not points) so cost is correct for fat warps.
-        // The legacy distance-to-center version silently approved cells on the long edge of warps like
-        // pay_fild01's 5×13 pay_fild07 portal.
-        List<(int minX, int minY, int maxX, int maxY)>? footprints = null;
-        if (portalBuffer > 0)
-        {
-            footprints = new List<(int, int, int, int)>();
-            foreach (var f in _data.World.PortalFootprintsOn(map)) footprints.Add(f);
-        }
-        if (hzList.Count == 0 && (footprints == null || footprints.Count == 0)) return null;
-        return (x, y) =>
-        {
-            var cost = 0f;
-            for (var i = 0; i < hzList.Count; i++)
-            {
-                var h = hzList[i];
-                var d = Math.Max(Math.Abs(h.x - x), Math.Abs(h.y - y));
-                if (d <= h.radius) cost += 8f;          // inside aggro — strong penalty (path detours unless no choice)
-                else if (d <= h.radius + 3) cost += 2f; // 3-cell warning buffer
-            }
-            if (footprints != null)
-            {
-                for (var i = 0; i < footprints.Count; i++)
-                {
-                    var f = footprints[i];
-                    // Chebyshev distance from (x,y) to the AABB of the footprint. 0 = inside.
-                    var dx = Math.Max(Math.Max(f.minX - x, 0), x - f.maxX);
-                    var dy = Math.Max(Math.Max(f.minY - y, 0), y - f.maxY);
-                    var d = Math.Max(dx, dy);
-                    if (d == 0) { cost += 50f; break; }       // inside footprint = guaranteed warp
-                    if (d == 1) cost += 6f;                    // adjacent — one step from triggering
-                    else if (d <= portalBuffer) cost += 1.5f;  // soft buffer fades smoothly
-                }
-            }
-            return cost;
-        };
+        // The REAL warp footprints (rectangles, not points): the legacy distance-to-center version silently approved
+        // cells on the long edge of warps like pay_fild01's 5×13 pay_fild07 portal.
+        return HuntPolicy.PathCost(_data, map, hzList, _config.PortalSafeDistance);
     }
 
     /// <summary>Public MCP entry — runs the bot's full Forecast pipeline against a database mob class.
@@ -927,14 +893,7 @@ public sealed partial class BotBehavior
     /// <summary>True when the monster is a fixed-position mob — Mandragora-style plants (negative
     /// MoveSpeed) and Geographer-style AiAggressiveImmobile sprites. The simulator zeros incoming
     /// damage when this is true and the bot can shoot from outside the mob's attack range.</summary>
-    private static bool IsMonsterImmobile(MonsterDbEntry? db)
-    {
-        if (db == null) return false;
-        if (db.MoveSpeed <= 0) return true;
-        if (!string.IsNullOrEmpty(db.Ai) && db.Ai.IndexOf("Immobile", StringComparison.OrdinalIgnoreCase) >= 0)
-            return true;
-        return false;
-    }
+    private static bool IsMonsterImmobile(MonsterDbEntry? db) => HuntPolicy.IsImmobile(db);
 
     /// <summary>Add every visible immobile-ranged mob's attack circle to <paramref name="hzList"/> as a
     /// soft hazard. Cost-overlay readers (<see cref="MakePathCost"/>) treat the circle's interior as
@@ -951,13 +910,8 @@ public sealed partial class BotBehavior
         // Hydras came into view and the route turned east, eastward they left view and it turned back west).
         if (_immobileMap != snap.Map) { _immobileMap = snap.Map; _immobileSeen.Clear(); }
         foreach (var m in snap.Monsters)
-        {
-            var db = _data.Monster(m.ClassId);
-            if (!IsMonsterImmobile(db)) continue;
-            var range = db?.Range ?? 0;
-            if (range < 2) continue; // melee plant has no projectile zone worth detouring around
-            _immobileSeen[m.Id] = (m.Pos.X, m.Pos.Y, range + 1); // +1: server range is rounded Euclidean, as in InOtherFixedReach
-        }
+            if (HuntPolicy.ImmobileZone(_data.Monster(m.ClassId), m.Pos) is { } zone) // melee plants have no projectile zone worth detouring around
+                _immobileSeen[m.Id] = zone;
         // Gone from a cell we can still see = killed.
         foreach (var (id, z) in _immobileSeen)
             if (Dist(snap.SelfPos, new Position(z.x, z.y)) <= ImmobileForgetDist && !snap.Monsters.Any(m => m.Id == id)) _immobileSeen.Remove(id);
@@ -1160,32 +1114,9 @@ public sealed partial class BotBehavior
     // The pack that piles on if we engage this target: same-type assist monsters that can see it, plus any
     // already-aggressive monster whose aggro range covers us. Lets us refuse mobs that are individually
     // winnable but collectively deadly (#8).
-    private const int AssistRadius = 10;
-
-    private bool IsAssist(int classId)
-    {
-        var ai = _data?.Monster(classId)?.Ai;
-        return !string.IsNullOrEmpty(ai) && ai.Contains("Assist", StringComparison.Ordinal);
-    }
-
-    private List<MonsterInfo> EngagementGroup(Snapshot snap, MonsterInfo target)
-    {
-        var group = new List<MonsterInfo> { target };
-        var targetAssists = IsAssist(target.ClassId);
-        // Without the range to snipe it, the bot stands next to the target, inside any neighbouring fixed monster's reach.
-        var standsAtTarget = !SnipesFixed(snap, target);
-        foreach (var m in snap.Monsters)
-        {
-            if (m.Id == target.Id) continue;
-            if (m.MaxHp > 0 && m.Hp <= 0) continue;
-            var joins = (targetAssists && m.ClassId == target.ClassId && Dist(m.Pos, target.Pos) <= AssistRadius)
-                        || (IsAggressive(m.ClassId) && Dist(snap.SelfPos, m.Pos) <= HazardRadius(m.ClassId))
-                        || (standsAtTarget && _data?.Monster(m.ClassId) is { } fixedDb && IsMonsterImmobile(fixedDb)
-                            && ServerDistance(m.Pos.X, m.Pos.Y, target.Pos.X, target.Pos.Y) <= fixedDb.Range + 1);
-            if (joins) group.Add(m);
-        }
-        return group;
-    }
+    // Without the range to snipe it, the bot stands next to the target, inside any neighbouring fixed monster's reach.
+    private List<MonsterInfo> EngagementGroup(Snapshot snap, MonsterInfo target) =>
+        HuntPolicy.EngagementGroup(_data, snap.Monsters, snap.SelfPos, target, standsAtTarget: !SnipesFixed(snap, target));
 
     private GroupForecast ForecastGroupOf(Snapshot snap, List<MonsterInfo> group)
     {
@@ -1483,7 +1414,7 @@ public sealed partial class BotBehavior
         // The sit/stand rules are HuntPolicy's, shared with the offline HuntSimulator.
         var f = HuntPolicy.RestFractions(_config, snap.SelfJobId, snap.SelfHp, snap.SelfMaxHp, snap.SelfSp, snap.SelfMaxSp);
         // Only a monster that will attack ends the rest: a passive Horn wandering by used to stand Bot3 up at low HP.
-        var threatened = AnyAdjacentMonster(snap, aggressiveOnly: true) || _hazards.Count > 0;
+        var threatened = HuntPolicy.Threatened(_data, snap.Monsters, snap.SelfPos, _bot.HasHitMe, _hazards.Count);
 
         if (_resting)
         {
@@ -1531,17 +1462,8 @@ public sealed partial class BotBehavior
     private bool CanSit(Snapshot snap) => snap.SelfJobId != 0 || HuntPolicy.CanSit(0, _bot.WithState(w =>
         w.Self.KnownSkills.Where(k => k.Skill == CharacterSkill.BasicMastery).Select(k => (int)k.Level).DefaultIfEmpty(0).Max()));
 
-    private bool AnyAdjacentMonster(Snapshot snap, int range = 3, bool aggressiveOnly = false)
-    {
-        foreach (var m in snap.Monsters)
-        {
-            if (m.MaxHp > 0 && m.Hp <= 0) continue;
-            // "Will attack": aggressive, or already fighting us (Bot3 sat down mid-fight with a Horn and sat/stood under its hits).
-            if (aggressiveOnly && !IsAggressive(m.ClassId) && !_bot.HasHitMe(m.Id)) continue;
-            if (Dist(snap.SelfPos, m.Pos) <= range) return true;
-        }
-        return false;
-    }
+    private bool AnyAdjacentMonster(Snapshot snap, int range = 3, bool aggressiveOnly = false) =>
+        HuntPolicy.AnyAdjacentMonster(_data, snap.Monsters, snap.SelfPos, range, aggressiveOnly, _bot.HasHitMe);
 
     private int NearestLoot(WorldState w, Position self)
     {
@@ -1562,18 +1484,7 @@ public sealed partial class BotBehavior
 
     // ---- hazard avoidance: stay clear of aggressive monsters the forecast says we'd lose to ----
 
-    private bool IsAggressive(int classId)
-    {
-        var m = _data?.Monster(classId);
-        if (m == null) return false;
-        // Plants never move or attack, even boss-flagged ones (the prt_fild08 Target Dummy is Special=Boss).
-        if (string.Equals(m.Ai, "AiPlant", StringComparison.Ordinal)) return false;
-        if (string.Equals(m.Special, "Boss", StringComparison.OrdinalIgnoreCase)) return true; // bosses/MVPs: always dangerous
-        if (string.IsNullOrEmpty(m.Ai)) return false;
-        return m.Ai.StartsWith("AiAggressive", StringComparison.Ordinal)
-            || m.Ai.Equals("AiAngry", StringComparison.Ordinal)
-            || m.Ai.Equals("AiStandardBoss", StringComparison.Ordinal);
-    }
+    private bool IsAggressive(int classId) => HuntPolicy.IsAggressive(_data?.Monster(classId));
 
     /// <summary>Walk every monster in the DB, aggregate per-map danger contributions weighted by the
     /// level gap (mob_level - bot_level), aggression, boss/MVP flag, and spawn count. Mobs at or below
@@ -1621,11 +1532,7 @@ public sealed partial class BotBehavior
     private float GetMapDanger(string map) =>
         _mapDanger.TryGetValue(map, out var d) ? d : 0f;
 
-    // A mob that never moves can only hit us within its attack range; fleeing at its scan distance (12 for Flora, range 3)
-    // made the bot flee, walk back toward its exit and flee again every 10 s.
-    private int HazardRadius(int classId) => _data?.Monster(classId) is { } db && IsMonsterImmobile(db)
-        ? Math.Max(1, db.Range) + 2
-        : (_data?.Monster(classId)?.ScanDist ?? 10) + 2;
+    private int HazardRadius(int classId) => HuntPolicy.HazardRadius(_data?.Monster(classId));
 
     private const float UnwinnableSpawnDanger = 3f; // per spawn of an aggressive mob the forecast loses to ≈ 15 walked cells
 
@@ -1637,14 +1544,10 @@ public sealed partial class BotBehavior
         foreach (var m in snap.Monsters)
         {
             if (m.MaxHp > 0 && m.Hp <= 0) continue;
-            if (_config.IgnoreClassIds.Contains(m.ClassId)) continue; // explicitly ignored (e.g. training dummy): neither hunt nor fear
-            // Force-hunt override: operator explicitly told us "engage this class regardless of
-            // forecast". The hazard system runs BEFORE PickTarget on every tick (including the very
-            // first one after a map-change spawn) and a hazard-flagged mob short-circuits to
-            // AvoidHazardsAsync — so a force-hunt entry that's only checked in PickTarget never gets
-            // a chance to fire. Treating force-hunted mobs as "never a hazard" closes the loop.
-            if (_config.ForceHuntClassIds.Contains(m.ClassId)) continue;
-            if (!IsAggressive(m.ClassId)) continue;
+            // Ignored (e.g. training dummy): neither hunt nor fear. Force-hunted: the hazard system runs BEFORE PickTarget on
+            // every tick and a hazard short-circuits to AvoidHazardsAsync, so a force-hunt entry checked only in PickTarget
+            // would never fire. Not aggressive: never a hazard.
+            if (!HuntPolicy.HazardCandidate(_config, m.ClassId, _data?.Monster(m.ClassId))) continue;
             // Either engine saying "lose" makes a hazard; a server "win" never cancels the old "lose". The deaths on in_sphinx1
             // (Mantis, Zerom) came from the engines disagreeing at the zone's edge: a server "win" ended the flee, the next
             // tick's old "lose" restarted it. A server "lose" sticks to the monster until a server "win" arrives while we're
@@ -1660,7 +1563,7 @@ public sealed partial class BotBehavior
             // The one we're fleeing stays a hazard until the flee ends: the old forecast flips with our HP/SP mid-chase,
             // and each "win" ended the flee and re-engaged it at 1 cell (Bot1 vs Zerom on in_sphinx2, Bot3 vs Raggler).
             var fleeing = Mode == BotMode.Fleeing && _fleeThreats.Contains(m.Id);
-            if (old.CanWin && !serverLose && !fleeing) continue; // aggressive but winnable = a target, not a hazard
+            if (!HuntPolicy.IsHazard(!old.CanWin || serverLose, fleeing)) continue; // aggressive but winnable = a target, not a hazard
             var engine = !old.CanWin ? (serverLose ? "old+server" : "old") : serverLose ? "server" : "earlier (still fleeing it)";
             _hazards.Add((m.Pos, HazardRadius(m.ClassId), m.Name, engine, m.Id));
             _seenHazards[m.Id] = (m.Pos, HazardRadius(m.ClassId), DateTime.UtcNow);
@@ -1674,34 +1577,18 @@ public sealed partial class BotBehavior
     private readonly HashSet<int> _serverLoses = new();
     // Monsters the current flee is from (AvoidHazardsAsync); cleared when the flee ends.
     private readonly HashSet<int> _fleeThreats = new();
-    // Same 3-cell warning band as the path cost: a flee ends only past it, and a target must sit outside it.
-    private const int HazardBuffer = 3;
+    private const int HazardBuffer = HuntPolicy.HazardBuffer;
 
     // A target in or near a hazard zone, or whose straight walk crosses one, pulls us back to the threat: Bot3 left See
     // Otter's zone by one cell, engaged an Aster beyond it and re-entered the zone three times in 6 s before dying.
     private bool ApproachNearHazard(Snapshot snap, Position target, out int hazard, out string where)
     {
-        var n = Math.Max(1, Dist(snap.SelfPos, target));
         // In view, plus the ones seen in the last HazardMemory: Bot3 escaped one See Otter and engaged an Aster inside the
         // zone of a second one that had just left view. A remembered zone we stand in is stale (it'd be in view if there).
         var zones = _hazards.Select(h => (h.id, h.pos, h.radius)).Concat(_seenHazards
             .Where(s => _hazards.All(h => h.id != s.Key) && Dist(snap.SelfPos, s.Value.pos) > s.Value.radius)
             .Select(s => (id: s.Key, s.Value.pos, s.Value.radius))).ToList();
-        for (var i = n; i >= 1; i--) // target cell first, so "where" names it when both apply
-        {
-            int x = snap.SelfPos.X + (target.X - snap.SelfPos.X) * i / n, y = snap.SelfPos.Y + (target.Y - snap.SelfPos.Y) * i / n;
-            var buffer = i == n ? HazardBuffer : 0;
-            foreach (var h in zones)
-            {
-                hazard = h.id;
-                var d = Math.Max(Math.Abs(h.pos.X - x), Math.Abs(h.pos.Y - y));
-                if (d > h.radius + buffer) continue;
-                where = i < n ? $"the walk to it crosses (at ({x},{y}))" : d <= h.radius ? "it stands inside" : $"it stands {d - h.radius} cell(s) outside";
-                return true;
-            }
-        }
-        (hazard, where) = (0, "");
-        return false;
+        return HuntPolicy.ApproachNearHazard(snap.SelfPos, target, zones, out hazard, out where);
     }
 
     // Verification telemetry for the flee/target-selection fix: one line per (candidate, threat) rejection, and one per pick
@@ -1787,33 +1674,6 @@ public sealed partial class BotBehavior
     /// <summary>First waypoint (≤ 8 cells) of an A* path to the current walk goal where every hazard zone is
     /// steeply priced (deeper = dearer, so from inside the path leaves by the shortest way out). Null when there's
     /// no fresh goal, no path, or the waypoint wouldn't take us farther from <paramref name="threat"/>.</summary>
-    private (int x, int y)? DodgeTowardGoal(Snapshot snap, Position threat, out string whyNot)
-    {
-        whyNot = "";
-        if (_walkGoal is not { } g || g.map != snap.Map || DateTime.UtcNow - g.at > TimeSpan.FromSeconds(5))
-        { whyNot = "not walking anywhere"; return null; }
-        var map = _data?.GetWalkMap(snap.Map);
-        if (map == null) { whyNot = "no walk map"; return null; }
-        var zones = HazardZones();
-        var path = map.FindPath(snap.SelfPos.X, snap.SelfPos.Y, g.x, g.y, 20000, (x, y) =>
-        {
-            var cost = 0f;
-            foreach (var h in zones)
-            {
-                var d = Math.Max(Math.Abs(h.x - x), Math.Abs(h.y - y));
-                if (d <= h.radius) cost += 40f * (h.radius - d + 1);
-            }
-            return cost;
-        });
-        if (path is not { Count: > 1 }) { whyNot = $"no path to my goal ({g.x},{g.y})"; return null; }
-        var step = FurthestStraightLineSafeStep(snap.Map, snap.SelfPos.X, snap.SelfPos.Y, path, Math.Min(8, path.Count - 1), (g.x, g.y));
-        if (step < 1) { whyNot = "a portal is in the way"; return null; }
-        var wp = new Position(path[step].x, path[step].y);
-        if (Dist(wp, threat) > Dist(snap.SelfPos, threat)) return path[step];
-        whyNot = $"the way to my goal ({g.x},{g.y}) goes toward it";
-        return null;
-    }
-
     // HP over the last few seconds, to tell "a scary mob is in view" from "something is chewing on me".
     private readonly Queue<(DateTime at, int hp)> _hpHistory = new();
     private static readonly TimeSpan HpWindow = TimeSpan.FromSeconds(5);
@@ -1892,25 +1752,13 @@ public sealed partial class BotBehavior
         return true;
     }
 
-    private bool CellNearHazard(int x, int y, int skip = -1)
-    {
-        for (var i = 0; i < _hazards.Count; i++)
-            if (i != skip && Math.Max(Math.Abs(_hazards[i].pos.X - x), Math.Abs(_hazards[i].pos.Y - y)) <= _hazards[i].radius) return true;
-        return false;
-    }
+    private bool CellNearHazard(int x, int y, int skip = -1) => HuntPolicy.CellNearHazard(_hazards, x, y, skip);
 
     private async Task<bool> AvoidHazardsAsync(Snapshot snap, CancellationToken ct)
     {
-        var bestIdx = -1;
-        var nearestD = int.MaxValue;
-        for (var i = 0; i < _hazards.Count; i++)
-        {
-            var d = Dist(snap.SelfPos, _hazards[i].pos);
-            // An ongoing flee lasts until we're past the warning band too: ending it one cell outside the zone handed
-            // the next tick to PickTarget at the zone's edge, and the hazard was back in range two seconds later.
-            var reach = _hazards[i].radius + (Mode == BotMode.Fleeing ? HazardBuffer : 0);
-            if (d <= reach && d < nearestD) { nearestD = d; bestIdx = i; }
-        }
+        // An ongoing flee lasts until we're past the warning band too: ending it one cell outside the zone handed the next
+        // tick to PickTarget at the zone's edge, and the hazard was back in range two seconds later.
+        var (bestIdx, nearestD) = HuntPolicy.NearestHazardInReach(_hazards, snap.SelfPos, Mode == BotMode.Fleeing);
         if (bestIdx < 0)
         {
             if (Mode == BotMode.Fleeing && _fleeHz.name != null) _lastFlee = (_fleeHz.id, _fleeHz.name, _fleeHz.pos, _fleeHz.radius, DateTime.UtcNow);
@@ -1938,146 +1786,48 @@ public sealed partial class BotBehavior
         _targetId = 0;
         _targetClass = -1;
 
-        // On the way somewhere: sidestep along an A* path to the goal that bends out of the danger zone, instead
-        // of running straight back the way we came. Fly Wing / flee-away only when it's closing in or no such path.
-        string noDodge;
-        if (nearestD <= hz.radius / 2) noDodge = $"it's {nearestD} cells away, too close to sidestep";
-        else if (DodgeTowardGoal(snap, hz.pos, out noDodge) is { } dodge)
-        {
-            LogFlee("dodge", $"Flee: sidestepping '{hz.name}' toward my goal ({_walkGoal!.Value.x},{_walkGoal.Value.y}) via ({dodge.x},{dodge.y}).");
-            await _bot.WalkToAsync(dodge.x, dodge.y, ct);
-            return true;
-        }
-
-        // Walking away rarely outruns an aggressive mob (Angeling on pay_fild04 killed Bot3 that way).
-        // A Fly Wing (random spot on this map) gets out of its sight instantly; travel/hunt just replans.
-        // Only once it's actually hurting us: winging at every hazard in view burnt the stack (Bot1: 239 escapes)
-        // and the bots then died with "no Fly Wing" when a real ambush came.
-        if ((Ambushed(snap, out var hurt) || KillsMeFast(snap, hz.name, nearestD, hz.radius, out hurt)) && DateTime.UtcNow >= _nextEscapeItem && _data?.IsUsableItem(_config.FlyWingItemId) == true
-            && _bot.WithState(w => w.Self.Inventory.Any(it => it.ItemId == _config.FlyWingItemId && it.Count > 0)))
-        {
-            OnLog?.Invoke($"Using Fly Wing to escape '{hz.name}' ({hurt}; no sidestep: {noDodge}).");
-            _lastFleeAction = $"Fly Wing away from '{hz.name}'";
-            _lastFleeAt = DateTime.UtcNow;
-            _nextEscapeItem = DateTime.UtcNow.AddSeconds(3); // let the teleport land before judging again
-            await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
-            return true;
-        }
-
-        var self = snap.SelfPos;
-        var dx = Math.Sign(self.X - hz.pos.X);
-        var dy = Math.Sign(self.Y - hz.pos.Y);
-        if (dx == 0 && dy == 0) { dx = 1; dy = 1; }
-        var map = _data?.GetWalkMap(snap.Map);
-        var why = $"no sidestep: {noDodge}; {(Ambushed(snap, out _) || KillsMeFast(snap, hz.name, nearestD, hz.radius, out _) ? "no Fly Wing" : "not hurt yet, saving Fly Wings")}";
-        for (var step = 14; step >= 6; step -= 4)
-        {
-            var tx = self.X + dx * step;
-            var ty = self.Y + dy * step;
-            if (map == null)
+        // The move itself is HuntPolicy.ChooseFlee's (shared with the offline HuntSimulator): sidestep toward the walk goal
+        // (the last WalkPathTowardAsync target, fresh within 5 s), Fly Wing, walk away, around a portal, fight back, hold.
+        var goal = _walkGoal is { } g && g.map == snap.Map && DateTime.UtcNow - g.at <= TimeSpan.FromSeconds(5) ? (g.x, g.y) : ((int x, int y)?)null;
+        var flee = HuntPolicy.ChooseFlee(_data, snap.Map, _data?.GetWalkMap(snap.Map), snap.SelfPos, _hazards, bestIdx, nearestD, goal, HazardZones(),
+            MakePathCost(snap.Map), snap.Monsters,
+            hurt: () =>
             {
-                await _bot.WalkToAsync(Math.Max(1, tx), Math.Max(1, ty), ct);
-                return true;
-            }
-            // The one we flee only has to end up farther away: a cell 6-14 steps off can't be outside a radius-12 zone
-            // when it's 1-2 cells behind us, so checking it here too left only "holding position" while it hit us.
-            if (!map.TryFindWalkableNear(tx, ty, 5, out var fx, out var fy)
-                || CellNearHazard(fx, fy, skip: bestIdx)
-                || InOtherFixedReach(snap, fx, fy, 0) // fleeing a Thief Bug into a Flora's reach killed Bot5
-                || Dist(new Position(fx, fy), hz.pos) <= nearestD)
-                continue;
-
-            // A direct flee vector can point straight through a warp (e.g. mjolnir_02's Coal Mine
-            // entrance). Plan around portal footprints, then send only a short waypoint whose server-side
-            // walk cannot touch a portal. Otherwise the bot enters the neighboring map, resumes behavior,
-            // and immediately walks back into the same hazard and portal.
-            var path = map.FindPath(self.X, self.Y, fx, fy, 6000, MakePathCost(snap.Map));
-            if (path is not { Count: > 1 }) continue;
-            var safeStep = FurthestStraightLineSafeStep(snap.Map, self.X, self.Y, path, Math.Min(6, path.Count - 1));
-            if (safeStep < 1)
-            {
-                if (FindPortalFleeWaypoint(snap.Map, map, self, fx, fy, hz.pos) is { } aroundPortal)
+                var hurt = Ambushed(snap, out var why) || KillsMeFast(snap, hz.name, nearestD, hz.radius, out why);
+                return (hurt, why);
+            },
+            canFlyWing: () => DateTime.UtcNow >= _nextEscapeItem && _data?.IsUsableItem(_config.FlyWingItemId) == true
+                              && _bot.WithState(w => w.Self.Inventory.Any(it => it.ItemId == _config.FlyWingItemId && it.Count > 0)));
+        switch (flee.Kind)
+        {
+            case FleeKind.FlyWing:
+                OnLog?.Invoke(flee.Message);
+                _lastFleeAction = $"Fly Wing away from '{hz.name}'";
+                _lastFleeAt = DateTime.UtcNow;
+                _nextEscapeItem = DateTime.UtcNow.AddSeconds(3); // let the teleport land before judging again
+                await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
+                break;
+            case FleeKind.WalkBlind: // no walk map
+                await _bot.WalkToAsync(flee.X, flee.Y, ct);
+                break;
+            case FleeKind.FightBack:
+                LogFlee(flee.LogKind, flee.Message);
+                if (DateTime.UtcNow >= _nextFightBack || _fightBackId != flee.MonsterId)
                 {
-                    LogFlee("portal", $"Flee: stepping around a portal via ({aroundPortal.x},{aroundPortal.y}) to get away from '{hz.name}'.");
-                    await _bot.WalkToAsync(aroundPortal.x, aroundPortal.y, ct);
-                    return true;
+                    _fightBackId = flee.MonsterId;
+                    _nextFightBack = DateTime.UtcNow.AddSeconds(3); // re-assert like the hunt loop; flee clears _targetId every tick
+                    await _bot.AttackAsync(flee.MonsterId, ct);
                 }
-                continue;
-            }
-            while (safeStep > 1 && InOtherFixedReach(snap, path[safeStep].x, path[safeStep].y, 0)) safeStep--;
-            var waypoint = path[safeStep];
-            LogFlee("away", $"Flee: moving away from '{hz.name}' via ({waypoint.x},{waypoint.y}) toward ({fx},{fy}) ({why}).");
-            await _bot.WalkToAsync(waypoint.x, waypoint.y, ct);
-            return true;
+                break;
+            case FleeKind.Hold:
+                LogFlee(flee.LogKind, flee.Message);
+                break;
+            default: // Dodge, Away, AroundPortal, CorneredBlind: walk there
+                LogFlee(flee.LogKind, flee.Message);
+                await _bot.WalkToAsync(flee.X, flee.Y, ct);
+                break;
         }
-        if (map == null)
-        {
-            LogFlee("cornered", $"Flee: no safe cell away from '{hz.name}' — stepping blindly 6 cells off ({why}).");
-            await _bot.WalkToAsync(Math.Max(1, self.X + dx * 6), Math.Max(1, self.Y + dy * 6), ct);
-        }
-        else if (nearestD <= 2 && snap.Monsters.FirstOrDefault(m => m.Pos == hz.pos && m.Name == hz.name) is { } cornering)
-        {
-            // Standing still while it hits us always loses (Bot1 vs Argos on mjolnir_02: 10 hits, no swing back). A
-            // fight the forecast calls lost still deals damage and sometimes wins.
-            LogFlee("fightback", $"Flee: cornered by '{hz.name}' {nearestD} cell(s) away, no way out ({why}) — fighting back.");
-            if (DateTime.UtcNow >= _nextFightBack || _fightBackId != cornering.Id)
-            {
-                _fightBackId = cornering.Id;
-                _nextFightBack = DateTime.UtcNow.AddSeconds(3); // re-assert like the hunt loop; flee clears _targetId every tick
-                await _bot.AttackAsync(cornering.Id, ct);
-            }
-        }
-        else
-            LogFlee("cornered", $"Flee: no portal-safe path away from '{hz.name}' ({why}); holding position.");
         return true;
-    }
-
-    private (int x, int y)? FindPortalFleeWaypoint(string map, WalkMap walkMap, Position self,
-        int goalX, int goalY, Position threat)
-    {
-        if (_data == null || !WalkMayCrossPortal(map, self.X, self.Y, goalX, goalY, allowedPortalCell: null)) return null;
-        var best = (x: 0, y: 0);
-        var bestRemaining = int.MaxValue;
-        foreach (var portal in _data.World.PortalFootprintsOn(map))
-        {
-            var minX = Math.Min(self.X, goalX);
-            var maxX = Math.Max(self.X, goalX);
-            var minY = Math.Min(self.Y, goalY);
-            var maxY = Math.Max(self.Y, goalY);
-            if (portal.maxX < minX || portal.minX > maxX || portal.maxY < minY || portal.minY > maxY)
-                continue;
-
-            var candidates = new HashSet<(int x, int y)>();
-            for (var y = portal.minY - 1; y <= portal.maxY + 1; y++)
-            {
-                candidates.Add((portal.minX - 1, y));
-                candidates.Add((portal.maxX + 1, y));
-            }
-            for (var x = portal.minX - 1; x <= portal.maxX + 1; x++)
-            {
-                candidates.Add((x, portal.minY - 1));
-                candidates.Add((x, portal.maxY + 1));
-            }
-
-            foreach (var candidate in candidates)
-            {
-                if ((candidate.x == self.X && candidate.y == self.Y)
-                    || !walkMap.IsWalkable(candidate.x, candidate.y)
-                    || WalkMayCrossPortal(map, self.X, self.Y, candidate.x, candidate.y, allowedPortalCell: null)
-                    || _data.World.IsInPortalFootprint(map, candidate.x, candidate.y)
-                    || Dist(new Position(candidate.x, candidate.y), threat) < Dist(self, threat))
-                    continue;
-
-                var onward = walkMap.FindPath(candidate.x, candidate.y, goalX, goalY, 4000, MakePathCost(map));
-                if (onward is not { Count: > 1 }
-                    || onward.Any(p => _data.World.IsInPortalFootprint(map, p.x, p.y)))
-                    continue;
-                if (onward.Count >= bestRemaining) continue;
-                best = candidate;
-                bestRemaining = onward.Count;
-            }
-        }
-        return bestRemaining < int.MaxValue ? best : null;
     }
 
     // Flee decisions log once per change of action (not every tick); the last one is quoted in the death log.
