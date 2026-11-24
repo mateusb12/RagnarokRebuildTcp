@@ -60,6 +60,16 @@ public sealed class SkillLedger
 /// <param name="Killed">Every monster that died in the encounter (the target and anything area damage finished).</param>
 public sealed record EncounterResult(int Outcome, double Seconds, int DamageTaken, int Actions, int SkillActions, IReadOnlyList<int> Killed);
 
+/// <summary>Something that happened in the world, at <paramref name="At"/> on the virtual clock. <paramref name="Text"/> is
+/// its trace line (null: not traced, a replay-only fact such as a hit or a regen tick while walking).</summary>
+/// <param name="Kind">hit, regen, knockback, executed, rejected, queued, no-effect, castbar, reach, abandon, area-start, area-end, area-status, world, failed.</param>
+/// <param name="Entity">The server entity it concerns (a monster, the player, a ground effect); 0 when none.</param>
+/// <param name="Amount">hit: damage landed; regen: HP gained; executed: SP spent; reach: cells to walk.</param>
+/// <param name="Amount2">regen: SP gained; hit: damage results that landed (a 0-damage one is a miss).</param>
+/// <param name="HpLeft">hit: the entity's HP after it.</param>
+public sealed record WorldEvent(double At, string Kind, string? Text, int Entity = 0, CharacterSkill Skill = CharacterSkill.None,
+    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1);
+
 /// <summary>The player's choice when it may act: an auto-attack, a skill packet (the bytes the live bot sends), or
 /// nothing yet (a pure caster with no rule ready re-decides a moment later).</summary>
 public readonly record struct PlayerChoice(CharacterSkill Skill, byte[]? Packet, int Length, bool Wait)
@@ -127,7 +137,7 @@ public sealed class ServerWorld
     private readonly Instance _instance;
     private double _nextFrame = double.PositiveInfinity;
     // Live server event entities -> the skill whose execution created them (children inherit the parent's skill).
-    private readonly Dictionary<Entity, (CharacterSkill Skill, double Born, string Kind)> _events = new();
+    private readonly Dictionary<Entity, (CharacterSkill Skill, double Born, string Kind, int Id)> _events = new();
 
     private readonly Map _map;
     private readonly Player _player;
@@ -153,8 +163,13 @@ public sealed class ServerWorld
     /// <summary>The player's current attack delay: what the live server sends the bot, buffs included.</summary>
     public double AttackDelay => _player.GetTiming(TimingStat.AttackDelayTime);
 
-    /// <summary>Events worth a trace line (casts, rejections, statuses gained), as they happen.</summary>
-    public Action<string>? OnEvent;
+    /// <summary>What happens in the world as it happens: events worth a trace line (casts, rejections, statuses gained)
+    /// carry their Text; hits and regen ticks are also reported, for a replay, with no text.</summary>
+    public Action<WorldEvent>? OnEvent;
+
+    private void Emit(string kind, string? text, int entity = 0, CharacterSkill skill = CharacterSkill.None, int amount = 0, int amount2 = 0,
+        int hpLeft = -1, int x = -1, int y = -1) =>
+        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y));
 
     static ServerWorld()
     {
@@ -454,7 +469,7 @@ public sealed class ServerWorld
                     if (choice.Packet != null && Ledger(choice.Skill).Blocked == null)
                     {
                         Ledger(choice.Skill).Requested++;
-                        var effect = Observe(choice.Skill, enemy, () => Receive(choice.Packet, choice.Length));
+                        var effect = Observe(choice.Skill, enemy, () => Receive(choice.Packet, choice.Length), packet: true);
                         if (effect is Effect.CastBar or Effect.Queued) pending = choice.Skill;
                         if (effect is Effect.CastBar or Effect.Executed)
                         {
@@ -469,14 +484,14 @@ public sealed class ServerWorld
                     var steps2 = StepsIntoRange(target.Character.Position, range);
                     if (steps2 == 0 && DistanceCache.IntDistance(_player.Character.Position, target.Character.Position) > range)
                     {
-                        OnEvent?.Invoke($"target out of reach and the straight line is blocked: fight abandoned (pathing back is not simulated)");
+                        Emit("abandon", $"target out of reach and the straight line is blocked: fight abandoned (pathing back is not simulated)");
                         outcome = 2;
                         break;
                     }
                     if (steps2 > 0)
                     {
                         // ponytail: straight-line approach at MoveSpeed per cell; the live server paths the walk (TargetForAttack)
-                        OnEvent?.Invoke($"target out of reach ({DistanceCache.IntDistance(_player.Character.Position, target.Character.Position)} > {range}): walking {steps2} cells");
+                        Emit("reach", $"target out of reach ({DistanceCache.IntDistance(_player.Character.Position, target.Character.Position)} > {range}): walking {steps2} cells", amount: steps2);
                         holdUntil = t + steps2 * _player.Character.MoveSpeed;
                         continue;
                     }
@@ -525,7 +540,8 @@ public sealed class ServerWorld
     }
 
     /// <summary>Runs server code that may execute <paramref name="skill"/> and books what it observably did.</summary>
-    private Effect Observe(CharacterSkill skill, CombatEntity? target, Action serverCall)
+    /// <param name="packet">The call is the bot's skill packet arriving (not a server update): a queued or unanswered packet is reported.</param>
+    private Effect Observe(CharacterSkill skill, CombatEntity? target, Action serverCall, bool packet = false)
     {
         var self = _player.CombatEntity;
         var (sp, hp, cooldown, casting) = (Sp, Hp, _player.Character.AttackCooldown, self.IsCasting);
@@ -559,7 +575,7 @@ public sealed class ServerWorld
         foreach (var error in errors)
         {
             book.Rejected[error.ToString()] = book.Rejected.GetValueOrDefault(error.ToString()) + 1;
-            OnEvent?.Invoke($"{skill}: server rejected it ({error})");
+            Emit("rejected", $"{skill}: server rejected it ({error})", skill: skill);
         }
 
         var spent = sp - Sp;
@@ -572,22 +588,27 @@ public sealed class ServerWorld
         {
             book.CastBars++;
             book.CastSeconds += self.CastingTime - Time.ElapsedTimeFloat;
-            OnEvent?.Invoke($"{skill}: cast bar {self.CastingTime - Time.ElapsedTimeFloat:F2}s");
+            Emit("castbar", $"{skill}: cast bar {self.CastingTime - Time.ElapsedTimeFloat:F2}s", skill: skill);
             return Effect.CastBar;
         }
         if (_player.Character.QueuedAction == QueuedAction.Cast && errors.Count == 0 && spent == 0)
         {
             book.Queued++;
+            if (packet) Emit("queued", null, PlayerId, skill); // replay only: the trace stays as it was
             return Effect.Queued;
         }
         var acted = spent > 0 || healed > 0 || gained.Count > 0 || _player.Character.AttackCooldown != cooldown || (casting && !self.IsCasting && errors.Count == 0);
-        if (!acted) return errors.Count > 0 ? Effect.Rejected : Effect.None;
+        if (!acted)
+        {
+            if (packet && errors.Count == 0) Emit("no-effect", null, PlayerId, skill);
+            return errors.Count > 0 ? Effect.Rejected : Effect.None;
+        }
         book.Executed++;
         book.SpSpent += Math.Max(0, spent);
         book.Healed += healed;
         foreach (var g in gained) book.StatusesApplied[g] = book.StatusesApplied.GetValueOrDefault(g) + 1;
-        OnEvent?.Invoke($"{skill}: executed" + (spent > 0 ? $", SP -{spent}" : "") + (healed > 0 ? $", HP +{healed}" : "")
-                        + (gained.Count > 0 ? ", " + string.Join(", ", gained) : "") + (IsGenericHandler(skill) ? " (no server handler: generic cast)" : ""));
+        Emit("executed", $"{skill}: executed" + (spent > 0 ? $", SP -{spent}" : "") + (healed > 0 ? $", HP +{healed}" : "")
+                        + (gained.Count > 0 ? ", " + string.Join(", ", gained) : "") + (IsGenericHandler(skill) ? " (no server handler: generic cast)" : ""), skill: skill, amount: spent);
         return Effect.Executed;
     }
 
@@ -597,6 +618,10 @@ public sealed class ServerWorld
 
     /// <summary>The server's handler declares the skill passive (applied through the stat pipeline, never cast).</summary>
     public static bool IsPassive(CharacterSkill skill) => SkillHandler.GetSkillAttributes(skill).SkillTarget == SkillTarget.Passive;
+
+    /// <summary>The target type the server's handler declares (Self, Enemy, Ground, Ally, Any, Passive): PacketSkill drops a
+    /// packet of another type without an error.</summary>
+    public static string DeclaredTarget(CharacterSkill skill) => SkillHandler.GetSkillAttributes(skill).SkillTarget.ToString();
 
     /// <summary>The exception and the server frames it went through, innermost first: the operation that failed, then
     /// who called it (the event behaviour, the skill handler...).</summary>
@@ -619,9 +644,11 @@ public sealed class ServerWorld
         var left = hp;
         var total = 0;
         var pusher = CharacterSkill.None;
+        var results = 0;
         foreach (var d in combat.DamageQueue)
         {
             if (d.Time > Time.ElapsedTimeFloat || !d.IsDamageResult) continue;
+            results++;
             var damage = d.Damage * Math.Max(1, (int)d.HitCount) + Math.Max(0, (int)d.DamageOffHand);
             total += damage;
             left -= damage;
@@ -661,10 +688,12 @@ public sealed class ServerWorld
             if (from != to)
             {
                 if (pusher != CharacterSkill.None) Ledger(pusher).Knockbacks++;
-                OnEvent?.Invoke($"{(pusher != CharacterSkill.None ? pusher : "hit")}: {monster.Character.Name} knocked back {from} -> {to}");
+                Emit("knockback", $"{(pusher != CharacterSkill.None ? pusher : "hit")}: {monster.Character.Name} knocked back {from} -> {to}", monster.Character.Id, pusher, x: to.X, y: to.Y);
             }
         }
         if (total > 0) DuelSimulator.MonsterLastDamageField.SetValue(monster, Time.ElapsedTimeFloat);
+        if (results > 0) Emit("hit", null, monster.Character.Id, pusher, total, results, Math.Max(0, combat.GetStat(CharacterStat.Hp)),
+            monster.Character.Position.X, monster.Character.Position.Y);
         return total;
     }
 
@@ -767,14 +796,14 @@ public sealed class ServerWorld
         {
             if (entity.IsAlive() && entity.Get<WorldObject>().IsActive) continue;
             _events.Remove(entity);
-            OnEvent?.Invoke($"{ev.Skill}: world event {ev.Kind} ended after {Clock - ev.Born:F2}s");
+            Emit("area-end", $"{ev.Skill}: world event {ev.Kind} ended after {Clock - ev.Born:F2}s", ev.Id, ev.Skill);
             if (ev.Skill == CharacterSkill.None) continue;
             var book = Ledger(ev.Skill);
             book.EventsEnded++;
             book.EventSeconds += Clock - ev.Born;
         }
         if (!WorldActive()) // the server drops removed entities a frame late (Instance.DoRemovals), so this is the frame after the last one ended
-            OnEvent?.Invoke($"world: all events ended and removed; instance entity list {_instance.Entities.Count}, map chunks holding an area of effect "
+            Emit("world", $"world: all events ended and removed; instance entity list {_instance.Entities.Count}, map chunks holding an area of effect "
                             + ((int[])ActiveAoEChunksField.GetValue(_map)!).Count(c => c > 0));
         // Statuses the events put on the player (a protective ground effect, say) are booked to their skill.
         var gained = StatusSet(self).Except(selfBefore).ToList();
@@ -783,7 +812,7 @@ public sealed class ServerWorld
             var skill = SoleEventSkill();
             if (skill != CharacterSkill.None)
                 foreach (var s in gained) Ledger(skill).StatusesApplied[$"area+{s}"] = Ledger(skill).StatusesApplied.GetValueOrDefault($"area+{s}") + 1;
-            OnEvent?.Invoke($"{skill}: world event put {string.Join(", ", gained)} on the player");
+            Emit("area-status", $"{skill}: world event put {string.Join(", ", gained)} on the player", PlayerId, skill);
         }
         ScheduleFrame();
     }
@@ -804,7 +833,7 @@ public sealed class ServerWorld
             var ch = entity.Get<WorldObject>();
             if (!ch.IsActive) continue;
             var kind = ch.Type is CharacterType.NPC or CharacterType.BattleNpc ? ch.Npc.Behavior?.GetType().Name ?? ch.Name : ch.Type.ToString();
-            _events[entity] = (skill, Clock, kind);
+            _events[entity] = (skill, Clock, kind, ch.Id);
             if (skill != CharacterSkill.None)
             {
                 var book = Ledger(skill);
@@ -812,7 +841,7 @@ public sealed class ServerWorld
                 book.EventKinds[kind] = book.EventKinds.GetValueOrDefault(kind) + 1;
             }
             var aoe = ch.Type is CharacterType.NPC or CharacterType.BattleNpc && ch.Npc.AreaOfEffect != null ? $", area {ch.Npc.AreaOfEffect.Area}" : "";
-            OnEvent?.Invoke($"{skill}: world event {kind} created at {ch.Position}{aoe}");
+            Emit("area-start", $"{skill}: world event {kind} created at {ch.Position}{aoe}", ch.Id, skill, x: ch.Position.X, y: ch.Position.Y);
         }
         if (double.IsPositiveInfinity(_nextFrame) && WorldActive()) _nextFrame = Clock + FrameSeconds;
     }
@@ -865,7 +894,7 @@ public sealed class ServerWorld
         var record = $"{(skill != CharacterSkill.None ? skill.ToString() : "(unattributed)")} at {Clock:F2}s during {stage}: {diagnostic}"
                      + (undone.Count > 0 ? $" [undone: {string.Join(", ", undone)}]" : "");
         Failures.Add(record);
-        OnEvent?.Invoke("FAILED " + record);
+        Emit("failed", "FAILED " + record, skill: skill);
         var book = Ledger(skill);
         book.Failures++;
         book.RolledBack.AddRange(undone);
@@ -882,13 +911,14 @@ public sealed class ServerWorld
     /// unless it is lethal, as Player.Die is not run. Returns -1 when the player died.</summary>
     private int LandOnPlayer(CombatEntity self)
     {
-        var due = 0;
+        int due = 0, results = 0;
         foreach (var d in self.DamageQueue)
-            if (d.Time <= Time.ElapsedTimeFloat && d.IsDamageResult) due += d.Damage * Math.Max(1, (int)d.HitCount);
+            if (d.Time <= Time.ElapsedTimeFloat && d.IsDamageResult) { due += d.Damage * Math.Max(1, (int)d.HitCount); results++; }
         if (due >= Hp)
         {
             self.SetStat(CharacterStat.Hp, 0);
             self.DamageQueue.Clear();
+            Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: 0);
             return -1;
         }
         Time.ElapsedTimeFloat += (float)Epsilon; // UpdateDamageQueue applies what is strictly due
@@ -904,6 +934,7 @@ public sealed class ServerWorld
             Fail(CharacterSkill.None, "damage landing on the player (UpdateDamageQueue)", e, new List<string> { $"player HP set to {hp - due} without the failed step" });
         }
         finally { Time.ElapsedTimeFloat = (float)Clock; }
+        if (results > 0) Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: Hp);
         return due;
     }
 
@@ -960,7 +991,8 @@ public sealed class ServerWorld
             finally { ch.State = state; }
             RegenHp += Math.Max(0, Hp - hp);
             RegenSp += Math.Max(0, Sp - sp);
-            if (Sitting && (Hp > hp || Sp > sp)) OnEvent?.Invoke($"regen tick (sitting): +{Hp - hp} HP, +{Sp - sp} SP -> HP {Hp}/{MaxHp} SP {Sp}/{MaxSp}");
+            if (Hp > hp || Sp > sp)
+                Emit("regen", Sitting ? $"regen tick (sitting): +{Hp - hp} HP, +{Sp - sp} SP -> HP {Hp}/{MaxHp} SP {Sp}/{MaxSp}" : null, PlayerId, amount: Hp - hp, amount2: Sp - sp);
         }
         SetTime(seconds);
     }

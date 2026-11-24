@@ -31,13 +31,14 @@ if (mode is "validate" or "benchmark")
     return;
 }
 
-//   huntsim <map> <build> <minutes> <seed> [--script "rule; rule"] [--configs bot-configs.json] [--trace file] [--check]
+//   huntsim <map> <build> <minutes> <seed> [--script "rule; rule"] [--configs bot-configs.json] [--trace file] [--replay file.json] [--check]
+//     --replay writes the run as a HuntReplay (JSON) for the dashboard's Simulation tab.
 //     build: a PlayerBuild JSON file, or a bot name ("Bot3", or "Bot3@mjolnir_06" for its build when it hunted there)
 //            whose latest recorded duel build is used; a bot name also brings its saved BotBehaviorConfig (skill script,
 //            rest, win and hunt rules) from bot-configs.json. --script replaces the script (rules separated by ';').
 if (mode == "huntsim")
 {
-    if (args.Length < 5) { Console.WriteLine("usage: huntsim <map> <build.json | bot[@map]> <minutes> <seed> [--script \"rule; rule\"] [--trace file] [--check]"); return; }
+    if (args.Length < 5) { Console.WriteLine("usage: huntsim <map> <build.json | bot[@map]> <minutes> <seed> [--script \"rule; rule\"] [--configs file] [--trace file] [--replay file.json] [--check]"); return; }
     var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
                           ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
     ServerCombatRuntime.EnsureInitialized(serverDirectory);
@@ -87,6 +88,13 @@ if (mode == "huntsim")
     Console.WriteLine(sim.Report());
     var traceAt = Array.IndexOf(args, "--trace");
     if (traceAt > 0 && traceAt + 1 < args.Length) { File.WriteAllLines(args[traceAt + 1], sim.Trace); Console.WriteLine($"Trace: {sim.Trace.Count} events -> {args[traceAt + 1]}"); }
+    var replayAt = Array.IndexOf(args, "--replay");
+    if (replayAt > 0 && replayAt + 1 < args.Length)
+    {
+        var replay = sim.Replay(buildSource);
+        File.WriteAllText(args[replayAt + 1], System.Text.Json.JsonSerializer.Serialize(replay, HuntReplay.Json));
+        Console.WriteLine($"Replay: {replay.Events.Count} events, {replay.Track.Count} steps -> {args[replayAt + 1]}");
+    }
     if (args.Contains("--check"))
     {
         Console.WriteLine("\n== Verification ==");

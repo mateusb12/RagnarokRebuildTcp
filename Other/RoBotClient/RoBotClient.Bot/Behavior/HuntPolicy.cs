@@ -32,10 +32,16 @@ public static class HuntPolicy
     /// <summary>The old CanWin rule on a server prediction: expected HP lost within WinMargin of HP plus the potion
     /// buffer, attacks within MaxRoundsToKill, and without potions simulated deaths and timeouts capped too.</summary>
     public static bool ServerCanWin(DuelPrediction p, int hp, double potionBuffer, double winMargin, int maxRoundsToKill) =>
-        p.WinRate > 0 && hp > 0
-        && (p.Attacks.Mean <= maxRoundsToKill || p.DamageTaken.Mean <= 0)
-        && p.DamageTaken.Mean <= winMargin * (hp + potionBuffer)
-        && (potionBuffer > 0 || p.DeathRate + p.TimeoutRate <= MaxServerLossRate);
+        ServerWinVeto(p, hp, potionBuffer, winMargin, maxRoundsToKill) == null;
+
+    /// <summary>The win rule's first failing condition, in words (null: winnable). ServerCanWin is this returning null.</summary>
+    public static string? ServerWinVeto(DuelPrediction p, int hp, double potionBuffer, double winMargin, int maxRoundsToKill) =>
+        !(p.WinRate > 0) ? "never wins in the forecast duels"
+        : !(hp > 0) ? "no HP left"
+        : !(p.Attacks.Mean <= maxRoundsToKill || p.DamageTaken.Mean <= 0) ? $"needs {p.Attacks.Mean:F0} attacks, over MaxRoundsToKill {maxRoundsToKill}"
+        : !(p.DamageTaken.Mean <= winMargin * (hp + potionBuffer)) ? $"expected damage taken {p.DamageTaken.Mean:F0} is over WinMargin {winMargin} x HP {hp + potionBuffer:F0} = {winMargin * (hp + potionBuffer):F0}"
+        : !(potionBuffer > 0 || p.DeathRate + p.TimeoutRate <= MaxServerLossRate) ? $"loses or times out {p.DeathRate + p.TimeoutRate:P1} of duels, over {MaxServerLossRate:P1}"
+        : null;
 
     // ---- rest: BotBehavior.TickRestAsync and the offline HuntSimulator sit and stand by these ----
 
@@ -75,9 +81,11 @@ public static class HuntPolicy
     /// hunt filters, the environment's own exclusions, the portal buffer, the forecast win rule (ForceHuntClassIds
     /// overrides it), no-safe-cell and group-pull vetoes; then the best score (solo: exp/s incl. walk and rest; party:
     /// nearest, grey monsters last) that the environment can reach. Observations, forecasts and paths come from
-    /// &lt;paramref name="world"/&gt;, so neither a session nor a clock is needed here.</summary>
+    /// &lt;paramref name="world"/&gt;, so neither a session nor a clock is needed here. &lt;paramref name="ranking"/&gt;, when
+    /// given, receives every scored candidate (lower score first is better; Ok false: kept only for the shadow pick),
+    /// for an observer to explain the choice; it changes nothing.</summary>
     public static TargetPick<T, TF> PickTarget<T, TF>(IReadOnlyList<T> visible, ITargetWorld<T, TF> world, BotBehaviorConfig cfg,
-        GameDatabase? data, string map, bool wantShadow = false) where T : class
+        GameDatabase? data, string map, bool wantShadow = false, List<(T M, double Score, bool Ok)>? ranking = null) where T : class
     {
         var candidates = new List<(double Score, T M, TargetForecast<TF> F, bool Ok, double ShadowScore, bool ShadowOk)>();
         foreach (var m in visible)
@@ -110,6 +118,7 @@ public static class HuntPolicy
         // Stable: equal scores keep the order the monsters were seen in.
         var reachable = new Dictionary<T, bool>(ReferenceEqualityComparer.Instance);
         bool Reachable(T m) => reachable.TryGetValue(m, out var r) ? r : reachable[m] = world.Reachable(m);
+        ranking?.AddRange(candidates.OrderBy(c => c.Score).Select(c => (c.M, c.Score, c.Ok)));
         var shadowPick = wantShadow ? candidates.Where(c => c.ShadowOk).OrderBy(c => c.ShadowScore).FirstOrDefault(c => Reachable(c.M)).M : null;
         foreach (var c in candidates.OrderBy(c => c.Score))
         {

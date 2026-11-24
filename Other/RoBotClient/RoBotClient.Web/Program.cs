@@ -60,6 +60,9 @@ builder.Services.AddSingleton(new BotMemoryStore(string.IsNullOrEmpty(repoRoBot)
 
 builder.Services.AddSingleton<BotManager>();
 
+// Simulation tab: offline hunts run as the Host CLI's huntsim in a child process, replays saved under sim-replays/.
+builder.Services.AddSingleton(new RoBotClient.Web.Features.Simulation.SimRunner(string.IsNullOrEmpty(repoRoBot) ? AppContext.BaseDirectory : repoRoBot));
+
 // Auto-formed dynamic squads: every ~8s, scan each bot's visible-players list and cluster bots that can
 // see each other into squads, electing leaders by SquadRanking. Manual squads (SquadId not starting with
 // `auto-`) are immune. Enable/disable from MCP via set_auto_squad.
@@ -120,6 +123,10 @@ app.MapGet("/player-atlas/{dir}/{name}.png", (string dir, string name) =>
 // Monster sprite actions (parsed once per species from the Unity .asset) for the minimap's animated sprites.
 app.MapGet("/monster-anim/{name}", (string name, MonsterSprites sprites) =>
     sprites.GetAnim(name) is { } anim ? Results.Json(anim) : Results.NotFound());
+
+// Simulation tab: a saved offline replay, for the page's replay viewer (sim.js).
+app.MapGet("/sim-replay/{name}", (string name, RoBotClient.Web.Features.Simulation.SimRunner runner) =>
+    runner.PathOf(name) is { } path ? Results.File(path, "application/json") : Results.NotFound());
 
 // Watch tab: a Unity client logs into this dashboard to see a bot's PoV (Features/Watch). Before bots respawn below.
 app.MapWatch();

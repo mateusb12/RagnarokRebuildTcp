@@ -115,6 +115,13 @@ public sealed class HuntSimulator
     public string? RespawnExample;                  // the longest respawn seen
     public string? ObstacleExample;                 // the walk with the longest detour around blocked cells
 
+    // Replay (HuntReplay): what a viewer needs to watch the run, recorded as it happens; nothing is recomputed later.
+    private readonly List<ReplayEvent> _events = new();
+    private readonly List<ReplayStep> _track = new();
+    private readonly List<ReplayVitals> _vitals = new();
+    private Mob? _fightTarget;                      // who swings at the player right now (only the target fights back)
+    private object? _pickDetail;                    // the last target decision's candidates, for its event
+
     public HuntSimulator(HuntSimOptions options, GameDatabase data)
     {
         _o = options;
@@ -134,7 +141,47 @@ public sealed class HuntSimulator
 
     private string Name(Mob m) => m.Db.Name;
     private static int Dist(int x0, int y0, int x1, int y1) => Math.Max(Math.Abs(x0 - x1), Math.Abs(y0 - y1));
-    private void Log(string s) => Trace.Add($"[{Math.Max(_t, _world?.Clock ?? 0),8:F2}s] ({_x},{_y}) {s}");
+    /// <summary>A trace line, and the same line as a replay event of &lt;paramref name="kind"/&gt; with what the decision saw.</summary>
+    private void Log(string s, string kind = "note", int mob = 0, object? detail = null, int x = -1, int y = -1)
+    {
+        var t = Math.Max(_t, _world?.Clock ?? 0);
+        Trace.Add($"[{t,8:F2}s] ({_x},{_y}) {s}");
+        _events.Add(new ReplayEvent(t, kind, s, mob, x, y, Detail: detail));
+    }
+
+    /// <summary>A replay event only (no trace line, so the trace and its fingerprint stay as they were).</summary>
+    private void Note(string kind, string text, int mob = 0, object? detail = null, int x = -1, int y = -1) =>
+        _events.Add(new ReplayEvent(Math.Max(_t, _world?.Clock ?? 0), kind, text, mob, x, y, Detail: detail));
+
+    /// <summary>The server world's events: traced ones as before, and every one (hits, regen ticks, ground effects) for
+    /// the replay at its own server time, with the player's HP/SP right after it.</summary>
+    private void OnWorld(WorldEvent e)
+    {
+        if (e.Text != null) Trace.Add($"[{Math.Max(_t, _world.Clock),8:F2}s] ({_x},{_y}) {e.Text}");
+        var mob = _byServerId.TryGetValue(e.Entity, out var m) ? m : null;
+        var onPlayer = e.Entity == _world.PlayerId;
+        var kind = e.Kind == "hit" && onPlayer ? "hurt" : e.Kind;
+        var skill = e.Skill != CharacterSkill.None ? e.Skill.ToString() : null;
+        var text = e.Text ?? kind switch
+        {
+            "hurt" => (_fightTarget != null ? $"{Name(_fightTarget)} #{_fightTarget.Id}" : "no monster swings outside a fight: a ground effect")
+                      + (e.Amount == 0 ? " missed the player" : $" hit the player for {e.Amount} -> HP {e.HpLeft}/{_world.MaxHp}"),
+            "hit" => $"{skill ?? "auto-attack"} on {(mob != null ? $"{Name(mob)} #{mob.Id}" : $"entity {e.Entity}")}: "
+                     + (e.Amount == 0 ? "miss" : $"{e.Amount} damage") + $" -> HP {e.HpLeft}",
+            "regen" => $"regen tick ({(_world.Sitting ? "sitting" : "standing")}): +{e.Amount} HP, +{e.Amount2} SP",
+            "queued" => $"{skill}: the server queued it behind the after-cast delay",
+            "no-effect" => $"{skill}: the server took the packet without an error, but nothing observable happened (no SP spent, no cast bar, no status, no attack, no damage)",
+            _ => e.Kind,
+        };
+        _events.Add(new ReplayEvent(e.At, kind, text, kind == "hurt" ? _fightTarget?.Id ?? 0 : mob?.Id ?? 0, e.X, e.Y, e.Amount, e.HpLeft, skill,
+            kind.StartsWith("area") ? new { entity = e.Entity } : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) } : null));
+        Vitals(e.At);
+    }
+
+    private void Vitals(double t)
+    {
+        if (_vitals.Count == 0 || _vitals[^1].Hp != _world.Hp || _vitals[^1].Sp != _world.Sp) _vitals.Add(new ReplayVitals(t, _world.Hp, _world.Sp));
+    }
     private void Example(string kind, string text) { if (_exampleKinds.Add(kind)) Examples.Add($"{kind}: {text}"); }
     private TypeStats Stats(Mob m) => Types.TryGetValue(m.Db.Name, out var s) ? s : Types[m.Db.Name] = new TypeStats();
 
@@ -191,6 +238,7 @@ public sealed class HuntSimulator
     {
         (m.X, m.Y, m.Alive) = (x, y, true);
         m.Life++;
+        Note("spawn", $"{Name(m)} #{m.Id} {(m.Life == 1 ? "spawned" : "respawned")} at ({x},{y})", m.Id, x: x, y: y);
         if (!DuelSimulator.IsKnownMonster(m.Db.Id)) return;
         m.ServerId = _world.AddMonster(m.Db.Id, x, y); // a fresh server entity per life: full HP, no statuses
         _byServerId[m.ServerId] = m;
@@ -246,7 +294,10 @@ public sealed class HuntSimulator
     {
         PickDecisions++;
         var world = new SimTargets(this);
-        if (HuntPolicy.PickTarget(visible, world, _cfg, _data, _o.Map).Target is not { } m)
+        var ranking = new List<(Mob M, double Score, bool Ok)>();
+        var chosen = HuntPolicy.PickTarget(visible, world, _cfg, _data, _o.Map, ranking: ranking).Target;
+        _pickDetail = PickDetail(visible, world, ranking, chosen);
+        if (chosen is not { } m)
         {
             _restToWin = world.WinnableRested > 0; // as live PickTarget
             return null;
@@ -266,12 +317,42 @@ public sealed class HuntSimulator
         return (m, path.Take(stop + 1).ToList());
     }
 
+    /// <summary>What one target decision saw, per visible monster: where it was, its forecast, its score (the exp/s with
+    /// walk and rest that HuntPolicy.PickTarget ranked by, handed back through its ranking) and the verdict the shared rules
+    /// gave it. Read from the decision itself; nothing is re-decided.</summary>
+    private object PickDetail(List<Mob> visible, SimTargets world, List<(Mob M, double Score, bool Ok)> ranking, Mob? chosen)
+    {
+        var rank = new Dictionary<Mob, (double Score, int Rank)>();
+        for (var i = 0; i < ranking.Count; i++) rank[ranking[i].M] = (ranking[i].Score, i + 1);
+        var rows = visible.Select(m =>
+        {
+            var f = ForecastOf(m);
+            var why = world.Rejects.Where(r => r.M == m).Select(r => r.Why).ToList();
+            var ranked = rank.TryGetValue(m, out var r);
+            return new
+            {
+                mob = m.Id, name = Name(m), x = m.X, y = m.Y, distance = Dist(_x, _y, m.X, m.Y), exp = m.Db.Exp,
+                forecastKnown = f.Known, winRate = f.WinRate, killSeconds = f.Seconds, damageTaken = f.DamageTaken,
+                restSeconds = f.Known ? HuntPolicy.RestSeconds(_world.MaxHp, _o.Build.Vit, f.DamageTaken) : 0,
+                expPerSecond = ranked ? -r.Score : (double?)null, // solo: the score is -exp/s
+                rank = ranked ? r.Rank : (int?)null,
+                forced = _cfg.ForceHuntClassIds.Contains(m.Db.Id),
+                verdict = m == chosen ? (_cfg.ForceHuntClassIds.Contains(m.Db.Id) ? "chosen (in ForceHuntClassIds: the win rule is skipped for it)" : "chosen")
+                    : why.Count > 0 ? string.Join("; ", why)
+                    : ranked ? "ranked below the chosen target" : "not scored",
+            };
+        }).OrderBy(c => c.rank ?? int.MaxValue).ToList();
+        return new { hp = _world.Hp, maxHp = _world.MaxHp, winMargin = _cfg.WinMargin, maxRoundsToKill = _cfg.MaxRoundsToKill,
+            restToWin = chosen == null && world.WinnableRested > 0, candidates = rows };
+    }
+
     /// <summary>What HuntPolicy.PickTarget reads here: the virtual world's monsters, the server-code duel forecast judged
     /// at the player's current HP (as live; no potion buffer: no inventory here; no shadow engine), plain A* to the monster's cell. Nothing is excluded beyond the shared rules: no deaths-avoid list,
     /// hazards, fixed-monster sniping or group pulls (monsters stand still and don't assist).</summary>
     private sealed class SimTargets(HuntSimulator s) : ITargetWorld<Mob, Forecast>
     {
         public readonly Dictionary<Mob, List<(int x, int y)>> Paths = new();
+        public readonly List<(Mob M, string Why)> Rejects = new(); // this decision's verdicts, for its replay event
         public int WinnableRested;                  // too strong now, winnable at full HP: the live rest-to-win count
 
         public TargetSelf Self => new(true, 0, s._sheet!.MaxHp, s._o.Build.Vit, SecondsPerCell); // _sheet: set by the first forecast
@@ -310,7 +391,7 @@ public sealed class HuntSimulator
             var f = why == TargetReject.Unknown || why == TargetReject.TooStrong ? s.ForecastOf(m) : null;
             var restable = why == TargetReject.TooStrong && f!.CanWin; // ServerCanWin at full HP, as live re-forecasts at SelfMaxHp
             if (restable) WinnableRested++;
-            s.Reject(m, why switch
+            var label = why switch
             {
                 TargetReject.NotHuntable => "not huntable",
                 TargetReject.NearPortal => "near a portal",
@@ -318,7 +399,10 @@ public sealed class HuntSimulator
                 TargetReject.TooStrong => restable ? "too strong at current HP" : "too strong",
                 TargetReject.Unreachable => "unreachable or long detour",
                 _ => why.ToString(),
-            });
+            };
+            var veto = why == TargetReject.TooStrong ? HuntPolicy.ServerWinVeto(f!.P!, s._world.Hp, 0, s._cfg.WinMargin, s._cfg.MaxRoundsToKill) : null;
+            Rejects.Add((m, veto != null ? $"{label}: {veto}" + (restable ? " (winnable at full HP: rest to win)" : "") : label));
+            s.Reject(m, label);
             if (why == TargetReject.TooStrong && !restable) s.Example("too strong", $"{s.Name(m)}: {f!.Why}");
         }
     }
@@ -329,16 +413,20 @@ public sealed class HuntSimulator
         Stats(m).Rejected[why] = Stats(m).Rejected.GetValueOrDefault(why) + 1;
     }
 
-    /// <summary>A far random reachable cell, as WanderAsync picks one (no camp zone, no hazards: neither exists here).</summary>
-    private (int X, int Y)? WanderDestination()
+    /// <summary>A far random reachable cell, as WanderAsync picks one (no camp zone, no hazards: neither exists here).
+    /// &lt;paramref name="attempts"/&gt; receives each random draw and why it was refused, for the replay.</summary>
+    private (int X, int Y)? WanderDestination(List<string> attempts)
     {
         for (var attempt = 0; attempt < 6; attempt++)
         {
             int tx = _rng.Next(1, _walk.Width - 1), ty = _rng.Next(1, _walk.Height - 1);
-            if (Dist(_x, _y, tx, ty) < Math.Min(_walk.Width, _walk.Height) / 3 && attempt < 5) continue;
-            if (!_walk.TryFindWalkableNear(tx, ty, 8, out var fx, out var fy) || (fx == _x && fy == _y)) continue;
-            if (_data.World.IsInPortalFootprint(_o.Map, fx, fy, margin: 3)) continue;
-            if (_walk.FindPath(_x, _y, fx, fy) == null) continue;
+            if (Dist(_x, _y, tx, ty) < Math.Min(_walk.Width, _walk.Height) / 3 && attempt < 5)
+            { attempts.Add($"({tx},{ty}): closer than a third of the map ({Dist(_x, _y, tx, ty)} < {Math.Min(_walk.Width, _walk.Height) / 3})"); continue; }
+            if (!_walk.TryFindWalkableNear(tx, ty, 8, out var fx, out var fy) || (fx == _x && fy == _y))
+            { attempts.Add($"({tx},{ty}): no walkable cell within 8"); continue; }
+            if (_data.World.IsInPortalFootprint(_o.Map, fx, fy, margin: 3)) { attempts.Add($"({fx},{fy}): next to a portal"); continue; }
+            if (_walk.FindPath(_x, _y, fx, fy) == null) { attempts.Add($"({fx},{fy}): no path"); continue; }
+            attempts.Add($"({tx},{ty}) -> walkable ({fx},{fy}): accepted");
             return (fx, fy);
         }
         return null;
@@ -352,6 +440,8 @@ public sealed class HuntSimulator
             && Crop(path) is var crop && !crop.Contains("too long"))
             (_bestDetour, ObstacleExample) = (detour, $"from ({path[0].x},{path[0].y}) to ({path[^1].x},{path[^1].y}) the straight line crosses blocked cells; "
                 + $"A* walks {path.Count - 1} steps (straight distance {Dist(path[0].x, path[0].y, path[^1].x, path[^1].y)}), every step walkable:\n" + crop);
+        Note("route", $"{(approach ? "walk to the target" : "wander")}: A* route of {path.Count - 1} steps to ({path[^1].x},{path[^1].y})"
+            + (stopOnSighting ? ", stops when a monster comes into view" : ""), detail: new { approach, path = path.SelectMany(c => new[] { c.x, c.y }).ToArray() });
         for (var i = 1; i < path.Count && _t < _o.DurationSeconds; i++)
         {
             var (nx, ny) = path[i];
@@ -364,6 +454,7 @@ public sealed class HuntSimulator
             _t += dt;
             if (approach) ApproachSeconds += dt; else WanderSeconds += dt;
             (_x, _y) = (nx, ny);
+            _track.Add(new ReplayStep(_t, _x, _y, dt));
             Steps++;
             if (diagonal) DiagonalSteps++;
             _visits[_x / 8, _y / 8]++;
@@ -375,7 +466,8 @@ public sealed class HuntSimulator
             foreach (var m in now) _inView.Add(m.Id);
             if (entered.Count == 0) continue;
             ViewEntries += entered.Count;
-            Log($"in view: {string.Join(", ", entered.Select(m => $"{Name(m)} #{m.Id} at ({m.X},{m.Y})"))}");
+            Log($"in view: {string.Join(", ", entered.Select(m => $"{Name(m)} #{m.Id} at ({m.X},{m.Y})"))}", "sighting", entered[0].Id,
+                new { entered = entered.Select(m => m.Id).ToArray(), inView = now.Count, viewDistance = ViewDistance });
             return false;
         }
         return true;
@@ -391,8 +483,13 @@ public sealed class HuntSimulator
         _world.MovePlayer(_x, _y);
         var statuses = string.Join(",", _world.StatusesOf(0));
         FightStarts.Add((100.0 * _world.Hp / _world.MaxHp, 100.0 * _world.Sp / Math.Max(1, _world.MaxSp), statuses));
-        Log($"engage {Name(m)} #{m.Id}: HP {_world.Hp}/{_world.MaxHp} SP {_world.Sp}/{_world.MaxSp}" + (statuses.Length > 0 ? $" [{statuses}]" : ""));
+        var fc = ForecastOf(m);
+        Log($"engage {Name(m)} #{m.Id}: HP {_world.Hp}/{_world.MaxHp} SP {_world.Sp}/{_world.MaxSp}" + (statuses.Length > 0 ? $" [{statuses}]" : ""), "engage", m.Id,
+            new { forecastWinRate = fc.WinRate, forecastSeconds = fc.Seconds, forecastDamageTaken = fc.DamageTaken, forecastAttacks = fc.Attacks,
+                statuses, noAutoAttack = _o.NoAutoAttack, rules = _rules.Count });
+        _fightTarget = m;
         var fight = _world.Fight(m.ServerId, () => Decide(m), Math.Min(300, _o.DurationSeconds - _t));
+        _fightTarget = null;
         _t = _world.Clock;
         FightSeconds += fight.Seconds;
         Stats(m).FightSeconds += fight.Seconds;
@@ -401,23 +498,26 @@ public sealed class HuntSimulator
         foreach (var id in fight.Killed)
             if (_byServerId.Remove(id, out var dead)) Died(dead, fight, byArea: dead != m);
         foreach (var (id, mob) in _byServerId) (mob.X, mob.Y) = _world.MonsterPosition(id); // knockback moved them
+        if (_world.PlayerPosition != (_x, _y)) _track.Add(new ReplayStep(_t, _world.PlayerPosition.X, _world.PlayerPosition.Y, 0));
         (_x, _y) = _world.PlayerPosition; // the player's own skills or walking into range moved it
         if (fight.Outcome == -1)
         {
             Deaths++;
             Stats(m).Deaths++;
-            Log($"DIED to {Name(m)} #{m.Id} (death penalty, respawn and return trip are not simulated; revived at full HP, statuses cleared)");
+            Log($"DIED to {Name(m)} #{m.Id} (death penalty, respawn and return trip are not simulated; revived at full HP, statuses cleared)", "death", m.Id,
+                new { fightSeconds = fight.Seconds, damageTaken = fight.DamageTaken, forecastWinRate = fc.WinRate });
             _world.Revive();
+            Vitals(_t);
             return false;
         }
         if (fight.Outcome == 2)
         {
-            Log($"fight with {Name(m)} #{m.Id} abandoned after {fight.Seconds:F1}s: moved out of straight-line reach (see trace)");
+            Log($"fight with {Name(m)} #{m.Id} abandoned after {fight.Seconds:F1}s: moved out of straight-line reach (see trace)", "fight-end", m.Id);
             return false;
         }
         if (fight.Outcome == 0)
         {
-            Log($"fight with {Name(m)} #{m.Id} cut off after {fight.Seconds:F1}s ({(_t >= _o.DurationSeconds ? "run end" : "300 s limit")})");
+            Log($"fight with {Name(m)} #{m.Id} cut off after {fight.Seconds:F1}s ({(_t >= _o.DurationSeconds ? "run end" : "300 s limit")})", "fight-end", m.Id);
             return false;
         }
         if (_cfg.HealHpPercent > 0 && _world.Hp < _cfg.HealHpPercent * _world.MaxHp) FightsEndedUnderHealHp++;
@@ -445,7 +545,9 @@ public sealed class HuntSimulator
         m.ServerId = 0;
         _inView.Remove(m.Id);
         Log($"killed {Name(m)} #{m.Id}" + (byArea ? " by area damage" : $" in {fight!.Seconds:F2}s ({fight.Actions} actions, {fight.SkillActions} skills, took {fight.DamageTaken} dmg)")
-            + $" +{m.Db.Exp} exp; respawns at {m.RespawnAt:F1}s");
+            + $" +{m.Db.Exp} exp; respawns at {m.RespawnAt:F1}s", "kill", m.Id,
+            new { exp = m.Db.Exp, byArea, respawnAt = m.RespawnAt, fightSeconds = fight?.Seconds, actions = fight?.Actions, skillActions = fight?.SkillActions,
+                damageTaken = fight?.DamageTaken });
     }
 
     private const double LiveTickSeconds = 0.25; // BotBehavior's tick loop delay
@@ -473,11 +575,18 @@ public sealed class HuntSimulator
         var (start, hp0, sp0, regenHp0, regenSp0) = (_t, _world.Hp, _world.Sp, _world.RegenHp, _world.RegenSp);
         Rests++;
         if (!low) RestsToWin++;
+        var f0 = RestFractions();
         Log($"sit to rest: HP {_world.Hp}/{_world.MaxHp} SP {_world.Sp}/{_world.MaxSp} ("
-            + (low ? $"under {_cfg.RestBelowPercent:P0}" : "rest to win: fights in view are winnable at full HP only") + ")");
+            + (low ? $"under {_cfg.RestBelowPercent:P0}" : "rest to win: fights in view are winnable at full HP only") + ")", "sit", detail: new
+            {
+                hpFraction = f0.Hp, spFraction = f0.Sp, spCounts = HuntPolicy.KillsWithSpells(_cfg, _o.Build.JobId), restBelow = _cfg.RestBelowPercent,
+                restWhenNoPotions = _cfg.RestWhenNoPotions, lowOnHpSp = low, restToWin = _restToWin, canSit, threatened = false,
+                standAt = HuntPolicy.RestedFraction,
+            });
         var nextSit = _t + ResitSeconds;
-        if (!SendSit(true)) { SitRefusals++; Log("the server refused to sit"); }
+        if (!SendSit(true)) { SitRefusals++; Log("the server refused to sit", "sit-refused"); }
         var lastHp = _world.Hp;
+        var standReason = "the run ended";
         while (_t < _o.DurationSeconds)
         {
             _t = Math.Min(_t + LiveTickSeconds, _o.DurationSeconds);
@@ -487,8 +596,12 @@ public sealed class HuntSimulator
             lastHp = _world.Hp;
             if (HuntPolicy.ShouldStand(_cfg, RestFractions(), _restToWin, hit, threatened: false))
             {
+                var f = RestFractions(); // which of ShouldStand's conditions held, for the replay
+                standReason = hit ? "hit while sitting" : f.Hp >= HuntPolicy.RestedFraction && f.Sp >= HuntPolicy.RestedFraction
+                    ? $"rested: HP {f.Hp:P0} and {(HuntPolicy.KillsWithSpells(_cfg, _o.Build.JobId) ? $"SP {f.Sp:P0}" : "SP (not counted)")} at or above {HuntPolicy.RestedFraction:P0}"
+                    : "not resting by config (RestWhenNoPotions off, no rest-to-win)";
                 if (!_world.Sitting || !SendSit(false)) break;
-                Log("the server refused to stand; re-sent next tick"); // ponytail: live sends once and moves on
+                Log("the server refused to stand; re-sent next tick", "stand-refused"); // ponytail: live sends once and moves on
                 continue;
             }
             if (!_world.Sitting && _t >= nextSit)
@@ -500,7 +613,8 @@ public sealed class HuntSimulator
         _restToWin = false;
         RestSeconds += _t - start;
         Log($"stand after {_t - start:F2}s: HP {hp0}->{_world.Hp}/{_world.MaxHp} SP {sp0}->{_world.Sp}/{_world.MaxSp} "
-            + $"(server regen +{_world.RegenHp - regenHp0} HP, +{_world.RegenSp - regenSp0} SP)");
+            + $"(server regen +{_world.RegenHp - regenHp0} HP, +{_world.RegenSp - regenSp0} SP)", "stand",
+            detail: new { reason = standReason, seconds = _t - start, regenHp = _world.RegenHp - regenHp0, regenSp = _world.RegenSp - regenSp0 });
         return true;
     }
 
@@ -509,9 +623,14 @@ public sealed class HuntSimulator
     private PlayerChoice Decide(Mob target)
     {
         var noRule = _o.NoAutoAttack ? PlayerChoice.Hold : PlayerChoice.AutoAttack;
-        if (_rules.Count == 0) return noRule;
+        var fallback = _o.NoAutoAttack ? "hold (NoAutoAttack: no auto-attack)" : "auto-attack";
+        if (_rules.Count == 0) { Note("attack-decision", $"{fallback}: no skill script", target.Id, new { reason = "no skill script" }); return noRule; }
         var now = _world.Clock;
-        if (now < _nextSkillAt) return noRule;
+        if (now < _nextSkillAt)
+        {
+            Note("attack-decision", $"{fallback}: the live 0.25 s global skill throttle", target.Id, new { reason = $"global skill throttle until {_nextSkillAt:F2}s" });
+            return noRule;
+        }
         var (hp, maxHp) = _world.MonsterHp(target.ServerId);
         var info = new BotBehavior.MonsterInfo(target.ServerId, target.Db.Id, target.Db.Name, new Position(target.X, target.Y), hp, maxHp);
         var skips = new List<string>();
@@ -531,7 +650,12 @@ public sealed class HuntSimulator
             var key = System.Text.RegularExpressions.Regex.Replace(skip, @", is [^;]*", ""); // as TickSkillsAsync dedupes
             RuleSkips[key] = RuleSkips.GetValueOrDefault(key) + 1;
         }
-        if (choice is not var (rule, level)) return noRule;
+        if (choice is not var (rule, level))
+        {
+            Note("attack-decision", $"{fallback}: no rule fired" + (skips.Count > 0 ? $" ({string.Join("; ", skips)})" : ""), target.Id,
+                new { reason = "no rule could fire", skipped = skips, ownHp = _world.Hp, ownSp = _world.Sp, targetHp = hp, targetMaxHp = maxHp });
+            return noRule;
+        }
         _nextSkillAt = now + 0.25;
         _skillThrottle[rule.Skill] = now + (rule.EveryCooldown > 0 ? rule.EveryCooldown : 1.5);
         RuleFired[rule.Skill] = RuleFired.GetValueOrDefault(rule.Skill) + 1;
@@ -541,9 +665,14 @@ public sealed class HuntSimulator
             BotBehavior.SkillCastTarget.Ground => BotSession.SkillGroundPacket(rule.Skill, level, target.X, target.Y),
             _ => BotSession.SkillOnTargetPacket(rule.Skill, level, target.ServerId),
         };
-        Log($"rule fires: {rule.Skill} L{level} ({rule.Target}) on {Name(target)} #{target.Id} (HP {hp}/{maxHp}, own HP {_world.Hp} SP {_world.Sp})");
+        Log($"rule fires: {rule.Skill} L{level} ({rule.Target}) on {Name(target)} #{target.Id} (HP {hp}/{maxHp}, own HP {_world.Hp} SP {_world.Sp})", "cast-decision", target.Id,
+            new { rule = Describe(rule), ruleIndex = _rules.IndexOf(rule) + 1, ruleTarget = rule.Target.ToString(), serverTarget = ServerWorld.DeclaredTarget(rule.Skill), level, skippedBefore = skips, ownHp = _world.Hp, ownSp = _world.Sp, targetHp = hp, targetMaxHp = maxHp });
         return new PlayerChoice(rule.Skill, packet.Message, packet.Length, false);
     }
+
+    private static string Describe(BotBehavior.SkillRule r) =>
+        $"use {r.Skill} {(r.Level > 0 ? r.Level.ToString() : "max")} on {r.Target}" + (r.EveryCooldown > 0 ? $" every {r.EveryCooldown}s" : "")
+        + (r.Conditions.Count > 0 ? " if " + string.Join(" and ", r.Conditions.Select(c => $"{c.Lhs} {c.Op} {c.Value}")) : "");
 
     /// <summary>What the live bot's Snapshot would hold: own HP/SP/stats/statuses from the server entity, the monsters in
     /// view with their HP, the target's statuses.</summary>
@@ -574,11 +703,13 @@ public sealed class HuntSimulator
     {
         if (!_walk.TryFindWalkableNear(_walk.Width / 2, _walk.Height / 2, 60, out _x, out _y))
             throw new InvalidOperationException("no walkable start cell");
-        _world = new ServerWorld(_o.Map, _o.Build, _x, _y, _rng.Next()) { OnEvent = Log };
+        _world = new ServerWorld(_o.Map, _o.Build, _x, _y, _rng.Next()) { OnEvent = OnWorld };
+        _track.Add(new ReplayStep(0, _x, _y, 0));
+        Vitals(0);
         if (_world.MapWidth != _walk.Width || _world.MapHeight != _walk.Height)
             throw new InvalidOperationException($"server walk data {_world.MapWidth}x{_world.MapHeight} differs from the client's {_walk.Width}x{_walk.Height}");
         Populate();
-        Log($"start on {_o.Map} ({_walk.Width}x{_walk.Height}, {WalkableCells} walkable cells), {_mobs.Count} monsters spawned");
+        Log($"start on {_o.Map} ({_walk.Width}x{_walk.Height}, {WalkableCells} walkable cells), {_mobs.Count} monsters spawned", "start");
         var lookNow = true;
         while (_t < _o.DurationSeconds)
         {
@@ -595,7 +726,7 @@ public sealed class HuntSimulator
                 if (pick is { } p)
                 {
                     var (mob, path) = p;
-                    Log($"target {Name(mob)} #{mob.Id} at ({mob.X},{mob.Y}), {path.Count - 1} steps (of {visible.Count} in view)");
+                    Log($"target {Name(mob)} #{mob.Id} at ({mob.X},{mob.Y}), {path.Count - 1} steps (of {visible.Count} in view)", "pick", mob.Id, _pickDetail);
                     Walk(path, approach: true, stopOnSighting: false);
                     if (_t >= _o.DurationSeconds) break;
                     if (Dist(_x, _y, mob.X, mob.Y) > MeleeRange) throw new InvalidOperationException("fight started out of range");
@@ -606,16 +737,17 @@ public sealed class HuntSimulator
                     lookNow = true;
                     continue;
                 }
-                if (visible.Count > 0) Log($"no target among {visible.Count} in view");
+                if (visible.Count > 0) Log($"no target among {visible.Count} in view", "nopick", detail: _pickDetail);
                 if (_restToWin && RestIfDue()) { lookNow = true; continue; }
             }
             if (_wanderDest is not { } dest || Dist(_x, _y, dest.X, dest.Y) <= 3)
             {
-                _wanderDest = WanderDestination();
+                var attempts = new List<string>();
+                _wanderDest = WanderDestination(attempts);
                 if (_wanderDest == null)
                 {
                     // Wedged (WanderAsync's "no reachable destination in 6 attempts"): it retries on its 0.8 s throttle.
-                    if (IdleSeconds == 0 || !Trace[^1].Contains("wedged")) Log("wedged: no reachable wander destination in 6 attempts");
+                    if (IdleSeconds == 0 || !Trace[^1].Contains("wedged")) Log("wedged: no reachable wander destination in 6 attempts", "idle", detail: new { attempts });
                     var wait = Math.Min(0.8, _o.DurationSeconds - _t);
                     _t += wait;
                     IdleSeconds += wait;
@@ -624,7 +756,12 @@ public sealed class HuntSimulator
                     continue;
                 }
                 WanderDestinations++;
-                Log($"wander to ({_wanderDest.Value.X},{_wanderDest.Value.Y})");
+                Log($"wander to ({_wanderDest.Value.X},{_wanderDest.Value.Y})", "wander", detail: new
+                {
+                    why = _inView.Count == 0 ? "no monster in view" : "no target among the monsters in view",
+                    rule = "WanderAsync: a random walkable cell at least a third of the map away (the 6th draw may be near), not by a portal, with a path",
+                    attempts,
+                });
             }
             var route = _walk.FindPath(_x, _y, _wanderDest.Value.X, _wanderDest.Value.Y);
             if (route == null) { _wanderDest = null; continue; }
@@ -634,7 +771,7 @@ public sealed class HuntSimulator
         var accounted = WanderSeconds + ApproachSeconds + FightSeconds + IdleSeconds + RestSeconds;
         if (Math.Abs(accounted - _t) > 1e-6)
             throw new InvalidOperationException($"clock {_t:F6}s but walking + fighting + idle + resting = {accounted:F6}s");
-        Log($"end: {Kills} kills, {Exp} exp");
+        Log($"end: {Kills} kills, {Exp} exp", "end");
     }
 
     // ---- report ----
@@ -729,17 +866,108 @@ public sealed class HuntSimulator
         L("-- Where the bot went (8x8-cell blocks; ' ' blocked, '.' walkable unvisited, 1-9 time spent (log), '*' a kill) --");
         L(HeatMap());
         L();
-        L("-- Not modelled (stated, not hidden) --");
-        L("* Monsters stand still between spawn and death: no wandering, chasing, aggression, assist or swarms; live monsters move.");
-        L("* Recovery: the live sit/stand rules on the server's sit packet and regen ticks; nothing interrupts a rest (no monster walks up or aggresses), and the target score's rest estimate (HuntPolicy.RestSeconds) stays the live formula.");
-        L("* Fights: only the target swings back (once hit); area damage hurts neighbours but they don't react; monsters cast no skills. Knockback is the server's (walk data); a knocked monster doesn't walk back, the player walks to it in a straight line.");
-        L("* World events (ground effects) run on 10 ms server frames: CreateEvent, timers, area-of-effect ticks, expiry and removal are the server's; event packets to clients are dropped.");
-        L("* Skill rules are evaluated at action slots in a fight, not while walking up to the target as the live tick also does.");
-        L("* No potions, no looting, no zeny/inventory (gemstones, arrows to consume), no party (ally rules never fire), no other players, no hazards/fleeing; a death revives at full HP on the spot (no penalty, no return trip).");
-        L("* Re-targeting happens when a monster enters view or after a fight, not every tick as live; once picked, a target is walked to and fought.");
+        L("-- Approximated or not modelled (stated, not hidden) --");
+        foreach (var c in Capabilities().Where(c => c.Level is "approximated" or "absent"))
+            L($"* {c.Area} ({c.Level}): {c.What} {c.Implication}");
         L($"Trace fingerprint {Fingerprint()} ({Trace.Count} events)");
         return sb.ToString();
     }
+
+    /// <summary>What this simulator runs with the server's code, with the live bot's own decision code, approximately,
+    /// or not at all, with what each means for the numbers; plus what this run's inputs make of it. The report's
+    /// "approximated or not modelled" list and the dashboard read this one list.</summary>
+    public List<ReplayCapability> Capabilities()
+    {
+        var c = new List<ReplayCapability>();
+        void Add(string area, string level, string what, string implication) => c.Add(new ReplayCapability(area, level, what, implication));
+        Add("Combat", "server", "Auto-attacks, skills, damage, hit/miss, statuses, cast bars and after-cast delays run the game server's own code (skill packet -> PacketSkill -> SkillHandler, CombatEntity).",
+            "Damage, kill times and skill effects are the server's numbers.");
+        Add("Recovery", "server", "HP/SP regen is the server's Player.UpdateRegenTick (sitting, standing and walking rates); sitting goes through the server's sit/stand packet handler.",
+            "Resting time and what it recovers are the server's.");
+        Add("Ground effects", "server", "World events (ground effects) run on 10 ms server frames: creation, timers, area ticks, expiry and removal are the server's; their packets to clients are dropped.",
+            "Lingering area damage and its kills are real; nothing is drawn client-side.");
+        Add("Knockback", "server", "Knockback moves monsters over the server's walk data.", "A knocked monster stays where it lands: it never walks back.");
+        Add("Map", "server", "The server's walk data (checked equal to the client's grid) and the database's spawn counts, pinned spawn areas and respawn delays.", "Geometry and population are the real map's.");
+        Add("Target choice", "shared", "The live bot's HuntPolicy.PickTarget: hunt filters, portal buffer, win rule at the current HP, exp/s score with walk and rest, detour rule.",
+            "Picks and rejections are what the live rules decide on this world's inputs.");
+        Add("Skill choice", "shared", "The live rule engine (BotBehavior.ChooseSkillRule) on the bot's skill script, with its 0.25 s global throttle and per-rule cooldown.", "Why a skill fired or was skipped is the live engine's reason.");
+        Add("Resting", "shared", "The live sit/stand rules (HuntPolicy.ShouldSit/ShouldStand), checked every 0.25 s while sitting.", "When the bot sits and stands is the live decision.");
+        Add("Spawning", "approximated", "A (re)spawn lands on a uniformly random walkable cell of its area; the server's 9-slice spawn-zone formula is not reproduced.", "Monster density across a big area can differ a little from live.");
+        Add("Walking", "approximated", "A* on the walk grid at the base 0.15 s per cell (diagonal x1.414); the bot moves cell to cell, time jumps per step. Inside a fight the player walks into range in a straight line.",
+            "No server path smoothing or move lag; a target behind a wall mid-fight is abandoned rather than walked around.");
+        Add("Re-targeting", "approximated", "Targets are re-picked when a monster enters view or after a fight, not every 0.25 s tick as live; once picked, a target is walked to and fought.",
+            "The live bot can switch to a better target mid-walk; this one cannot.");
+        Add("Skill timing", "approximated", "Skill rules are evaluated at action slots in a fight, not while walking up to the target as the live tick also does.", "Opening buffs cast on the approach live happen at the first swing here.");
+        Add("Target forecast", "approximated", "The pick's forecast is a server-code duel from full HP, judged against the current HP; the live server-forecast mode re-runs it from the current HP. No potion buffer.",
+            "Borderline targets at low HP can be judged slightly differently than live.");
+        Add("Rest estimate in the score", "approximated", "The target score's rest-time term is HuntPolicy.RestSeconds (live's formula, without recovery skills), not the server regen.", "Scores of damaging targets carry live's rest estimate.");
+        Add("Regen timing", "approximated", "The server regen runs in 0.25 s slices of virtual time.", "A regen tick can land up to 0.25 s late.");
+        Add("Monster AI", "absent", "Monsters stand still between spawn and death: no wandering, chasing, aggression, assisting or swarms; live monsters move.",
+            "Encounters happen only when the bot walks up; nothing ambushes it, interrupts a rest or follows it; search times and paths differ from live.");
+        Add("Monster fights", "absent", "Only the target swings back (once hit, within its own reach); area damage hurts neighbours but they don't react; monsters cast no skills.", "Damage taken is the one-on-one melee duel's.");
+        Add("Items", "absent", "No potions, looting, zeny or inventory (gemstones, arrows to consume).", "HP comes back only by regen and sitting; skills needing ammo or catalysts are refused by the server.");
+        Add("Other players", "absent", "No party (ally rules never fire), no other players competing for monsters.", "Kill-stealing and party support don't exist here.");
+        Add("Hazards and fleeing", "absent", "No hazards, no fleeing, nothing threatens a sitting bot.", "Rests are never interrupted.");
+        Add("Death", "absent", "A death revives at full HP on the spot: no EXP penalty, no save-point return trip.", "A dying build looks better than it would live.");
+        Add("Progression", "absent", "The build is fixed for the whole run: no level-ups, stat or skill points.", "A long run keeps the recorded build's stats, HP and kill speed throughout.");
+        // What this run's inputs make of it.
+        if (_o.Config == null) Add("Config", "approximated", "No saved config for this bot: the in-code BotBehaviorConfig defaults ran.", "Rest, win and hunt rules may differ from the live bot's.");
+        if (!_cfg.RestWhenNoPotions) Add("Config", "absent", "RestWhenNoPotions is off: the live bot sits only to win a fight in view and otherwise relies on potions, which don't exist here.", "HP only comes back by standing regen.");
+        if (FightsEndedUnderHealHp > 0) Add("Potions", "absent", $"{FightsEndedUnderHealHp} fights ended under HealHpPercent {_cfg.HealHpPercent:P0}, where the live bot would drink a potion if it carried one.", "Live would recover faster here (and spend zeny).");
+        var unknown = _mobs.Where(m => !DuelSimulator.IsKnownMonster(m.Db.Id)).Select(m => m.Db.Name).Distinct().ToList();
+        if (unknown.Count > 0) Add("Monsters", "absent", $"Unknown to the server data, never targeted: {string.Join(", ", unknown)}.", "They are drawn but can't be fought.");
+        var generic = _rules.Select(r => r.Skill).Distinct().Where(ServerWorld.IsGenericHandler).ToList();
+        if (generic.Count > 0) Add("Skills", "absent", $"No server handler for {string.Join(", ", generic)}: the server runs its generic cast (cooldown and packet only).", "These casts do nothing but cost time.");
+        if (_rules.Any(r => r.Target == BotBehavior.SkillCastTarget.Ally)) Add("Skills", "absent", "Ally rules in the script never fire (no party).", "Support casts are missing.");
+        return c;
+    }
+
+    /// <summary>The finished run as a HuntReplay (call after Run): what was recorded while it ran, the report's numbers and
+    /// the capability list. &lt;paramref name="buildSource"/&gt;: where the build came from, for the viewer.</summary>
+    public HuntReplay Replay(string? buildSource = null)
+    {
+        var walk = new StringBuilder(_walk.Width * _walk.Height);
+        for (var y = 0; y < _walk.Height; y++)
+            for (var x = 0; x < _walk.Width; x++)
+                walk.Append(_walk.IsWalkable(x, y) ? '1' : '0');
+        var b = _o.Build;
+        var hours = _o.DurationSeconds / 3600;
+        var skills = _world.Skills.Keys.Union(RuleFired.Keys).Union(_rules.Select(r => r.Skill)).Distinct().OrderBy(s => s.ToString()).Select(s =>
+        {
+            var l = _world.Skills.GetValueOrDefault(s) ?? new SkillLedger();
+            return new ReplaySkill(s.ToString(), b.LearnedSkills.GetValueOrDefault(s), RuleFired.GetValueOrDefault(s), l.Requested, l.CastBars, l.Queued, l.Executed,
+                l.SpSpent, l.Damage, l.Hits, l.KillingBlows, l.Healed, new(l.Rejected), new(l.StatusesApplied), l.Failures, l.Blocked, ServerWorld.IsGenericHandler(s));
+        }).ToList();
+        var types = Types.OrderByDescending(t => t.Value.Killed).ThenByDescending(t => t.Value.Population).Select(t =>
+        {
+            var f = ForecastOf(_mobs.First(m => m.Db.Name == t.Key));
+            return new ReplayType(t.Key, t.Value.Population, t.Value.Seen, t.Value.Picked, t.Value.Killed, t.Value.Exp,
+                t.Value.Killed > 0 ? t.Value.FightSeconds / t.Value.Killed : 0, ForecastText(f), new(t.Value.Rejected));
+        }).ToList();
+        var summary = new ReplaySummary(Kills, Deaths, Exp, Exp / hours, Exp / Math.Max(1e-9, (_o.DurationSeconds - RestSeconds) / 3600), Kills / hours,
+            WanderSeconds, ApproachSeconds, FightSeconds, RestSeconds, IdleSeconds, NoHuntableAliveSeconds, DamageTaken, _world.RegenHp, _world.RegenSp,
+            Rests, RestsToWin, SitRefusals, FightsEndedUnderHealHp, Steps, PickDecisions, Picks, new(Rejections),
+            SearchPerKill.Count > 0 ? SearchPerKill.Average() : 0, Kills > 0 ? FightSeconds / Math.Max(1, Kills + Deaths) : 0,
+            skills, new(RuleSkips), types);
+        return new HuntReplay
+        {
+            Map = _o.Map, Width = _walk.Width, Height = _walk.Height, Walk = walk.ToString(), Duration = _o.DurationSeconds, Seed = _o.Seed,
+            Build = $"Lv {b.Level}/{b.JobLevel} job {b.JobId}, STR {b.Str} AGI {b.Agi} VIT {b.Vit} INT {b.Int} DEX {b.Dex} LUK {b.Luk}; "
+                    + $"gear {string.Join(", ", b.Equipment.Select(e => _data.ItemName(e.ItemId)))}",
+            BuildSource = buildSource,
+            Config = _o.Config != null ? _o.ConfigSource ?? "given" : "NONE SAVED: the in-code BotBehaviorConfig defaults",
+            SkillScript = _o.SkillScript ?? "", MaxHp = _world.MaxHp, MaxSp = _world.MaxSp,
+            Mobs = _mobs.Select(m => new ReplayMob(m.Id, m.Db.Id, m.Db.Name, m.Db.Level, m.Db.Exp, m.Db.HP, m.Pinned, new[] { m.MinX, m.MinY, m.MaxX, m.MaxY },
+                Respawn(m), ForecastText(ForecastOf(m)))).ToList(),
+            Track = _track, Vitals = _vitals,
+            Events = _events.OrderBy(e => e.T).ToList(), // stable: back-dated world events (regen caught up at a fight's start) slot in by time
+            Summary = summary, Capabilities = Capabilities(), Failures = _world.Failures.ToList(),
+            Report = Report(), Fingerprint = Fingerprint(),
+        };
+    }
+
+    private static string ForecastText(Forecast f) => !f.Known ? "unknown to the server data" : f.CanWin
+        ? $"win {f.WinRate:P0}, {f.Seconds:F1}s, -{f.DamageTaken:F0} HP" : $"too strong at full HP ({f.Why})";
 
     private void SkillsReport(Action<string> L)
     {

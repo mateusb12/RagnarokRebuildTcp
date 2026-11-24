@@ -1,0 +1,331 @@
+@page "/simulation"
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@using RoBotClient.Bot.Behavior
+@using RoBotClient.Bot.Manager
+@using RoBotClient.Bot.Offline
+@using RoBotClient.Web.Components
+@inherits LiveComponent
+@implements IAsyncDisposable
+@inject BotManager Bots
+@inject SimRunner Runner
+@inject BotConfigStore Configs
+@inject IJSRuntime JS
+@inject NavigationManager Nav
+
+<PageTitle>Simulation - RagBot Control</PageTitle>
+
+<style>
+    .sim-tile { background: var(--bs-tertiary-bg); border-radius: .5rem; padding: .5rem .75rem; min-width: 8.5rem; }
+    .sim-tile .v { font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .sim-tile .l { font-size: .75rem; color: var(--bs-secondary-color); }
+    .sim-pre { background: #1e1e1e; color: #d4d4d4; padding: .75rem; border-radius: .5rem; font-size: .75rem; white-space: pre; overflow: auto; max-height: 60vh; }
+    .cap-server { border-left: 3px solid #198754; } .cap-shared { border-left: 3px solid #3b9dff; }
+    .cap-approximated { border-left: 3px solid #ffc107; } .cap-absent { border-left: 3px solid #6c757d; }
+</style>
+
+<div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+    <div class="d-flex align-items-center gap-2">
+        <h1 class="h3 mb-0">Offline simulation</h1>
+        <span class="badge bg-secondary rounded-pill fs-6">@_runs.Count runs</span>
+    </div>
+    <span class="small text-secondary">Runs the CLI's <code>huntsim</code> in its own process. No live bot is started or touched.</span>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <div class="row g-2 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Character build</label>
+                <select class="form-select form-select-sm" value="@_bot" @onchange="e => PickBot((string)e.Value!)">
+                    @foreach (var b in _bots) { <option value="@b">@b</option> }
+                </select>
+                <div class="small text-secondary mt-1">The bot's latest recorded build (bot-duels) and its saved config.</div>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small mb-1">Map</label>
+                <select class="form-select form-select-sm" @bind="_map">
+                    @foreach (var m in _maps) { <option value="@m">@m @MapName(m)</option> }
+                </select>
+            </div>
+            <div class="col-md-1">
+                <label class="form-label small mb-1">Minutes</label>
+                <input type="number" min="1" max="120" class="form-control form-control-sm" @bind="_minutes" />
+            </div>
+            <div class="col-md-1">
+                <label class="form-label small mb-1">Seed</label>
+                <input type="number" class="form-control form-control-sm" @bind="_seed" />
+            </div>
+            <div class="col-md-2">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="ovr" @bind="_overrideScript" />
+                    <label class="form-check-label small" for="ovr">Override skill script</label>
+                </div>
+            </div>
+            <div class="col-md-2 text-end">
+                <button class="btn btn-primary" disabled="@(Runner.Current.Running || _bot == null || _map == null)" @onclick="Run">
+                    @(Runner.Current.Running ? "Running…" : "Run simulation")
+                </button>
+            </div>
+        </div>
+        @if (_cfg != null)
+        {
+            <div class="small text-secondary mt-2">
+                Saved config <code>@_cfgKey</code>: home map @_cfg.HomeMap, rest @(_cfg.RestWhenNoPotions ? $"below {_cfg.RestBelowPercent:P0}" : "off (potions)"),
+                WinMargin @_cfg.WinMargin, MaxRoundsToKill @_cfg.MaxRoundsToKill@(_cfg.NoAutoAttack ? ", NoAutoAttack" : ""),
+                script: <code>@(string.IsNullOrWhiteSpace(_cfg.SkillScript) ? "(none: auto-attacks only)" : _cfg.SkillScript.Replace("\n", " | "))</code>
+            </div>
+        }
+        else if (_bot != null)
+        {
+            <div class="small text-warning mt-2">No saved config for @_bot: the run uses the in-code defaults (the report says so).</div>
+        }
+        @if (_overrideScript)
+        {
+            <textarea class="form-control form-control-sm mt-2 font-monospace" rows="3" placeholder="one rule per line, e.g. use Bash 0 if self.sp >= 15" @bind="_script"></textarea>
+        }
+        @{ var st = Runner.Current; }
+        @if (st.Running)
+        {
+            <div class="mt-2 small"><span class="spinner-border spinner-border-sm me-2"></span>Simulating @st.Request!.Bot on @st.Request.Map, @st.Request.Minutes min, seed @st.Request.Seed… @((DateTime.UtcNow - st.StartedUtc).TotalSeconds.ToString("0"))s</div>
+        }
+        else if (st.Error != null)
+        {
+            <div class="alert alert-danger mt-2 mb-0 small">
+                <div class="fw-semibold">Run failed: @st.Error</div>
+                @if (st.Output.Length > 0) { <pre class="sim-pre mt-2 mb-0">@Tail(st.Output)</pre> }
+            </div>
+        }
+        @if (_runs.Count > 0)
+        {
+            <div class="d-flex align-items-center gap-2 mt-3">
+                <label class="small text-secondary text-nowrap">Replay</label>
+                <select class="form-select form-select-sm" style="max-width:32rem" value="@_selected" @onchange="e => Select((string)e.Value!)">
+                    @foreach (var r in _runs) { <option value="@r">@r</option> }
+                </select>
+            </div>
+        }
+    </div>
+</div>
+
+@if (_loadError != null)
+{
+    <div class="alert alert-danger small">@_loadError</div>
+}
+@if (_replay is { } rp)
+{
+    var s = rp.Summary;
+    var h = rp.Duration / 3600;
+    <div class="small text-secondary mb-2">
+        <span class="fw-semibold text-body">@rp.Map</span> · @(rp.Duration / 60) min virtual · seed @rp.Seed · @rp.Build
+        <br />Build: @rp.BuildSource · Config: @rp.Config · trace fingerprint <code>@rp.Fingerprint</code>
+    </div>
+    @if (rp.Failures.Count > 0)
+    {
+        <div class="alert alert-danger small">
+            <div class="fw-semibold">Result incomplete: server code failed @rp.Failures.Count time(s) during this run (a runtime error, not a missing capability). The failing skill was withheld afterwards.</div>
+            <ul class="mb-0">@foreach (var f in rp.Failures.Take(10)) { <li><code>@f</code></li> }</ul>
+        </div>
+    }
+
+    <div id="sim-viewer" @ref="_viewer" class="mb-3"></div>
+
+    <div class="d-flex flex-wrap gap-2 mb-3">
+        @Tile("Kills", s.Kills.ToString("N0"), $"{s.KillsPerHour:N0}/h")
+        @Tile("Base EXP", s.Exp.ToString("N0"), "database values, no rate")
+        @Tile("EXP/h sustained", s.ExpPerHour.ToString("N0"), "sitting included")
+        @Tile("EXP/h not sitting", s.ExpPerHourNotSitting.ToString("N0"), "resting time excluded")
+        @Tile("Deaths", s.Deaths.ToString(), s.Deaths > 0 ? "revived on the spot" : "")
+        @Tile("Damage taken", s.DamageTaken.ToString("N0"), $"{s.FightSecondsPerKill:0.0}s per fight")
+        @Tile("Server regen", $"+{s.RegenHp:N0} HP", $"+{s.RegenSp:N0} SP")
+        @Tile("Rests", s.Rests.ToString(), $"{s.RestsToWin} to win, {s.SitRefusals} refused")
+        @Tile("Search per kill", $"{s.SearchSecondsPerKill:0.0}s", "wander + walk-up")
+    </div>
+
+    <div class="card mb-3"><div class="card-body">
+        <div class="small fw-semibold mb-1">Where the time went</div>
+        @{
+            var parts = new (string Name, double Sec, string Color)[] {
+                ("wandering", s.WanderSeconds, "#8e7cc3"), ("walking to targets", s.ApproachSeconds, "#ffe066"), ("fighting", s.FightSeconds, "#e5484d"),
+                ("resting", s.RestSeconds, "#3b9dff"), ("wedged / idle", s.IdleSeconds, "#6c757d") };
+        }
+        <div class="d-flex rounded overflow-hidden" style="height:14px">
+            @foreach (var p in parts.Where(p => p.Sec > 0)) { <div title="@p.Name @p.Sec.ToString("0")s" style="width:@Pct(p.Sec, rp.Duration);background:@p.Color"></div> }
+        </div>
+        <div class="d-flex flex-wrap gap-3 small mt-1">
+            @foreach (var p in parts) { <span><span style="display:inline-block;width:10px;height:10px;background:@p.Color;border-radius:2px"></span> @p.Name @p.Sec.ToString("0")s (@((100 * p.Sec / rp.Duration).ToString("0.0"))%)</span> }
+        </div>
+        @if (s.NoHuntableAliveSeconds > 0) { <div class="small text-secondary mt-1">@s.NoHuntableAliveSeconds.ToString("0")s of searching with no huntable monster alive anywhere on the map (waiting on respawns).</div> }
+    </div></div>
+
+    <div class="row g-3 mb-3">
+        <div class="col-lg-7">
+            <div class="card h-100"><div class="card-body p-0">
+                <div class="small fw-semibold p-2">Skills (executed by the server)</div>
+                @if (s.Skills.Count == 0) { <div class="small text-secondary px-2 pb-2">No skill script: auto-attacks only.</div> }
+                else
+                {
+                    <table class="table table-sm mb-0 small" style="font-variant-numeric:tabular-nums">
+                        <thead><tr><th>Skill</th><th class="text-end">Lv</th><th class="text-end" title="rule fired">Fired</th><th class="text-end" title="packets sent">Sent</th><th class="text-end" title="cast bars started">Bars</th><th class="text-end" title="queued behind the after-cast delay">Queued</th><th class="text-end">Executed</th><th class="text-end">SP</th><th class="text-end">Damage</th><th class="text-end">Kills</th><th>Refused by the server / notes</th></tr></thead>
+                        <tbody>
+                            @foreach (var k in s.Skills)
+                            {
+                                <tr>
+                                    <td>@k.Skill</td><td class="text-end">@k.Level</td><td class="text-end">@k.Fired</td><td class="text-end">@k.Sent</td><td class="text-end">@k.CastBars</td><td class="text-end">@k.Queued</td><td class="text-end">@k.Executed</td>
+                                    <td class="text-end">@k.SpSpent</td><td class="text-end">@k.Damage.ToString("N0")</td><td class="text-end">@k.Kills</td>
+                                    <td>
+                                        @foreach (var (why, n) in k.Rejected) { <span class="badge text-bg-warning me-1">@why ×@n</span> }
+                                        @if (k.NoServerHandler) { <span class="badge text-bg-secondary me-1">no server handler</span> }
+                                        @if (k.Sent > 0 && k.Executed == 0 && k.Rejected.Count == 0 && k.CastBars == 0 && k.Queued == 0) { <span class="badge text-bg-warning me-1" title="see the no-effect events">sent, no effect</span> }
+                                        @if (k.Blocked != null) { <span class="badge text-bg-danger me-1" title="@k.Blocked">FAILED ×@k.Failures</span> }
+                                        @foreach (var (st2, n) in k.Statuses) { <span class="badge text-bg-dark border me-1">@st2 ×@n</span> }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                    @if (s.RuleSkips.Count > 0) { <div class="small text-secondary p-2">Rules skipped: @string.Join("; ", s.RuleSkips.OrderByDescending(x => x.Value).Take(6).Select(x => $"{x.Key} ×{x.Value}"))</div> }
+                }
+            </div></div>
+        </div>
+        <div class="col-lg-5">
+            <div class="card h-100"><div class="card-body p-0">
+                <div class="small fw-semibold p-2">Monsters</div>
+                <table class="table table-sm mb-0 small" style="font-variant-numeric:tabular-nums">
+                    <thead><tr><th>Monster</th><th class="text-end">Pop</th><th class="text-end">Seen</th><th class="text-end">Killed</th><th class="text-end">s/kill</th><th>Forecast (full HP)</th></tr></thead>
+                    <tbody>
+                        @foreach (var t in s.Types)
+                        {
+                            <tr title="@string.Join(", ", t.Rejected.Select(x => $"{x.Key} ×{x.Value}"))">
+                                <td>@t.Name</td><td class="text-end">@t.Population</td><td class="text-end">@t.Seen</td><td class="text-end">@t.Killed</td>
+                                <td class="text-end">@(t.Killed > 0 ? t.FightSecondsPerKill.ToString("0.0") : "—")</td><td>@t.Forecast</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <div class="small text-secondary p-2">@s.PickDecisions target decisions, @s.Picks picks. Rejections: @(s.Rejections.Count == 0 ? "none" : string.Join(", ", s.Rejections.Select(x => $"{x.Key} ×{x.Value}")))</div>
+            </div></div>
+        </div>
+    </div>
+
+    <div class="card mb-3"><div class="card-body">
+        <div class="small fw-semibold mb-2">What this simulation models (from the simulator's own capability list for this run)</div>
+        <div class="row g-2">
+            @foreach (var (level, title, blurb) in Levels)
+            {
+                var caps = rp.Capabilities.Where(c => c.Level == level).ToList();
+                if (caps.Count == 0) continue;
+                <div class="col-lg-6">
+                    <div class="small fw-semibold">@title <span class="text-secondary fw-normal">— @blurb</span></div>
+                    @foreach (var c in caps)
+                    {
+                        <div class="cap-@level ps-2 my-1 small"><span class="fw-semibold">@c.Area.</span> @c.What <span class="text-secondary">@c.Implication</span></div>
+                    }
+                </div>
+            }
+        </div>
+    </div></div>
+
+    <details class="mb-4"><summary class="small">Full text report (the CLI's, same run)</summary><pre class="sim-pre mt-2">@rp.Report</pre></details>
+}
+
+@code {
+    protected override int RefreshMs => 1000;
+    private static readonly string ScriptVersion = DateTime.UtcNow.Ticks.ToString(); // a new sim.js per app start, as WorldMap does
+    private List<string> _bots = new(), _maps = new(), _runs = new();
+    private string? _bot, _map, _selected, _loadError, _cfgKey;
+    private double _minutes = 10;
+    private int _seed = 7;
+    private bool _overrideScript;
+    private string _script = "";
+    private BotBehaviorConfig? _cfg;
+    private HuntReplay? _replay;
+    private ElementReference _viewer;
+    private IJSObjectReference? _module;
+    private bool _mount;
+    private string? _lastFinished;
+
+    private static readonly (string, string, string)[] Levels =
+    {
+        ("server", "Game server code", "runs the server's own implementation"),
+        ("shared", "Live bot code", "the same decision code the live bot runs"),
+        ("approximated", "Approximated", "simplified; read the effect on the numbers"),
+        ("absent", "Not modelled", "missing from this world; the result can't show it"),
+    };
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+        _bots = Runner.BotsWithBuilds();
+        _maps = Bots.Data.MonstersById.Values.SelectMany(m => m.Spawns ?? new()).Select(s => s.Map)
+            .Where(m => Bots.Data.MapsByCode.ContainsKey(m)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(m => m).ToList();
+        _runs = Runner.Runs();
+        if (_bots.Count > 0) PickBot(_bots[0]);
+        var q = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(new Uri(Nav.Uri).Query);
+        var run = q.TryGetValue("run", out var v) ? v.ToString() : _runs.FirstOrDefault();
+        if (run != null) Load(run);
+        Runner.Changed += OnRunnerChanged;
+    }
+
+    private void PickBot(string bot)
+    {
+        _bot = bot;
+        _cfgKey = Configs.List().FirstOrDefault(k => k.EndsWith(" " + bot, StringComparison.OrdinalIgnoreCase));
+        _cfg = _cfgKey != null ? Configs.Get(_cfgKey) : null;
+        if (_cfg != null && _maps.Contains(_cfg.HomeMap, StringComparer.OrdinalIgnoreCase)) _map = _cfg.HomeMap;
+        _map ??= _maps.FirstOrDefault();
+        _script = _cfg?.SkillScript ?? "";
+    }
+
+    private void Run()
+    {
+        if (_bot == null || _map == null) return;
+        Runner.Start(new SimRunner.Request(_map, _bot, Math.Clamp(_minutes, 0.5, 120), _seed, _overrideScript ? _script : null));
+    }
+
+    private void OnRunnerChanged() => _ = InvokeAsync(() =>
+    {
+        _runs = Runner.Runs();
+        var st = Runner.Current;
+        if (!st.Running && st.ReplayName != null && st.ReplayName != _lastFinished)
+        {
+            _lastFinished = st.ReplayName;
+            Load(st.ReplayName);
+        }
+        StateHasChanged();
+    });
+
+    private void Select(string name) { Load(name); }
+
+    private void Load(string name)
+    {
+        try
+        {
+            _replay = Runner.Load(name);
+            _selected = name;
+            _loadError = _replay == null ? $"No saved run '{name}'." : null;
+            _mount = _replay != null;
+        }
+        catch (Exception e) { _replay = null; _loadError = $"Couldn't read {name}: {e.Message}"; }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!_mount || _replay == null) return;
+        _mount = false;
+        _module ??= await JS.InvokeAsync<IJSObjectReference>("import", $"./js/sim.js?v={ScriptVersion}");
+        await _module.InvokeVoidAsync("mount", _viewer, "sim-replay/" + Uri.EscapeDataString(_selected!));
+    }
+
+    private RenderFragment Tile(string label, string value, string sub) => @<div class="sim-tile"><div class="l">@label</div><div class="v">@value</div><div class="l">@sub</div></div>;
+    private static string Pct(double part, double whole) => (100 * part / Math.Max(1e-9, whole)).ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "%";
+    private string MapName(string code) => Bots.Data.MapsByCode.TryGetValue(code, out var m) && !string.IsNullOrEmpty(m.Name) ? $"({m.Name})" : "";
+    private static string Tail(string s) => s.Length > 4000 ? "…" + s[^4000..] : s;
+
+    public async ValueTask DisposeAsync()
+    {
+        Runner.Changed -= OnRunnerChanged;
+        base.Dispose();
+        if (_module != null) { try { await _module.DisposeAsync(); } catch (JSDisconnectedException) { } }
+    }
+}
