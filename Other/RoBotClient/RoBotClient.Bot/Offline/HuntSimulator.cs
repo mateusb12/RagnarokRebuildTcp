@@ -175,7 +175,7 @@ public sealed class HuntSimulator
         };
         _events.Add(new ReplayEvent(e.At, kind, text, kind == "hurt" ? _fightTarget?.Id ?? 0 : mob?.Id ?? 0, e.X, e.Y, e.Amount, e.HpLeft, skill,
             kind.StartsWith("area") ? new { entity = e.Entity } : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) }
-            : e.Motion > 0 ? new { motion = Math.Round(e.Motion, 3) } : null)); // motion: the swing began that long before (sprites only)
+            : e.Hits > 1 ? new { motion = Math.Round(e.Motion, 3), hits = e.Hits } : e.Motion > 0 ? new { motion = Math.Round(e.Motion, 3) } : null)); // motion: the swing began that long before; hits: Double Attack (sprites only)
         Vitals(e.At);
     }
 

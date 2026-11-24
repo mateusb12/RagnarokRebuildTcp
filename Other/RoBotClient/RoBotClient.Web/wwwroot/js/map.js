@@ -13,10 +13,9 @@ const COLORS = {
     textDim: "#7c8493",
 };
 
-const font = (px, bold = false) => `${bold ? "bold " : ""}${px}px system-ui, sans-serif`;
-const clamp01 = v => Math.max(0, Math.min(1, v));
-const hpColor = pct => pct <= 0.25 ? "#dc3545" : pct <= 0.5 ? "#ffc107" : "#198754";
-const dpr = () => window.devicePixelRatio || 1;
+// Sprites, HP bars, damage numbers and shouts come from the simulation tab's module (the simulation is the source).
+const Sim = await import("./sim-sprites.js" + new URL(import.meta.url).search);
+const { font, clamp01, dpr, hpColor, drawShout, drawNumber, DAMAGE_PATH, COMBO_PATH, HIT_INTERVAL_MS, MISS_PATH, RED } = Sim;
 const overlaps = (a, b) => a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]; // [left, top, right, bottom]
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -33,7 +32,7 @@ function stateOf(canvas) {
         animating: false,
         hover: [],            // tooltip targets: points { x, y, name } and rects { left, top, width, height, name }
         glides: new Map(),    // "b:name" / "m:id" -> { x, y, seen }   drawn position, eased toward the server cell
-        trails: new Map(),    // monster id -> { delayed, target, accel, moving, seen }   HP bar damage trail
+        trails: new Map(),    // monster id -> Sim.hpTrail state + seen   HP bar damage trail
         plates: new Map(),    // bot name -> name-plate opacity
         lastHp: new Map(),    // monster id / "b:name" -> hp at the previous frame (a drop spawns damage numbers)
         lastMiss: new Map(),  // monster id / "b:name" -> misses taken so far (a rise spawns "Miss")
@@ -69,7 +68,7 @@ function startLoop(canvas, s) {
         if (!s.payload || !canvas.isConnected) { s.animating = false; return; }
         const dt = Math.min(0.1, (now - last) / 1000);
         last = now;
-        tickTrails(s, dt, now);
+        for (const [id, tr] of s.trails) if (now - tr.seen > 2000) s.trails.delete(id);
         render(canvas, s, glideAll(s, s.payload, dt, now), now);
         requestAnimationFrame(step);
     };
@@ -157,17 +156,6 @@ function message(canvas, text) {
 // Images by URL (minimap art, monster atlases): undefined while loading, null if missing.
 const images = new Map();
 
-/** Same lazy cache for the per-species monster animation JSON (MonsterSprites.Anim). */
-const anims = new Map();
-function animData(url) {
-    if (!url) return null;
-    if (!anims.has(url)) {
-        anims.set(url, undefined);
-        fetch(url).then(r => r.ok ? r.json() : null).then(a => anims.set(url, a), () => anims.set(url, null));
-    }
-    return anims.get(url) || null;
-}
-
 function image(url) {
     if (!url) return null;
     if (!images.has(url)) {
@@ -249,66 +237,25 @@ function layoutMobs(v, s, payload) {
     for (const [id, t] of s.deadAt) if (v.now - t > 5000) s.deadAt.delete(id);
     return [...(payload.mobs || [])].sort((a, b) => b.y - a.y).map(m => {
         const x = v.toX(m.x), y = v.toY(m.y);
-        const sp = payload.sprites?.[m.name];
-        const atlas = sp ? image(sp.atlas) : null;
+        const a = Sim.animOf(m.name);
         const barSpace = m.hp != null ? 12 : 0;
         const name = m.name || "monster";
-        if (atlas) {
-            const k = Math.min(1, v.spriteHeight / Math.max(sp.w, sp.h)); // same size as the first-frame portrait
-            const feet = y + v.mr;
-            const a = animData(sp.anim);
-            const pose = a && animFrame(s, m, a, v.now);
-            const layers = pose
-                ? pose.layers.filter(l => l[0] >= 0 && a.rects[l[0]]).map(([i, lx, ly, mirror, scx, scy, alpha]) => {
-                    const r = a.rects[i], w = r[2] * Math.abs(scx) * k, h = r[3] * Math.abs(scy) * k;
-                    return { r, left: x + lx * k - w / 2, top: feet + ly * k - h / 2, w, h, mirror: !!mirror !== scx < 0, alpha: alpha * pose.alpha };
-                })
-                : [{ r: [sp.x, sp.y, sp.w, sp.h], left: x - sp.w * k / 2, top: feet - sp.h * k, w: sp.w * k, h: sp.h * k, mirror: false, alpha: 1 }];
+        if (a) {
+            const since = performance.now() - s.payloadAt; // the ages below are as of the last payload
+            if (m.dead && !s.deadAt.has(m.id)) s.deadAt.set(m.id, v.now);
+            // RoSpriteAnimator walks by distance: frame = cells * 4.6 * 0.37 * 4 / (delay / 24); idle loops on its delay.
+            const loopMs = m.walk && m.cell > 0 ? v.now / 1000 / m.cell * 6.808 * 24 : v.now;
+            const pose = Sim.monsterFrame(a, m.dir & 7, { dead: m.dead ? v.now - s.deadAt.get(m.id) : null, atk: m.atk + since, hit: m.hit + since, walk: m.walk }, loopMs);
+            const r0 = a.rects[0], k = Math.min(1, v.spriteHeight / Math.max(r0[2], r0[3], 1)); // minimap: every monster ~30 css px
+            const layers = pose ? Sim.place(a, pose.frame, 0, 0, x, y + v.mr, k, pose.alpha) : [];
             if (!layers.length) return null;
-            const left = Math.min(...layers.map(l => l.left)), right = Math.max(...layers.map(l => l.left + l.w));
-            const top = Math.min(...layers.map(l => l.top)), bottom = Math.max(...layers.map(l => l.top + l.h));
-            return { m, x, y, sprite: { atlas, layers }, barY: top - 3,
+            const [left, top, right, bottom] = Sim.box(layers);
+            return { m, x, y, layers, barY: top - 3,
                 hover: { x, y: (top + bottom) / 2, name }, box: [left, top - barSpace, right, bottom] };
         }
-        return { m, x, y, sprite: null, barY: y - v.mr - 3,
+        return { m, x, y, layers: null, barY: y - v.mr - 3,
             hover: { x, y, name }, box: [x - v.mr, y - v.mr - barSpace, x + v.mr, y + v.mr] };
     }).filter(Boolean);
-}
-
-// Monster motions as RoAnimationHelper.GetMotionIdForSprite lays them out: action = motion * 8 + facing.
-const MOTION = { idle: 0, walk: 8, attack: 16, hit: 24, dead: 32 };
-
-/** The animation frame to show now, like RoSpriteAnimator: dead plays once and holds its last frame (then the corpse
- *  fades, as the server already removed it), a swing or a flinch plays once from when it happened (whichever is
- *  newer), walking and idle loop. Facing is the server's Direction, which matches the sprite's facing order. */
-function animFrame(s, m, a, now) {
-    const since = performance.now() - s.payloadAt; // the ages below are as of the last payload
-    const once = (motion, age) => {
-        const act = a.actions[motion + (m.dir & 7)] || a.actions[motion];
-        if (!act?.frames.length) return null;
-        const i = Math.floor(age / Math.max(1, act.delay));
-        return i < act.frames.length || motion === MOTION.dead ? act.frames[Math.min(i, act.frames.length - 1)] : null;
-    };
-    let alpha = 1, frame = null;
-    if (m.dead) {
-        if (!s.deadAt.has(m.id)) s.deadAt.set(m.id, now);
-        const age = now - s.deadAt.get(m.id);
-        frame = once(MOTION.dead, age);
-        alpha = clamp01((1900 - age) / 700); // fade out before WorldMap drops the corpse at 2 s
-    } else {
-        const atk = m.atk + since, hit = m.hit + since;
-        frame = atk <= hit ? once(MOTION.attack, atk) || once(MOTION.hit, hit) : once(MOTION.hit, hit) || once(MOTION.attack, atk);
-    }
-    if (!frame) {
-        const motion = m.walk ? MOTION.walk : MOTION.idle;
-        const act = a.actions[motion + (m.dir & 7)] || a.actions[0];
-        if (!act?.frames.length) return null;
-        const delay = Math.max(1, act.delay);
-        // RoSpriteAnimator walks by distance: frame = cells * 4.6 * 0.37 * 4 / (delay / 24); idle loops on its delay.
-        const step = m.walk && m.cell > 0 ? (now / 1000 / m.cell) * 6.808 * 24 / delay : now / delay;
-        frame = act.frames[Math.floor(step) % act.frames.length];
-    }
-    return { layers: frame.layers ?? frame, alpha };
 }
 
 /** An item on the ground: its inventory icon (half a monster sprite), else a small gold diamond. Returns its hover point. */
@@ -332,20 +279,9 @@ function drawItem(v, it) {
     return { x, y, name: it.count > 1 ? `${it.name} x${it.count}` : it.name };
 }
 
-function drawMob(v, { x, y, sprite }) {
+function drawMob(v, { x, y, layers }) {
     const { ctx } = v;
-    if (sprite) {
-        ctx.imageSmoothingEnabled = true;
-        for (const { r, left, top, w, h, mirror, alpha } of sprite.layers) {
-            if (alpha <= 0) continue;
-            ctx.save();
-            ctx.globalAlpha = clamp01(alpha);
-            if (mirror) { ctx.translate(left * 2 + w, 0); ctx.scale(-1, 1); } // flip about the layer's centre
-            ctx.drawImage(sprite.atlas, r[0], r[1], r[2], r[3], left, top, w, h);
-            ctx.restore();
-        }
-        return;
-    }
+    if (layers) { Sim.drawLayers(ctx, layers); return; }
     ctx.fillStyle = COLORS.monster;
     ctx.strokeStyle = "#000000cc";
     ctx.lineWidth = 1.5;
@@ -355,44 +291,14 @@ function drawMob(v, { x, y, sprite }) {
     ctx.stroke();
 }
 
-// HP bar "damage trail", copied from the Unity client's SliderBar: on a hit the bar drops at once and a white chunk
-// (ProgressDelayed) stays behind, then drains with accelerating speed (accel += 20/s each second) until it meets the bar.
-function trailFor(s, id, pct, now) {
-    let tr = s.trails.get(id);
-    if (!tr) s.trails.set(id, tr = { delayed: pct, accel: 0, moving: false });
-    tr.seen = now;
-    tr.target = pct;
-    if (pct >= tr.delayed) { tr.delayed = pct; tr.moving = false; }
-    else if (!tr.moving) { tr.moving = true; tr.accel = 0; }
-    return tr;
-}
-
-function tickTrails(s, dt, now) {
-    for (const [id, tr] of s.trails) {
-        if (now - tr.seen > 2000) { s.trails.delete(id); continue; }
-        if (!tr.moving) continue;
-        tr.delayed -= tr.accel * dt;
-        tr.accel += dt * 20;
-        if (tr.delayed < tr.target) tr.moving = false; // caught up with the bar, like SliderBar.Update
-    }
-}
-
-/** Dueled monsters only (hp is null otherwise): a small bar above the sprite, coloured like the bots' HP bars. */
+/** Dueled monsters only (hp is null otherwise): a small bar above the sprite, with the client's white damage trail. */
 function drawHpBar(v, s, { m, x, barY }) {
     if (m.hp == null) return;
-    const { ctx } = v;
-    const w = Math.max(18, v.spriteHeight * 1.2), h = Math.max(3, v.spriteHeight * 0.16);
-    const left = x - w / 2, top = barY - h;
     const pct = clamp01(m.hp / m.maxHp);
-    const tr = trailFor(s, m.id, pct, v.now);
-    ctx.fillStyle = "#000000cc";
-    ctx.fillRect(left - 1, top - 1, w + 2, h + 2);
-    if (tr.moving && tr.delayed > pct) {
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(left, top, w * tr.delayed, h);
-    }
-    ctx.fillStyle = hpColor(pct);
-    ctx.fillRect(left, top, w * pct, h);
+    let tr = s.trails.get(m.id);
+    if (!tr) s.trails.set(m.id, tr = {});
+    tr.seen = v.now;
+    Sim.drawHpBar(v.ctx, x, barY, Math.max(18, v.spriteHeight * 1.2), Math.max(3, v.spriteHeight * 0.16), pct, Sim.hpTrail(tr, pct, v.now / 1000));
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -456,20 +362,6 @@ function drawToast(v, { text, icon }) {
     if (img) ctx.drawImage(img, left, mid - k / 2, k, k);
     ctx.fillStyle = COLORS.text;
     ctx.fillText(text, left + (k ? k + 6 : 0), mid);
-}
-
-/** Skill shout ("Bash!!") above the dot, styled like the name plate. */
-function drawShout(v, text, x, above) {
-    const { ctx } = v;
-    const size = Math.max(9, Math.round(v.fs * 0.75));
-    ctx.font = font(size, true);
-    ctx.textBaseline = "middle";
-    const w = ctx.measureText(text).width;
-    const y = above - 3 - size / 2 - 2;
-    ctx.fillStyle = "#000000aa";
-    ctx.fillRect(x - w / 2 - 3, y - size / 2 - 2, w + 6, size + 4);
-    ctx.fillStyle = COLORS.text;
-    ctx.fillText(text, x - w / 2, y);
 }
 
 /** Name centred under the bot dot. A monster under the plate fades it so the monster shows through. */
@@ -576,50 +468,6 @@ function glideAll(s, p, dt, now) {
 // Damage numbers, ported from the Unity client
 // ---------------------------------------------------------------------------------------------------------------
 
-// DamageIndicator.OnUpdate driven by Data/FlyingText/*.asset. Keys are Unity AnimationCurve keys
-// [time, value, inSlope, outSlope] over a 0..1 lifetime of `tween` seconds.
-// Damage: starts where it spawned, drifts sideways away from the attacker while arcing up and down, punches in at
-// 5x size then settles, and fades out.
-const DAMAGE_PATH = {
-    trajectory: [[0.0019874573, -0.0014190674, 4.052195, 4.052195], [0.9942106, 0.011132479, -3.9042158, -3.9042158]],
-    size: [[-0.0009186715, 5.0193124, -14.1374855, -14.1374855], [0.3964636, 0.99757385, -0.60127693, -0.3272466], [1, 0.8000686, -0.3272466, -0.3272466]],
-    alpha: [[0, 1, -0.00026645948, -0.00026645948], [0.11452991, 0.9999695, -0.00026645948, -0.075074494], [0.56060225, 0.70585805, -1.3047085, -1.4544252], [1.0042865, 0.006022349, -0.2006653, -0.2006653]],
-    tween: 1, height: 4, distance: 4, color: "#ffffff",
-    maxSize: 2.5, // minimap: Unity pops to 5x, capped so the yellow total stays the biggest number
-};
-// Multi-hit (Double Attack): EntityMessageQueue.SendDamageEvent shows each hit 0.2 s apart, and ServerControllable
-// .AttachDamageIndicator adds a yellow running total (ComboPath.asset) that rides with the monster, each new hit
-// replacing the previous total (ComboIndicator.EndDamageIndicator).
-const COMBO_PATH = {
-    trajectory: [[0.0039138794, 0.51712036, 0.4858895, 0.4858895], [0.9932951, 0.9978503, 0.4858895, 0.4858895]],
-    size: [[0.0007741172, 0.0036451616, 18.02707, 18.02707], [0.10320092, 1.4825153, 2.0349398, 0.004584544], [0.9957344, 1.4866072, 0.004584544, 0.004584544]],
-    alpha: [[0, 1, -0.00006110869, -0.00006110869], [0.49939838, 0.9999695, -0.00006110869, -0.075074494], [0.75252, 0.70585805, -2.4358597, -2.8889782], [1.0042865, 0.006022349, -0.2006653, -0.2006653]],
-    tween: 3, height: 6, distance: 0, color: "#ffff00",
-    scale: 2, // minimap: settles at ~3x, above any (capped) white hit
-};
-const HIT_INTERVAL_MS = 200;
-// MissPath.asset: rises straight up at constant size, holds, then fades over 1.5 s.
-const MISS_PATH = {
-    trajectory: [[-0.0012550354, -0.0013427734, 1.0056698, 1.0056698], [1.0009416, 1.0065361, 1.0056698, 1.0056698]],
-    size: [[0, 1, 0, 0], [1, 1, 0, 0]],
-    alpha: [[0, 1, 0.009446392, 0.009446392], [0.4999364, 1.0047226, 0.009446392, -0.42355192], [1.0024122, -0.0012597442, -4.6746316, -4.6746316]],
-    tween: 1.5, height: 5, distance: 0, color: "#ffffff", scale: 1.5,
-};
-// ServerControllable: damage and misses on a player (an ally) are red.
-const RED = "#ff3b3b";
-
-/** Unity's AnimationCurve.Evaluate: cubic Hermite between keys, clamped at the ends. */
-function evalCurve(keys, t) {
-    if (t <= keys[0][0]) return keys[0][1];
-    for (let i = 0; i < keys.length - 1; i++) {
-        const [t0, v0, , o0] = keys[i], [t1, v1, i1] = keys[i + 1];
-        if (t > t1) continue;
-        const d = t1 - t0, u = (t - t0) / d, u2 = u * u, u3 = u2 * u;
-        return (2 * u3 - 3 * u2 + 1) * v0 + (u3 - 2 * u2 + u) * d * o0 + (-2 * u3 + 3 * u2) * v1 + (u3 - u2) * d * i1;
-    }
-    return keys[keys.length - 1][1];
-}
-
 function nearestBot(bots, m) {
     let near = null, best = Infinity;
     for (const b of bots) {
@@ -682,21 +530,6 @@ function drawDamageNumbers(v, s, mobs) {
     }
     ctx.globalAlpha = 1;
     ctx.textAlign = "start";
-}
-
-function drawNumber(v, n, life) {
-    const { ctx } = v, P = n.path;
-    const unit = v.spriteHeight * 0.5; // one Unity world unit on the minimap, relative to the sprite
-    const size = Math.min(evalCurve(P.size, life), P.maxSize ?? Infinity) * (P.scale ?? 1);
-    const x = n.x + (n.dir || 0) * P.distance * unit * life * 0.5;
-    const y = n.y - evalCurve(P.trajectory, life) * P.height * unit * 0.6; // minimap: Unity's full arc (4 units) read too high, 0.3 too low
-    ctx.globalAlpha = clamp01(evalCurve(P.alpha, life));
-    ctx.font = font(Math.round(9 * dpr() * size), true);
-    ctx.lineWidth = Math.max(2, 2.5 * size);
-    ctx.strokeStyle = "#000000";
-    ctx.strokeText(String(n.value), x, y);
-    ctx.fillStyle = n.color || P.color;
-    ctx.fillText(String(n.value), x, y);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

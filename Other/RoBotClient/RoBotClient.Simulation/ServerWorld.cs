@@ -70,7 +70,7 @@ public sealed record EncounterResult(int Outcome, double Seconds, int DamageTake
 /// <summary>Motion: for hits, the server's attack motion time (DamageInfo.AttackMotionTime): the swing started that long before the
 /// damage landed. For a cast bar, Amount is its length in ms.</summary>
 public sealed record WorldEvent(double At, string Kind, string? Text, int Entity = 0, CharacterSkill Skill = CharacterSkill.None,
-    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1, double Motion = 0);
+    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1, double Motion = 0, int Hits = 1);
 
 /// <summary>The player's choice when it may act: an auto-attack, a skill packet (the bytes the live bot sends), or
 /// nothing yet (a pure caster with no rule ready re-decides a moment later).</summary>
@@ -170,8 +170,8 @@ public sealed class ServerWorld
     public Action<WorldEvent>? OnEvent;
 
     private void Emit(string kind, string? text, int entity = 0, CharacterSkill skill = CharacterSkill.None, int amount = 0, int amount2 = 0,
-        int hpLeft = -1, int x = -1, int y = -1, double motion = 0) =>
-        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y, motion));
+        int hpLeft = -1, int x = -1, int y = -1, double motion = 0, int hits = 1) =>
+        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y, motion, hits));
 
     static ServerWorld()
     {
@@ -648,11 +648,13 @@ public sealed class ServerWorld
         var pusher = CharacterSkill.None;
         var results = 0;
         var motion = 0.0;
+        var hits = 1; // Double Attack: one result with HitCount 2 (the dashboard splits the numbers by it)
         foreach (var d in combat.DamageQueue)
         {
             if (d.Time > Time.ElapsedTimeFloat || !d.IsDamageResult) continue;
             results++;
             motion = Math.Max(motion, d.AttackMotionTime);
+            hits = Math.Max(hits, (int)d.HitCount);
             var damage = d.Damage * Math.Max(1, (int)d.HitCount) + Math.Max(0, (int)d.DamageOffHand);
             total += damage;
             left -= damage;
@@ -697,7 +699,7 @@ public sealed class ServerWorld
         }
         if (total > 0) DuelSimulator.MonsterLastDamageField.SetValue(monster, Time.ElapsedTimeFloat);
         if (results > 0) Emit("hit", null, monster.Character.Id, pusher, total, results, Math.Max(0, combat.GetStat(CharacterStat.Hp)),
-            monster.Character.Position.X, monster.Character.Position.Y, motion);
+            monster.Character.Position.X, monster.Character.Position.Y, motion, hits);
         return total;
     }
 

@@ -196,21 +196,12 @@
             .FirstOrDefault();
         _species = seen.Values.GroupBy(m => m.Name).Select(g => (Name: g.Key, Count: g.Count()))
             .OrderByDescending(entry => entry.Count).ThenBy(entry => entry.Name).ToList();
-        // First sprite frame per species in view (atlas file + rect), drawn on the map in place of a dot.
-        var sprites = _species.Select(entry => (entry.Name, Frame: Sprites.Get(entry.Name))).Where(entry => entry.Frame != null)
-            .ToDictionary(entry => entry.Name, entry => (object)new
-            {
-                atlas = $"monster-atlas/{Uri.EscapeDataString(entry.Frame!.AtlasName)}.png",
-                anim = $"monster-anim/{Uri.EscapeDataString(entry.Name)}",
-                x = entry.Frame.X, y = entry.Frame.Top, w = entry.Frame.Width, h = entry.Frame.Height,
-            });
-
         object payload;
         var wm = Bots.Data.GetWalkMap(MapCode);
         if (wm == null)
             payload = new { ok = false, message = $"no walk data for {MapCode}" };
         else if (_terrainSent)
-            payload = new { ok = true, map = MapCode, minimap = $"minimap/{MapCode}.png", bots, mobs, items, toast, sprites, showSpawnAreas = ShowSpawnAreas ?? _showSpawnAreas };
+            payload = new { ok = true, map = MapCode, minimap = $"minimap/{MapCode}.png", bots, mobs, items, toast, showSpawnAreas = ShowSpawnAreas ?? _showSpawnAreas };
         else
             payload = new
             {
@@ -222,7 +213,6 @@
                 cells = TerrainString(wm),
                 bots,
                 mobs,
-                sprites,
                 showSpawnAreas = ShowSpawnAreas ?? _showSpawnAreas,
                 spawns = Bots.Data.SpawnAreas(MapCode).Select(area => new
                 {

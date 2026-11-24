@@ -1,5 +1,6 @@
 // Simulation tab sprites (visual only): monsters and the bot drawn and posed as the Unity client does it, from what the
-// replay recorded. Nothing here changes what the replay says; sim.js asks it for layers to draw.
+// replay recorded. Nothing here changes what the replay says; sim.js asks it for layers to draw. The minimap (map.js)
+// imports its sprites, HP bars, damage numbers and shouts from here: the simulation is the source.
 //  - Monsters: the imported sprite actions (/monster-anim, as the minimap). A swing starts the server's attack motion time
 //    before its damage lands and is sped up so its attack frame connects then (ServerControllable.SetAttackAnimationSpeed);
 //    a hit taken flinches; dead plays once and fades.
@@ -7,6 +8,12 @@
 //    attached like RoSpriteAnimator children: same action and frame as the body, offset by the frames' "Pos" anchors, sorted
 //    by SpriteOrder (behind the body on .imf foreground frames). Attack1/2/3 from the job + weapon class; skills pose
 //    per the client's skill handlers; cast bars hold the cast pose.
+
+// Small canvas helpers, shared with the minimap.
+export const dpr = () => window.devicePixelRatio || 1;
+export const font = (px, bold = false) => `${bold ? "bold " : ""}${px}px system-ui, sans-serif`;
+export const clamp01 = v => Math.max(0, Math.min(1, v));
+export const hpColor = pct => pct <= 0.25 ? "#dc3545" : pct <= 0.5 ? "#ffc107" : "#198754";
 
 // Client motion layout (RoAnimationHelper.GetMotionIdForSprite): action = motion + facing.
 export const MON = { idle: 0, walk: 8, attack: 16, hit: 24, dead: 32 };
@@ -52,7 +59,7 @@ export function indexMonsters(rp) {
     return { hits, swings };
 }
 
-const lastLE = (arr, t, key = x => x) => { let lo = 0, hi = arr.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (key(arr[m]) <= t) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
+export const lastLE = (arr, t, key = x => x) => { let lo = 0, hi = arr.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (key(arr[m]) <= t) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
 /** Frame i of an action played once from age (ms) at speed (delay multiplier); null once it's over unless hold. */
 function once(act, age, speed, hold) {
     if (!act?.frames.length || !(age >= 0) || !isFinite(age)) return null;
@@ -61,36 +68,40 @@ function once(act, age, speed, hold) {
 }
 const loopFrame = (act, ms) => act?.frames.length ? Math.floor(ms / Math.max(1, act.delay)) % act.frames.length : 0;
 
+/** The monster's pose, like RoSpriteAnimator: dead plays once and holds its last frame while the corpse fades; a swing
+ *  or a flinch plays once from when it happened (the newer wins; the swing at `speed`); else walk or idle loop on loopMs.
+ *  Ages in ms (Infinity: none), dir the RO facing. The minimap poses its monsters with this too. */
+export function monsterFrame(a, dir, { dead = null, atk = Infinity, hit = Infinity, speed = 1, walk = false }, loopMs) {
+    const act = mo => a.actions[mo + dir] || a.actions[mo];
+    const one = (mo, age, sp, hold) => { const ac = act(mo), i = once(ac, age, sp, hold); return i != null ? ac.frames[i] : null; };
+    let frame, alpha = 1;
+    if (dead != null) { frame = one(MON.dead, dead, 1, true); alpha = clamp01((1900 - dead) / 700); }
+    else frame = atk <= hit ? one(MON.attack, atk, speed) || one(MON.hit, hit, 1) : one(MON.hit, hit, 1) || one(MON.attack, atk, speed);
+    if (!frame) { const ac = act(walk ? MON.walk : MON.idle); if (!ac?.frames.length) return null; frame = ac.frames[loopFrame(ac, loopMs)]; }
+    return { frame, alpha };
+}
+
 /** Layers for a monster at t. The simulator has no monster facing: it faces the bot while fighting it (a swing or flinch
- *  within 3 s), else south. */
-export function monsterLayers(ix, a, id, m, t, me, s, spriteH) {
+ *  within 3 s), else south. px: screen pixels per sprite pixel; the client draws sprites at 50 px per tile, scaled 1.5
+ *  (x Size for monsters). */
+export function monsterLayers(ix, a, id, m, t, me, s, px) {
     const flinchAt = (() => { const l = ix.hits.get(id); const i = l ? lastLE(l, t) : -1; return i >= 0 ? l[i] : -Infinity; })();
     const sw = (() => { const l = ix.swings.get(id); const i = l ? lastLE(l, t, x => x.t0) : -1; return i >= 0 ? l[i] : null; })();
     const dir = (sw && t - sw.t0 < 3) || t - flinchAt < 3 || !m.alive ? facing(me.x - m.x, me.y - m.y) : 0;
-    const act = motion => a.actions[motion + dir] || a.actions[motion];
-    let frame = null, alpha = 1;
-    if (!m.alive) { const age = (t - m.diedAt) * 1000, i = once(act(MON.dead), age, 1, true); frame = i != null ? act(MON.dead).frames[i] : null; alpha = Math.max(0, Math.min(1, (1900 - age) / 700)); }
-    else {
-        // ServerControllable.SetAttackAnimationSpeed: AnimSpeed = motionTime / (AttackFrameTime / 1000), so the attack frame lands with the damage.
-        const speed = sw && sw.motion > 0 && a.attackFrameTime > 0 ? sw.motion * 1000 / a.attackFrameTime : 1;
-        const ia = sw ? once(act(MON.attack), (t - sw.t0) * 1000, speed) : null, ih = once(act(MON.hit), (t - flinchAt) * 1000, 1);
-        const atkNewer = sw && sw.t0 >= flinchAt;
-        frame = atkNewer ? (ia != null ? act(MON.attack).frames[ia] : ih != null ? act(MON.hit).frames[ih] : null)
-                         : (ih != null ? act(MON.hit).frames[ih] : ia != null ? act(MON.attack).frames[ia] : null);
-    }
-    if (!frame) { const ac = act(MON.idle); if (!ac?.frames.length) return null; frame = ac.frames[loopFrame(ac, t * 1000)]; }
-    const r0 = a.rects[0], k = spriteH / Math.max(r0[2], r0[3], 1);
-    const layers = place(a, frame, 0, 0, s.x, s.y + 2, k, alpha);
+    // ServerControllable.SetAttackAnimationSpeed: AnimSpeed = motionTime / (AttackFrameTime / 1000), so the attack frame lands with the damage.
+    const speed = sw && sw.motion > 0 && a.attackFrameTime > 0 ? sw.motion * 1000 / a.attackFrameTime : 1;
+    const pose = monsterFrame(a, dir, { dead: m.alive ? null : (t - m.diedAt) * 1000, atk: sw ? (t - sw.t0) * 1000 : Infinity, hit: (t - flinchAt) * 1000, speed }, t * 1000);
+    const layers = pose ? place(a, pose.frame, 0, 0, s.x, s.y + 2, px * (a.size || 1), pose.alpha) : [];
     return layers.length ? { layers, box: box(layers) } : null;
 }
 
-function place(spr, frame, ox, oy, x, feet, k, alpha) {
+export function place(spr, frame, ox, oy, x, feet, k, alpha) {
     return frame.filter(l => l[0] >= 0 && spr.rects[l[0]]).map(([i, lx, ly, mirror, scx, scy, al, angle]) => {
         const r = spr.rects[i], w = r[2] * Math.abs(scx) * k, h = r[3] * Math.abs(scy) * k;
         return { img: spr.img, r, left: x + (lx + ox) * k - w / 2, top: feet + (ly + oy) * k - h / 2, w, h, mirror: !!mirror !== scx < 0, alpha: al * alpha, angle: angle || 0 };
     });
 }
-const box = ls => [Math.min(...ls.map(l => l.left)), Math.min(...ls.map(l => l.top)), Math.max(...ls.map(l => l.left + l.w)), Math.max(...ls.map(l => l.top + l.h))];
+export const box = ls => [Math.min(...ls.map(l => l.left)), Math.min(...ls.map(l => l.top)), Math.max(...ls.map(l => l.left + l.w)), Math.max(...ls.map(l => l.top + l.h))];
 
 // ---- raw .spr / .act (port of the client's importer: Editor/RagnarokSpriteLoader.cs, RagnarokAnimLoader.cs) ----
 function decodeSpr(buf) {
@@ -222,7 +233,7 @@ export function indexPlayer(rp, P) {
 }
 
 /** The bot's layers at t (b: its screen point). Facing: toward the target while fighting, else its last step. */
-export function playerLayers(P, moves, rp, t, me, b, act, tm, spriteH) {
+export function playerLayers(P, moves, rp, t, me, b, act, tm, px) {
     const tr = rp.track; let dir = 0;
     const moving = me.x !== me.cx || me.y !== me.cy;
     if (act === "fight" && tm) dir = facing(tm.x - me.x, tm.y - me.y);
@@ -245,7 +256,7 @@ export function playerLayers(P, moves, rp, t, me, b, act, tm, spriteH) {
     }
     const ba = action(motion); if (!ba?.frames.length) return null;
     fi = Math.min(fi, ba.frames.length - 1);
-    const r0 = P.body.rects[0] || [0, 0, 1, 1], k = spriteH * 1.1 / Math.max(r0[3], 1), feet = b.y + 2;
+    const k = px, feet = b.y + 2;
     const fg = ba.foreground?.[fi], anchor = ba.anchors?.[fi] || [0, 0];
     const layers = [{ order: 0, ls: place(P.body, ba.frames[fi], 0, 0, b.x, feet, k, 1) }];
     for (const c of P.children) {
@@ -259,42 +270,99 @@ export function playerLayers(P, moves, rp, t, me, b, act, tm, spriteH) {
     return layers.sort((x, y) => x.order - y.order).flatMap(x => x.ls);
 }
 
+// ---- HP bars, damage numbers and skill shouts (ported from the Unity client; the minimap draws them with these too) ----
 
-// Client damage numbers: DamageIndicator.cs with the curves of Data/FlyingText/{Damage,Miss}Path.asset as [time, value, inSlope, outSlope].
-// ponytail: Unity's weighted tangents are evaluated as plain Hermite; error is under a few percent of the size curve.
-const DMG_ALPHA = [[0, 1, 0, 0], [0.11453, 0.99997, 0, -0.07507], [0.5606, 0.70586, -1.30471, -1.45443], [1.00429, 0.00602, -0.20067, -0.20067]];
-const PATHS = {
-    damage: { traj: [[0.00199, -0.00142, 4.0522, 4.0522], [0.99421, 0.01113, -3.90422, -3.90422]], size: [[-0.00092, 5.01931, -14.13749, -14.13749], [0.39646, 0.99757, -0.60128, -0.32725], [1, 0.80007, -0.32725, -0.32725]], alpha: DMG_ALPHA, fly: true, height: 4, dist: 4, tween: 1, scale: 1, start: 0 },
-    miss: { traj: [[-0.00126, -0.00134, 1.00567, 1.00567], [1.00094, 1.00654, 1.00567, 1.00567]], size: [[0, 1, 0, 0], [1, 1, 0, 0]], alpha: [[0, 1, 0.00945, 0.00945], [0.49994, 1.00472, 0.00945, -0.42355], [1.00241, -0.00126, -4.67463, -4.67463]], fly: false, height: 5, dist: 4, tween: 1.5, scale: 2, start: 0.6 },
+// SliderBar's damage trail: on a drop the bar falls at once and a white chunk stays behind, draining with accel += 20/s
+// each second (10·τ² after τ s) until it meets the bar; drops while it drains don't restart it. tr: per-bar state
+// ({} to start), fed the bar's fraction in time order (now in s). Returns where the white chunk ends.
+export function hpTrail(tr, pct, now) {
+    let d = tr.at == null ? (tr.last ?? pct) : tr.from - 10 * (now - tr.at) ** 2;
+    if (d <= pct) { tr.at = null; d = pct; }
+    else if (tr.at == null) { tr.from = d; tr.at = now; }
+    tr.last = pct;
+    return d;
+}
+
+/** An HP bar centred on x with its bottom at `bottom`, coloured by fraction, with the white trail up to `delayed`. */
+export function drawHpBar(g, x, bottom, w, h, pct, delayed) {
+    const left = x - w / 2, top = bottom - h;
+    pct = clamp01(pct); delayed = clamp01(delayed ?? pct);
+    g.fillStyle = "#000000cc"; g.fillRect(left - 1, top - 1, w + 2, h + 2);
+    if (delayed > pct) { g.fillStyle = "#ffffff"; g.fillRect(left, top, w * delayed, h); }
+    g.fillStyle = hpColor(pct); g.fillRect(left, top, w * pct, h);
+}
+
+// DamageIndicator.OnUpdate driven by Data/FlyingText/*.asset. Keys are Unity AnimationCurve keys
+// [time, value, inSlope, outSlope] over a 0..1 lifetime of `tween` seconds.
+// Damage: starts where it spawned, drifts sideways away from the attacker while arcing up and down, punches in at
+// 5x size then settles, and fades out.
+export const DAMAGE_PATH = {
+    trajectory: [[0.0019874573, -0.0014190674, 4.052195, 4.052195], [0.9942106, 0.011132479, -3.9042158, -3.9042158]],
+    size: [[-0.0009186715, 5.0193124, -14.1374855, -14.1374855], [0.3964636, 0.99757385, -0.60127693, -0.3272466], [1, 0.8000686, -0.3272466, -0.3272466]],
+    alpha: [[0, 1, -0.00026645948, -0.00026645948], [0.11452991, 0.9999695, -0.00026645948, -0.075074494], [0.56060225, 0.70585805, -1.3047085, -1.4544252], [1.0042865, 0.006022349, -0.2006653, -0.2006653]],
+    tween: 1, height: 4, distance: 4, color: "#ffffff",
+    maxSize: 2.5, // minimap: Unity pops to 5x, capped so the yellow total stays the biggest number
 };
-export const INDICATOR_SECONDS = 1.5;
-const DAMAGE_NUMBER_SIZE = 0.85, DIGIT = 0.5, SPACING = 0.7; // GameConfigData defaults; shader digit quad 0.5 units, advance = 0.5 * spacing
-function curve(k, t) {
-    if (t <= k[0][0]) return k[0][1];
-    for (let i = 1; i < k.length; i++) if (t <= k[i][0]) {
-        const [t0, v0, , m0] = k[i - 1], [t1, v1, m1] = k[i], d = t1 - t0, s = (t - t0) / d, s2 = s * s, s3 = s2 * s;
-        return (2 * s3 - 3 * s2 + 1) * v0 + (s3 - 2 * s2 + s) * d * m0 + (3 * s2 - 2 * s3) * v1 + (s3 - s2) * d * m1;
+// Multi-hit (Double Attack): EntityMessageQueue.SendDamageEvent shows each hit 0.2 s apart, and ServerControllable
+// .AttachDamageIndicator adds a yellow running total (ComboPath.asset) that rides with the monster, each new hit
+// replacing the previous total (ComboIndicator.EndDamageIndicator).
+export const COMBO_PATH = {
+    trajectory: [[0.0039138794, 0.51712036, 0.4858895, 0.4858895], [0.9932951, 0.9978503, 0.4858895, 0.4858895]],
+    size: [[0.0007741172, 0.0036451616, 18.02707, 18.02707], [0.10320092, 1.4825153, 2.0349398, 0.004584544], [0.9957344, 1.4866072, 0.004584544, 0.004584544]],
+    alpha: [[0, 1, -0.00006110869, -0.00006110869], [0.49939838, 0.9999695, -0.00006110869, -0.075074494], [0.75252, 0.70585805, -2.4358597, -2.8889782], [1.0042865, 0.006022349, -0.2006653, -0.2006653]],
+    tween: 3, height: 6, distance: 0, color: "#ffff00",
+    scale: 2, // minimap: settles at ~3x, above any (capped) white hit
+};
+export const HIT_INTERVAL_MS = 200;
+// MissPath.asset: rises straight up at constant size, holds, then fades over 1.5 s.
+export const MISS_PATH = {
+    trajectory: [[-0.0012550354, -0.0013427734, 1.0056698, 1.0056698], [1.0009416, 1.0065361, 1.0056698, 1.0056698]],
+    size: [[0, 1, 0, 0], [1, 1, 0, 0]],
+    alpha: [[0, 1, 0.009446392, 0.009446392], [0.4999364, 1.0047226, 0.009446392, -0.42355192], [1.0024122, -0.0012597442, -4.6746316, -4.6746316]],
+    tween: 1.5, height: 5, distance: 0, color: "#ffffff", scale: 1.5,
+};
+// ServerControllable: damage and misses on a player (an ally) are red.
+export const RED = "#ff3b3b";
+
+/** Unity's AnimationCurve.Evaluate: cubic Hermite between keys, clamped at the ends. */
+function evalCurve(keys, t) {
+    if (t <= keys[0][0]) return keys[0][1];
+    for (let i = 0; i < keys.length - 1; i++) {
+        const [t0, v0, , o0] = keys[i], [t1, v1, i1] = keys[i + 1];
+        if (t > t1) continue;
+        const d = t1 - t0, u = (t - t0) / d, u2 = u * u, u3 = u2 * u;
+        return (2 * u3 - 3 * u2 + 1) * v0 + (u3 - 2 * u2 + u) * d * o0 + (-2 * u3 + 3 * u2) * v1 + (u3 - u2) * d * i1;
     }
-    return k[k.length - 1][1];
+    return keys[keys.length - 1][1];
 }
-// Map-space unit vector the number flies along: away from the attacker, snapped like Direction.GetIntercardinalDirection (cardinals turn 45° clockwise).
-export function flyAway(victim, attacker) {
-    if (!attacker) return [0, 0];
-    const a = Math.round(Math.atan2(attacker.y - victim.y, attacker.x - victim.x) / (Math.PI / 4));
-    const r = (a % 2 === 0 ? a - 1 : a) * Math.PI / 4; // facing toward the attacker, made diagonal
-    return [-Math.sign(Math.round(Math.cos(r) * 1e6)), -Math.sign(Math.round(Math.sin(r) * 1e6))];
+
+export function drawNumber(v, n, life) { // v: { ctx, spriteHeight } in device pixels
+    const { ctx } = v, P = n.path;
+    const unit = v.spriteHeight * 0.5; // one Unity world unit on the minimap, relative to the sprite
+    const size = Math.min(evalCurve(P.size, life), P.maxSize ?? Infinity) * (P.scale ?? 1);
+    const x = n.x + (n.dir || 0) * P.distance * unit * life * 0.5;
+    const y = n.y - evalCurve(P.trajectory, life) * P.height * unit * 0.6; // minimap: Unity's full arc (4 units) read too high, 0.3 too low
+    ctx.globalAlpha = clamp01(evalCurve(P.alpha, life));
+    ctx.font = font(Math.round(9 * dpr() * size), true);
+    ctx.lineWidth = Math.max(2, 2.5 * size);
+    ctx.strokeStyle = "#000000";
+    ctx.strokeText(String(n.value), x, y);
+    ctx.fillStyle = n.color || P.color;
+    ctx.fillText(String(n.value), x, y);
 }
-// kind "damage" | "miss"; (x, y) victim feet on screen; (dx, dy) screen-space flight vector per world unit; u = px per world unit.
-export function drawIndicator(g, kind, txt, color, age, x, y, dx, dy, u) {
-    const P = PATHS[kind], lt = age / P.tween;
-    if (lt < 0 || lt > 1) return;
-    const size = curve(P.size, lt) * DAMAGE_NUMBER_SIZE * P.scale, fly = P.fly ? lt * P.dist : 0;
-    const px = x + dx * fly * u, py = y + dy * fly * u - (P.start + 1.25 + curve(P.traj, lt) * P.height) * u;
-    const h = Math.max(9, DIGIT * size * u), adv = kind === "miss" ? null : h * SPACING;
-    g.save(); g.globalAlpha = Math.max(0, Math.min(1, curve(P.alpha, lt)));
-    g.font = "900 " + h.toFixed(1) + "px Arial Black, Impact, sans-serif"; g.textBaseline = "middle"; g.lineJoin = "round";
-    g.lineWidth = Math.max(2, h / 7); g.strokeStyle = "#000"; g.fillStyle = color;
-    const chars = adv ? [...txt] : [txt], w = adv ? adv * chars.length : g.measureText(txt).width;
-    chars.forEach((c, i) => { const cx = px - w / 2 + (adv ? i * adv + (adv - g.measureText(c).width) / 2 : 0); g.strokeText(c, cx, py); g.fillText(c, cx, py); });
-    g.restore();
+
+
+/** Skill shout ("Bash!!") above the dot, styled like the name plate. */
+export function drawShout(v, text, x, above) {
+    const { ctx } = v;
+    const size = Math.max(9, Math.round(v.fs * 0.75));
+    ctx.font = font(size, true);
+    ctx.textBaseline = "middle";
+    const w = ctx.measureText(text).width;
+    const y = above - 3 - size / 2 - 2;
+    ctx.fillStyle = "#000000aa";
+    ctx.fillRect(x - w / 2 - 3, y - size / 2 - 2, w + 6, size + 4);
+    ctx.fillStyle = "#cbd2dc";
+    ctx.fillText(text, x - w / 2, y);
 }
+

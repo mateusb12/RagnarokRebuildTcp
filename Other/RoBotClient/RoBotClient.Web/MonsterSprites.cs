@@ -16,7 +16,7 @@ public sealed class MonsterSprites
     public sealed record Frame(string AtlasName, int X, int Top, int Width, int Height);
 
     private readonly string _monstersDir;
-    private readonly Lazy<Dictionary<string, string>> _spriteByName;
+    private readonly Lazy<Dictionary<string, (string Sprite, double Size, double Shadow)>> _spriteByName;
     private readonly ConcurrentDictionary<string, Frame?> _frames = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, Anim?> _anims = new(StringComparer.OrdinalIgnoreCase);
 
@@ -29,6 +29,10 @@ public sealed class MonsterSprites
         /// <summary>When the swing connects (ms into Attack1 at normal speed): the client scales a monster's attack so this
         /// frame lands on the server's motion time.</summary>
         public int AttackFrameTime { get; init; }
+        /// <summary>monsterclass.json Size and ShadowSize: the client scales the monster by 1.5 * Size (ClientDataLoader); a
+        /// shadow of ShadowSize, none when it is not positive.</summary>
+        public double Size { get; init; } = 1;
+        public double Shadow { get; init; } = 0.5;
     }
     public sealed record AnimAction(int Delay, List<List<double[]>> Frames)
     {
@@ -41,7 +45,8 @@ public sealed class MonsterSprites
     public Anim? GetAnim(string monsterName) =>
         _monstersDir.Length == 0
             ? null
-            : _anims.GetOrAdd(monsterName, n => _spriteByName.Value.TryGetValue(n, out var sprite) ? ReadAnim(_monstersDir, sprite, $"monster-atlas/{Uri.EscapeDataString(sprite + "_atlas")}.png") : null);
+            : _anims.GetOrAdd(monsterName, n => _spriteByName.Value.TryGetValue(n, out var m) && ReadAnim(_monstersDir, m.Sprite, $"monster-atlas/{Uri.EscapeDataString(m.Sprite + "_atlas")}.png") is { } a
+                ? a with { Size = m.Size, Shadow = m.Shadow } : null);
 
     public MonsterSprites(string clientConfigDir, string importedMonstersDir, string headDataFile = "", string importedCharactersDir = "")
     {
@@ -138,11 +143,11 @@ public sealed class MonsterSprites
     public Frame? Get(string monsterName) =>
         _monstersDir.Length == 0
             ? null
-            : _frames.GetOrAdd(monsterName, n => _spriteByName.Value.TryGetValue(n, out var sprite) ? ReadFirstFrame(_monstersDir, sprite) : null);
+            : _frames.GetOrAdd(monsterName, n => _spriteByName.Value.TryGetValue(n, out var m) ? ReadFirstFrame(_monstersDir, m.Sprite) : null);
 
-    private static Dictionary<string, string> LoadSpriteNames(string path)
+    private static Dictionary<string, (string, double, double)> LoadSpriteNames(string path)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var map = new Dictionary<string, (string, double, double)>(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(path))
             return map;
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
@@ -150,7 +155,8 @@ public sealed class MonsterSprites
         {
             if (m.TryGetProperty("Name", out var n) && n.GetString() is { Length: > 0 } name
                 && m.TryGetProperty("SpriteName", out var s) && s.GetString() is { Length: > 0 } sprite)
-                map.TryAdd(name, Path.GetFileNameWithoutExtension(sprite));
+                map.TryAdd(name, (Path.GetFileNameWithoutExtension(sprite),
+                    m.TryGetProperty("Size", out var z) ? z.GetDouble() : 1, m.TryGetProperty("ShadowSize", out var sh) ? sh.GetDouble() : 0.5));
         }
         return map;
     }

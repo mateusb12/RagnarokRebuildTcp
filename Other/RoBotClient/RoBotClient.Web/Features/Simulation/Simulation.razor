@@ -315,7 +315,8 @@
         if (!_mount || _replay == null) return;
         _mount = false;
         _module ??= await JS.InvokeAsync<IJSObjectReference>("import", $"./js/sim.js?v={ScriptVersion}");
-        await _module.InvokeVoidAsync("mount", _viewer, "sim-replay/" + Uri.EscapeDataString(_selected!), PlayerLook(_replay));
+        await _module.InvokeVoidAsync("mount", _viewer, "sim-replay/" + Uri.EscapeDataString(_selected!), PlayerLook(_replay),
+            Bots.Data.SkillInfoById.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value.Name)); // shout names, as WorldMap.Shout
     }
 
     // The bot's sprites (SimSprites): the look recorded with the build, else the character's if it's logged in now.

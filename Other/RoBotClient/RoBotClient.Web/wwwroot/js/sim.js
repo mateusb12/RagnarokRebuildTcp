@@ -5,7 +5,7 @@
 // World Y increases UPWARD (as map.js): screenY = (cy - y) * zoom + height / 2.
 
 const Sprites = await import("./sim-sprites.js" + new URL(import.meta.url).search); // visual-only sprite code
-const { animOf, drawLayers } = Sprites;
+const { animOf, drawLayers, dpr, font, lastLE } = Sprites;
 
 const COLORS = {
     bg: "#10131a", walkable: "#3a4254", blocked: "#191c24", self: "#3b9dff", monster: "#e5484d", target: "#ffe066",
@@ -36,14 +36,11 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "
 const fmtT = t => { const m = Math.floor(t / 60), s = t - 60 * m; return m + ":" + (s < 10 ? "0" : "") + s.toFixed(2); };
 const pct = v => (100 * v).toFixed(0) + "%";
 const n1 = v => v == null ? "—" : (+v).toFixed(1);
-const dpr = () => window.devicePixelRatio || 1;
-const font = (px, bold) => (bold ? "bold " : "") + px + "px system-ui, sans-serif";
-const lastLE = (arr, t, key = x => x) => { let lo = 0, hi = arr.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (key(arr[m]) <= t) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
 
 let current = null;
 
 /** player: the bot's body and head sprite actions (MonsterSprites.PlayerAnim, camelCase), or null for a dot. */
-export async function mount(root, url, player) {
+export async function mount(root, url, player, skillNames) {
     if (current) current.stop();
     current = null;
     root.innerHTML = '<div class="text-secondary small py-3">Loading replay…</div>';
@@ -51,6 +48,7 @@ export async function mount(root, url, player) {
     try { const r = await fetch(url); if (!r.ok) throw new Error(r.status + " " + r.statusText); rp = await r.json(); }
     catch (e) { root.innerHTML = '<div class="alert alert-danger small">Could not load the replay: ' + esc(e.message) + "</div>"; return; }
     current = new Viewer(root, rp);
+    current.skillNames = skillNames;
     const v = current, P = await Sprites.loadPlayer(player);
     if (P && v === current) { v.player = P; v.playerMoves = Sprites.indexPlayer(rp, P); }
 }
@@ -77,6 +75,11 @@ class Viewer {
         this.mobLife = new Map();  // id -> [{t, alive, x, y}]
         this.mobHp = new Map();    // id -> [{t, hp}]
         this.spriteIx = Sprites.indexMonsters(rp);
+        this.drops = new Map(); // mob id (0: the bot) -> HP drops [{t, before, after}], for the HP bars' white trail
+        for (const e of rp.events) if ((e.kind === "hit" || e.kind === "hurt") && e.amount > 0 && e.hpLeft >= 0) {
+            const k = e.kind === "hurt" ? 0 : e.mob; let l = this.drops.get(k); if (!l) this.drops.set(k, l = []);
+            l.push({ t: e.t, before: e.hpLeft + e.amount, after: e.hpLeft });
+        }
         const push = (map, id, v) => { let a = map.get(id); if (!a) map.set(id, a = []); a.push(v); };
         const die = (id, t) => { const l = this.mobLife.get(id); const p = l?.[l.length - 1]; if (p?.alive) push(this.mobLife, id, { t, alive: false, x: p.x, y: p.y }); };
         this.areas = [];           // {t0, t1, x, y, skill, text}
@@ -327,9 +330,9 @@ class Viewer {
             list.push({ id, mob, m, s });
         }
         list.sort((a, b) => b.m.y - a.m.y); // nearer the bottom drawn on top, as the minimap
-        const spriteH = Math.max(22, Math.min(72, z * 2.6));
+        const spriteH = Math.max(22, Math.min(72, z * 2.6)), px = Math.max(z, 8) * 1.5 / 50; // ponytail: floor at 8 px/tile so zoomed-out sprites stay visible
         for (const { id, mob, m, s } of list) {
-            const a = animOf(mob.name), lay = a && Sprites.monsterLayers(this.spriteIx, a, id, m, t, me, s, spriteH);
+            const a = animOf(mob.name), lay = a && Sprites.monsterLayers(this.spriteIx, a, id, m, t, me, s, px);
             if (!m.alive) {
                 if (lay) drawLayers(g, lay.layers);
                 else if (t - m.diedAt < 1.5) { g.globalAlpha = 1 - (t - m.diedAt) / 1.5; g.strokeStyle = COLORS.monster; g.lineWidth = 2; g.beginPath(); g.moveTo(s.x - rad, s.y - rad); g.lineTo(s.x + rad, s.y + rad); g.moveTo(s.x + rad, s.y - rad); g.lineTo(s.x - rad, s.y + rad); g.stroke(); g.globalAlpha = 1; }
@@ -338,7 +341,7 @@ class Viewer {
             const win = mob.forecast.startsWith("win");
             const box = lay ? lay.box : [s.x - rad, s.y - rad, s.x + rad, s.y + rad];
             const ring = (col, r) => { g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); if (lay) g.ellipse(s.x, s.y, r + spriteH * 0.3, (r + spriteH * 0.3) * 0.45, 0, 0, 7); else g.arc(s.x, s.y, rad + r, 0, 7); g.stroke(); };
-            if (lay) { g.fillStyle = win ? "#0007" : "#e5484d99"; g.beginPath(); g.ellipse(s.x, s.y, spriteH * 0.3, spriteH * 0.13, 0, 0, 7); g.fill(); drawLayers(g, lay.layers); }
+            if (lay) { const sr = (a.shadow > 0 ? a.shadow : 0.35) * (a.size || 1) * px * 50 * 0.6; g.fillStyle = win ? "#0007" : "#e5484d99"; g.beginPath(); g.ellipse(s.x, s.y, sr, sr * 0.45, 0, 0, 7); g.fill(); drawLayers(g, lay.layers); }
             else { g.fillStyle = win ? COLORS.monster : "#7a2a2a"; g.beginPath(); g.arc(s.x, s.y, rad, 0, 7); g.fill(); }
             if (id === target) ring(COLORS.target, 3);
             if (id === this.selectedMob) ring("#fff", 6);
@@ -347,31 +350,54 @@ class Viewer {
                 ring(c.verdict.startsWith("chosen") ? "#52c41a" : c.verdict.startsWith("too strong") ? "#ff4d4f" : c.verdict.startsWith("unreachable") ? "#ffa940" : "#bfbfbf", 4);
                 g.fillStyle = "#fff"; g.font = font(11, true); g.fillText(c.rank ? "#" + c.rank : "✕", box[2] + 2, box[1] + 10);
             }
-            if (m.hp < mob.maxHp) this.bar(g, s.x - 12, box[1] - 6, 24, 3, m.hp / mob.maxHp, "#e5484d");
+            if (m.hp < mob.maxHp) { const w = Math.max(24, Math.min(48, z * 1.2)); Sprites.drawHpBar(g, s.x, box[1] - 3, w, Math.max(3, w * 0.13), m.hp / mob.maxHp, this.trailAt(id, t, m.hp, mob.maxHp)); }
             if (z >= 9 || id === target) { g.fillStyle = COLORS.text; g.font = font(10); const w = g.measureText(mob.name).width; g.fillText(mob.name, s.x - w / 2, Math.max(box[3], s.y + rad) + 11); }
             const hr = Math.max(rad + 3, (box[3] - box[1]) / 2, (box[2] - box[0]) / 2);
             this.hoverTargets.push({ x: (box[0] + box[2]) / 2, y: (box[1] + box[3]) / 2, r: hr, id, text: mob.name + " #" + id + " (" + m.x + "," + m.y + ") HP " + m.hp + "/" + mob.maxHp + " · " + mob.forecast });
         }
         const b = this.toScreen(me.x, me.y), vit = this.vitalsAt(t), sitting = act === "rest", br = Math.max(3.5, z * 0.5);
         if (target) { const m = this.mobAt(target, t), s = this.toScreen(m.x, m.y); g.strokeStyle = COLORS.target; g.globalAlpha = 0.6; g.lineWidth = 1.5; g.beginPath(); g.moveTo(b.x, b.y); g.lineTo(s.x, s.y); g.stroke(); g.globalAlpha = 1; }
-        const pl = this.player && Sprites.playerLayers(this.player, this.playerMoves, this.rp, t, me, b, act, target && this.mobAt(target, t), Math.max(22, Math.min(72, z * 2.6)));
+        const pl = this.player && Sprites.playerLayers(this.player, this.playerMoves, this.rp, t, me, b, act, target && this.mobAt(target, t), Math.max(z, 8) * 1.5 / 50);
         if (pl) { g.fillStyle = "#0008"; g.beginPath(); g.ellipse(b.x, b.y + 2, br * 1.6, br * 0.7, 0, 0, 7); g.fill(); drawLayers(g, pl); }
         else { g.fillStyle = COLORS.self; g.beginPath(); g.arc(b.x, b.y, br, 0, 7); g.fill(); g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.stroke(); }
         if (sitting) { g.fillStyle = "#9cd1ff"; g.font = font(12, true); g.fillText("z z", b.x + 6, b.y - 8); }
-        this.bar(g, b.x - 14, b.y + br + 3, 28, 4, vit.hp / this.rp.maxHp, "#198754");
+        Sprites.drawHpBar(g, b.x, b.y + br + 7, 28, 4, vit.hp / this.rp.maxHp, this.trailAt(0, t, vit.hp, this.rp.maxHp));
         this.bar(g, b.x - 14, b.y + br + 8, 28, 3, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff");
         this.hoverTargets.push({ x: b.x, y: b.y, r: br + 3, id: 0, text: "bot (" + me.cx + "," + me.cy + ") HP " + vit.hp + "/" + this.rp.maxHp + " SP " + vit.sp + "/" + this.rp.maxSp + " · " + ACTIVITY[act].label });
         const ev = this.rp.events;
-        const u = Math.max(22, Math.min(72, z * 2.6)) / 2.6;
-        for (let i = lastLE(ev, t, e => e.t); i >= 0 && ev[i].t > t - Sprites.INDICATOR_SECONDS; i--) {
+        // Damage numbers and the skill shout (sim-sprites.js, ported from the client; the minimap draws them the same way).
+        const sh = Math.max(22, Math.min(72, z * 2.6)), NV = { ctx: g, spriteHeight: sh * dpr() }, combos = new Set();
+        const num = (path, value, x, y, born, extra) => { const life = (t - born) / path.tween; if (life < 0 || life > 1) return; g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.textAlign = "center"; g.textBaseline = "alphabetic"; Sprites.drawNumber(NV, { path, value, x: x * dpr(), y: y * dpr(), ...extra }, life); g.restore(); }; // device pixels, exactly as the minimap draws
+        let shouted = false;
+        for (let i = lastLE(ev, t, e => e.t); i >= 0 && ev[i].t > t - 4; i--) {
             const e = ev[i], age = t - e.t; let x, y, txt, col;
-            if (e.kind === "hit" || e.kind === "hurt") { // client numbers: white on monsters, red on the player (ServerControllable.AttachDamageIndicator / AttachMissIndicator)
+            if (e.kind === "hit" || e.kind === "hurt") {
                 const m = this.mobAt(e.mob, e.kind === "hit" ? e.t : t), p = this.posAt(e.t); if (!m) continue;
-                const [vx, vy] = e.kind === "hit" ? [m, p] : [p, m], s = this.toScreen(vx.x, vx.y), miss = e.amount === 0, [fx, fy] = Sprites.flyAway(vx, vy);
-                Sprites.drawIndicator(g, miss ? "miss" : "damage", miss ? "Miss" : String(e.amount), e.kind === "hurt" ? "#f00" : "#fff", age, miss && e.kind === "hurt" ? b.x : s.x, miss && e.kind === "hurt" ? b.y : s.y, fx, -fy, u);
+                const ms = this.toScreen(m.x, m.y), my = ms.y - sh * 0.6;
+                if (e.kind === "hurt") { // on the player: red, one number per landing (as the minimap)
+                    if (e.amount === 0) num(Sprites.MISS_PATH, "Miss", b.x, b.y - sh * 0.6, e.t, { color: Sprites.RED });
+                    else num(Sprites.DAMAGE_PATH, e.amount, b.x, b.y - sh * 0.6, e.t, { dir: Math.sign(p.x - m.x) || 1, color: Sprites.RED });
+                    continue;
+                }
+                if (e.amount === 0) { num(Sprites.MISS_PATH, "Miss", ms.x, my, e.t); continue; }
+                // Double Attack: each hit 0.2 s apart, plus the yellow running total riding the monster; the newest total ends older ones.
+                const hits = Math.max(1, e.detail?.hits || 1), per = Math.round(e.amount / hits), dir = Math.sign(m.x - p.x) || 1;
+                for (let h = hits - 1; h >= 0; h--) {
+                    const born = e.t + Sprites.HIT_INTERVAL_MS / 1000 * h;
+                    num(Sprites.DAMAGE_PATH, per, ms.x, my, born, { dir });
+                    if (hits > 1 && born <= t && !combos.has(e.mob)) {
+                        combos.add(e.mob);
+                        const now = (e.hpLeft !== 0 && this.mobAt(e.mob, t)) || m, ns = this.toScreen(now.x, now.y);
+                        num(Sprites.COMBO_PATH, per * (h + 1), ns.x, ns.y - sh * 0.6, born);
+                    }
+                }
                 continue;
             }
-            else if (e.kind === "executed") { x = b.x; y = b.y - 14; txt = e.skill; col = "#69c0ff"; }
+            else if (e.kind === "executed") { // "Bash!!" for 3 s, like WorldMap.Shout / Unity's ShowSkillCastMessage(skill, 3)
+                if (!shouted && age <= 3 && !["Hiding", "Cloaking", "NoCast"].includes(e.skill)) { shouted = true; g.save(); Sprites.drawShout({ ctx: g, fs: 15 }, (this.skillNames?.[e.skill] || e.skill) + "!!", b.x, b.y - sh); g.restore(); }
+                continue;
+            }
+            else if (age > 1) continue;
             else if (e.kind === "rejected" || e.kind === "no-effect") { x = b.x; y = b.y - 14; txt = e.skill + (e.kind === "rejected" ? " refused" : " no effect"); col = "#ffa940"; }
             else if (e.kind === "regen" && sitting) { x = b.x + 14; y = b.y; txt = "+" + e.amount; col = "#73d13d"; }
             else if (e.kind === "death") { x = b.x; y = b.y; txt = "DIED"; col = "#ff4d4f"; }
@@ -382,6 +408,15 @@ class Viewer {
         g.fillStyle = COLORS.text; g.font = font(12, true); g.fillText(fmtT(t) + "  " + ACTIVITY[act].label, 16, 24);
         this.bar(g, 16, 32, 150, 8, vit.hp / this.rp.maxHp, "#198754"); g.font = font(10); g.fillStyle = COLORS.text; g.fillText("HP " + vit.hp + "/" + this.rp.maxHp, 172, 40);
         this.bar(g, 16, 46, 150, 6, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff"); g.fillStyle = COLORS.text; g.fillText("SP " + vit.sp + "/" + this.rp.maxSp, 172, 53);
+    }
+    /** Where the HP bar's white trail ends at t, replayed from the drops in the last 2 s (it drains in under 0.4 s), so
+     *  seeking and playing backwards show the same thing. */
+    trailAt(id, t, hp, maxHp) {
+        const l = this.drops.get(id), tr = {};
+        if (l) for (let i = lastLE(l, t - 2, d => d.t) + 1; i < l.length && l[i].t <= t; i++) {
+            Sprites.hpTrail(tr, l[i].before / maxHp, l[i].t); Sprites.hpTrail(tr, l[i].after / maxHp, l[i].t);
+        }
+        return Sprites.hpTrail(tr, hp / maxHp, t);
     }
     bar(g, x, y, w, h, f, col) { g.fillStyle = "#000c"; g.fillRect(x, y, w, h); g.fillStyle = col; g.fillRect(x, y, w * Math.max(0, Math.min(1, f)), h); }
 
