@@ -48,6 +48,7 @@ if (mode == "huntsim")
         Path.Combine(repo, "RoRebuildServer", "GameConfig", "ServerData", "Script", "Warps"));
     PlayerBuild build;
     string buildSource;
+    Appearance? look = null;
     if (File.Exists(args[2]))
     {
         build = System.Text.Json.JsonSerializer.Deserialize<PlayerBuild>(File.ReadAllText(args[2]), DuelStore.JsonOptions)!;
@@ -61,6 +62,7 @@ if (mode == "huntsim")
                 && (who.Length == 1 || string.Equals(r.Map, who[1], StringComparison.OrdinalIgnoreCase)))
             .MaxBy(r => r.EngagedAtUtc) ?? throw new ArgumentException($"no duel record with a build for '{args[2]}' in {duels}");
         build = record.Build!;
+        look = DuelStore.ReadAll(duels).Where(r => r.Character == record.Character && r.Look != null).MaxBy(r => r.EngagedAtUtc)?.Look; // older records have none
         buildSource = $"{record.Character}'s build recorded {record.EngagedAtUtc:yyyy-MM-dd HH:mm}Z on {record.Map}";
     }
     // The bot's saved BotBehaviorConfig from bot-configs.json, read by the store the live BotManager uses; --script
@@ -92,6 +94,7 @@ if (mode == "huntsim")
     if (replayAt > 0 && replayAt + 1 < args.Length)
     {
         var replay = sim.Replay(buildSource);
+        replay.Look = look;
         File.WriteAllText(args[replayAt + 1], System.Text.Json.JsonSerializer.Serialize(replay, HuntReplay.Json));
         Console.WriteLine($"Replay: {replay.Events.Count} events, {replay.Track.Count} steps -> {args[replayAt + 1]}");
     }

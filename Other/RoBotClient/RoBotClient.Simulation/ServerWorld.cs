@@ -67,8 +67,10 @@ public sealed record EncounterResult(int Outcome, double Seconds, int DamageTake
 /// <param name="Amount">hit: damage landed; regen: HP gained; executed: SP spent; reach: cells to walk.</param>
 /// <param name="Amount2">regen: SP gained; hit: damage results that landed (a 0-damage one is a miss).</param>
 /// <param name="HpLeft">hit: the entity's HP after it.</param>
+/// <summary>Motion: for hits, the server's attack motion time (DamageInfo.AttackMotionTime): the swing started that long before the
+/// damage landed. For a cast bar, Amount is its length in ms.</summary>
 public sealed record WorldEvent(double At, string Kind, string? Text, int Entity = 0, CharacterSkill Skill = CharacterSkill.None,
-    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1);
+    int Amount = 0, int Amount2 = 0, int HpLeft = -1, int X = -1, int Y = -1, double Motion = 0);
 
 /// <summary>The player's choice when it may act: an auto-attack, a skill packet (the bytes the live bot sends), or
 /// nothing yet (a pure caster with no rule ready re-decides a moment later).</summary>
@@ -168,8 +170,8 @@ public sealed class ServerWorld
     public Action<WorldEvent>? OnEvent;
 
     private void Emit(string kind, string? text, int entity = 0, CharacterSkill skill = CharacterSkill.None, int amount = 0, int amount2 = 0,
-        int hpLeft = -1, int x = -1, int y = -1) =>
-        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y));
+        int hpLeft = -1, int x = -1, int y = -1, double motion = 0) =>
+        OnEvent?.Invoke(new WorldEvent(Clock, kind, text, entity, skill, amount, amount2, hpLeft, x, y, motion));
 
     static ServerWorld()
     {
@@ -588,7 +590,7 @@ public sealed class ServerWorld
         {
             book.CastBars++;
             book.CastSeconds += self.CastingTime - Time.ElapsedTimeFloat;
-            Emit("castbar", $"{skill}: cast bar {self.CastingTime - Time.ElapsedTimeFloat:F2}s", skill: skill);
+            Emit("castbar", $"{skill}: cast bar {self.CastingTime - Time.ElapsedTimeFloat:F2}s", skill: skill, amount: (int)((self.CastingTime - Time.ElapsedTimeFloat) * 1000));
             return Effect.CastBar;
         }
         if (_player.Character.QueuedAction == QueuedAction.Cast && errors.Count == 0 && spent == 0)
@@ -645,10 +647,12 @@ public sealed class ServerWorld
         var total = 0;
         var pusher = CharacterSkill.None;
         var results = 0;
+        var motion = 0.0;
         foreach (var d in combat.DamageQueue)
         {
             if (d.Time > Time.ElapsedTimeFloat || !d.IsDamageResult) continue;
             results++;
+            motion = Math.Max(motion, d.AttackMotionTime);
             var damage = d.Damage * Math.Max(1, (int)d.HitCount) + Math.Max(0, (int)d.DamageOffHand);
             total += damage;
             left -= damage;
@@ -693,7 +697,7 @@ public sealed class ServerWorld
         }
         if (total > 0) DuelSimulator.MonsterLastDamageField.SetValue(monster, Time.ElapsedTimeFloat);
         if (results > 0) Emit("hit", null, monster.Character.Id, pusher, total, results, Math.Max(0, combat.GetStat(CharacterStat.Hp)),
-            monster.Character.Position.X, monster.Character.Position.Y);
+            monster.Character.Position.X, monster.Character.Position.Y, motion);
         return total;
     }
 
@@ -912,13 +916,14 @@ public sealed class ServerWorld
     private int LandOnPlayer(CombatEntity self)
     {
         int due = 0, results = 0;
+        var motion = 0.0;
         foreach (var d in self.DamageQueue)
-            if (d.Time <= Time.ElapsedTimeFloat && d.IsDamageResult) { due += d.Damage * Math.Max(1, (int)d.HitCount); results++; }
+            if (d.Time <= Time.ElapsedTimeFloat && d.IsDamageResult) { due += d.Damage * Math.Max(1, (int)d.HitCount); results++; motion = Math.Max(motion, d.AttackMotionTime); }
         if (due >= Hp)
         {
             self.SetStat(CharacterStat.Hp, 0);
             self.DamageQueue.Clear();
-            Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: 0);
+            Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: 0, motion: motion);
             return -1;
         }
         Time.ElapsedTimeFloat += (float)Epsilon; // UpdateDamageQueue applies what is strictly due
@@ -934,7 +939,7 @@ public sealed class ServerWorld
             Fail(CharacterSkill.None, "damage landing on the player (UpdateDamageQueue)", e, new List<string> { $"player HP set to {hp - due} without the failed step" });
         }
         finally { Time.ElapsedTimeFloat = (float)Clock; }
-        if (results > 0) Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: Hp);
+        if (results > 0) Emit("hit", null, PlayerId, amount: due, amount2: results, hpLeft: Hp, motion: motion);
         return due;
     }
 

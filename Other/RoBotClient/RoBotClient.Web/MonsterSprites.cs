@@ -24,11 +24,18 @@ public sealed class MonsterSprites
     /// Actions: motion * 8 + facing (idle 0, walk 8, attack 16, hit 24, dead 32), each with its frame delay (ms) and
     /// frames of layers [sprite index, x, y, mirror 0/1, scaleX, scaleY, alpha]; x/y place the layer's centre
     /// relative to the feet, y down (RO act coordinates, as Unity's SpriteMeshBuilder reads them).</summary>
-    public sealed record Anim(string Atlas, List<int[]> Rects, List<AnimAction> Actions);
+    public sealed record Anim(string Atlas, List<int[]> Rects, List<AnimAction> Actions)
+    {
+        /// <summary>When the swing connects (ms into Attack1 at normal speed): the client scales a monster's attack so this
+        /// frame lands on the server's motion time.</summary>
+        public int AttackFrameTime { get; init; }
+    }
     public sealed record AnimAction(int Delay, List<List<double[]>> Frames)
     {
         /// <summary>Per frame, the first "Pos" attach point [x, y] (where a head goes on a body); [0, 0] if none.</summary>
         public List<double[]> Anchors { get; } = new();
+        /// <summary>Per frame, the .imf flag: the body is in front, so the attached sprites (head, gear) draw behind it.</summary>
+        public List<bool> Foreground { get; } = new();
     }
 
     public Anim? GetAnim(string monsterName) =>
@@ -61,14 +68,8 @@ public sealed class MonsterSprites
             ? null
             : _portraits.GetOrAdd((isMale, job, head, color), _ =>
             {
-                var g = isMale ? "Male" : "Female";
-                if (!_bodySprites.Value.TryGetValue((isMale, job), out var bodyName) && !_bodySprites.Value.TryGetValue((isMale, 0), out bodyName))
-                    return null;
-                if (!_headSprites.Value.TryGetValue((isMale, head, color), out var headName) && !_headSprites.Value.TryGetValue((isMale, head, 0), out headName))
-                    return null;
-                var body = ReadAnim(Path.Combine(_charactersDir, "Body" + g), bodyName, $"player-atlas/Body{g}/{Uri.EscapeDataString(bodyName + "_atlas")}.png");
-                var hd = ReadAnim(Path.Combine(_charactersDir, "Head" + g), headName, $"player-atlas/Head{g}/{Uri.EscapeDataString(headName + "_atlas")}.png");
-                if (body?.Actions is not [{ Frames: [var bf, ..] } ba, ..] || hd?.Actions is not [{ Frames: [var hf, ..] } ha, ..])
+                if (GetPlayerAnim(isMale, job, head, color) is not { Body: var body, Head: var hd }
+                    || body.Actions is not [{ Frames: [var bf, ..] } ba, ..] || hd.Actions is not [{ Frames: [var hf, ..] } ha, ..])
                     return null;
                 double dx = ba.Anchors[0][0] - ha.Anchors[0][0], dy = ba.Anchors[0][1] - ha.Anchors[0][1];
                 var parts = new List<(Anim A, double[] L, double Dx, double Dy)>();
@@ -84,6 +85,23 @@ public sealed class MonsterSprites
                 return new Portrait(placed.Max(p => p.X + p.r[2]) - minX, placed.Max(p => p.Y + p.r[3]) - minY,
                     placed.Select(p => new PortraitPart(p.Atlas, p.r[0], p.r[1], p.r[2], p.r[3], p.X - minX, p.Y - minY, p.Mirror)).ToList());
             });
+
+    /// <summary>Body and head sprite actions of a player look (the Simulation tab animates the bot with them); not cached.</summary>
+    public sealed record PlayerAnim(Anim Body, Anim Head);
+
+    public PlayerAnim? GetPlayerAnim(bool isMale, int job, int head, int color)
+    {
+        if (_charactersDir.Length == 0)
+            return null;
+        var g = isMale ? "Male" : "Female";
+        if (!_bodySprites.Value.TryGetValue((isMale, job), out var bodyName) && !_bodySprites.Value.TryGetValue((isMale, 0), out bodyName))
+            return null;
+        if (!_headSprites.Value.TryGetValue((isMale, head, color), out var headName) && !_headSprites.Value.TryGetValue((isMale, head, 0), out headName))
+            return null;
+        var body = ReadAnim(Path.Combine(_charactersDir, "Body" + g), bodyName, $"player-atlas/Body{g}/{Uri.EscapeDataString(bodyName + "_atlas")}.png");
+        var hd = ReadAnim(Path.Combine(_charactersDir, "Head" + g), headName, $"player-atlas/Head{g}/{Uri.EscapeDataString(headName + "_atlas")}.png");
+        return body != null && hd != null ? new PlayerAnim(body, hd) : null;
+    }
 
     private static Dictionary<(bool, int), string> LoadBodySprites(string path)
     {
@@ -189,6 +207,7 @@ public sealed class MonsterSprites
         string? docId = null;
         double[] rect = new double[4];
         bool inPos = false, inSprites = false, anchorSet = false;
+        var attackFrameTime = 0;
         foreach (var raw in File.ReadLines(asset))
         {
             if (raw.StartsWith("--- "))
@@ -209,7 +228,9 @@ public sealed class MonsterSprites
             else if (line.StartsWith("width: ")) rect[2] = Num(line[7..]);
             else if (line.StartsWith("height: ")) { rect[3] = Num(line[8..]); rectById[docId ?? ""] = rect; }
             else if (line.StartsWith("- Delay: ")) actions.Add(new AnimAction((int)Num(line[9..]), new()));
-            else if (line == "- Layers:" && actions.Count > 0) { actions[^1].Frames.Add(frame = new()); actions[^1].Anchors.Add([0, 0]); inPos = false; anchorSet = false; }
+            else if (line == "- Layers:" && actions.Count > 0) { actions[^1].Frames.Add(frame = new()); actions[^1].Anchors.Add([0, 0]); actions[^1].Foreground.Add(false); inPos = false; anchorSet = false; }
+            else if (line == "IsForeground: 1" && actions.Count > 0 && actions[^1].Foreground.Count > 0) actions[^1].Foreground[^1] = true;
+            else if (line.StartsWith("AttackFrameTime: ")) attackFrameTime = (int)Num(line[17..]);
             else if (line.StartsWith("Pos:")) inPos = true;
             else if (line.StartsWith("- Position: ") && inPos && !anchorSet && actions.Count > 0)
             {
@@ -238,7 +259,7 @@ public sealed class MonsterSprites
         var rects = spriteIds.Select(id => rectById.TryGetValue(id, out var r)
             ? new[] { (int)r[0], textureHeight - (int)r[1] - (int)r[3], (int)r[2], (int)r[3] }
             : new[] { 0, 0, 0, 0 }).ToList();
-        return new Anim(atlasUrl, rects, actions);
+        return new Anim(atlasUrl, rects, actions) { AttackFrameTime = attackFrameTime };
 
         static double Num(string s) => double.Parse(s, CultureInfo.InvariantCulture);
         static (double, double) Vec(string s) // "{x: 1, y: -12}"

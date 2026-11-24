@@ -1,4 +1,5 @@
 using System.Text.Json;
+using RoBotClient.Simulation;
 using System.Text.Json.Serialization;
 
 namespace RoBotClient.Bot.Offline;
@@ -37,6 +38,9 @@ public sealed class HuntReplay
     public required List<string> Failures { get; init; }
     public required string Report { get; init; }
     public required string Fingerprint { get; init; }
+    /// <summary>The simulated build itself (job, equipment), and the character's look when its duel record had one: for drawing it.</summary>
+    public PlayerBuild? BuildSpec { get; init; }
+    public Appearance? Look { get; set; }
 }
 
 public sealed record ReplayMob(int Id, int ClassId, string Name, int Level, int Exp, int MaxHp, bool Pinned, int[] Area, string Respawn, string Forecast);

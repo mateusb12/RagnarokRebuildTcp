@@ -54,6 +54,8 @@ public sealed class DuelRecord
     /// <summary>The bot's enemy-targeted skill rules, as written in its script (what the policy can use).</summary>
     public List<string> SkillRules { get; set; } = new();
     public PlayerBuild? Build { get; set; }
+    /// <summary>The character's look, for drawing it (the dashboard's Simulation tab); nothing simulates it.</summary>
+    public Appearance? Look { get; set; }
     /// <summary>The build when the duel ended, recorded only when it differs from Build (the bot equipped a weapon,
     /// levelled up or learned a skill mid-fight): the duel then wasn't fought with the build it is replayed with.</summary>
     public PlayerBuild? BuildAtEnd { get; set; }
@@ -87,3 +89,6 @@ public sealed class DuelRecord
 
     public double? FirstActionAt => Actions.Count > 0 ? Actions[0].At : null;
 }
+
+/// <summary>Sex, hairstyle and hair colour, as the server sends them (the client draws the character from these).</summary>
+public sealed record Appearance(bool IsMale, int HeadType, int HairColor);

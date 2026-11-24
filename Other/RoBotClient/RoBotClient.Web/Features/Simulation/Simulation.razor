@@ -12,6 +12,7 @@
 @inject BotConfigStore Configs
 @inject IJSRuntime JS
 @inject NavigationManager Nav
+@inject SimSprites Sprites
 
 <PageTitle>Simulation - RagBot Control</PageTitle>
 
@@ -314,7 +315,16 @@
         if (!_mount || _replay == null) return;
         _mount = false;
         _module ??= await JS.InvokeAsync<IJSObjectReference>("import", $"./js/sim.js?v={ScriptVersion}");
-        await _module.InvokeVoidAsync("mount", _viewer, "sim-replay/" + Uri.EscapeDataString(_selected!));
+        await _module.InvokeVoidAsync("mount", _viewer, "sim-replay/" + Uri.EscapeDataString(_selected!), PlayerLook(_replay));
+    }
+
+    // The bot's sprites (SimSprites): the look recorded with the build, else the character's if it's logged in now.
+    private object? PlayerLook(HuntReplay rp)
+    {
+        var who = rp.BuildSource is { } src && src.IndexOf("'s build", StringComparison.Ordinal) is > 0 and var i ? src[..i] : null;
+        var live = who == null ? null : Bots.GetSnapshots().FirstOrDefault(s => s.CharacterName == who);
+        var look = live == null ? null : Bots.GetSession(live.Id)?.WithState(w => new RoBotClient.Simulation.Appearance(w.Self.IsMale, w.Self.HeadType, w.Self.HairColor));
+        return Sprites.Player(rp, look);
     }
 
     private RenderFragment Tile(string label, string value, string sub) => @<div class="sim-tile"><div class="l">@label</div><div class="v">@value</div><div class="l">@sub</div></div>;

@@ -4,6 +4,9 @@
 // drawn gliding across the cell it is stepping into (a step takes 0.15 s, 0.21 s diagonal).
 // World Y increases UPWARD (as map.js): screenY = (cy - y) * zoom + height / 2.
 
+const Sprites = await import("./sim-sprites.js" + new URL(import.meta.url).search); // visual-only sprite code
+const { animOf, drawLayers } = Sprites;
+
 const COLORS = {
     bg: "#10131a", walkable: "#3a4254", blocked: "#191c24", self: "#3b9dff", monster: "#e5484d", target: "#ffe066",
     route: "#ffe066", view: "rgba(203,210,220,0.18)", text: "#cbd2dc", dim: "#7c8493", area: "#c77dff",
@@ -39,7 +42,8 @@ const lastLE = (arr, t, key = x => x) => { let lo = 0, hi = arr.length - 1, r = 
 
 let current = null;
 
-export async function mount(root, url) {
+/** player: the bot's body and head sprite actions (MonsterSprites.PlayerAnim, camelCase), or null for a dot. */
+export async function mount(root, url, player) {
     if (current) current.stop();
     current = null;
     root.innerHTML = '<div class="text-secondary small py-3">Loading replay…</div>';
@@ -47,6 +51,8 @@ export async function mount(root, url) {
     try { const r = await fetch(url); if (!r.ok) throw new Error(r.status + " " + r.statusText); rp = await r.json(); }
     catch (e) { root.innerHTML = '<div class="alert alert-danger small">Could not load the replay: ' + esc(e.message) + "</div>"; return; }
     current = new Viewer(root, rp);
+    const v = current, P = await Sprites.loadPlayer(player);
+    if (P && v === current) { v.player = P; v.playerMoves = Sprites.indexPlayer(rp, P); }
 }
 
 class Viewer {
@@ -70,6 +76,7 @@ class Viewer {
         this.mobs = new Map(rp.mobs.map(m => [m.id, m]));
         this.mobLife = new Map();  // id -> [{t, alive, x, y}]
         this.mobHp = new Map();    // id -> [{t, hp}]
+        this.spriteIx = Sprites.indexMonsters(rp);
         const push = (map, id, v) => { let a = map.get(id); if (!a) map.set(id, a = []); a.push(v); };
         const die = (id, t) => { const l = this.mobLife.get(id); const p = l?.[l.length - 1]; if (p?.alive) push(this.mobLife, id, { t, alive: false, x: p.x, y: p.y }); };
         this.areas = [];           // {t0, t1, x, y, skill, text}
@@ -311,39 +318,59 @@ class Viewer {
         const sel = this.selected;
         const cand = sel && (sel.kind === "pick" || sel.kind === "nopick") && Math.abs(sel.t - t) < 1e-6 ? new Map(sel.detail.candidates.map(c => [c.mob, c])) : null;
         this.hoverTargets = [];
+        const now = t * 1000, list = [];
         for (const [id, mob] of this.mobs) {
             const m = this.mobAt(id, t); if (!m) continue;
+            if (!m.alive && t - m.diedAt >= 2) continue;
             const s = this.toScreen(m.x, m.y);
+            if (s.x < -60 || s.y < -60 || s.x > this.cw + 60 || s.y > this.ch + 60) continue;
+            list.push({ id, mob, m, s });
+        }
+        list.sort((a, b) => b.m.y - a.m.y); // nearer the bottom drawn on top, as the minimap
+        const spriteH = Math.max(22, Math.min(72, z * 2.6));
+        for (const { id, mob, m, s } of list) {
+            const a = animOf(mob.name), lay = a && Sprites.monsterLayers(this.spriteIx, a, id, m, t, me, s, spriteH);
             if (!m.alive) {
-                if (t - m.diedAt < 1.5) { g.globalAlpha = 1 - (t - m.diedAt) / 1.5; g.strokeStyle = COLORS.monster; g.lineWidth = 2; g.beginPath(); g.moveTo(s.x - rad, s.y - rad); g.lineTo(s.x + rad, s.y + rad); g.moveTo(s.x + rad, s.y - rad); g.lineTo(s.x - rad, s.y + rad); g.stroke(); g.globalAlpha = 1; }
+                if (lay) drawLayers(g, lay.layers);
+                else if (t - m.diedAt < 1.5) { g.globalAlpha = 1 - (t - m.diedAt) / 1.5; g.strokeStyle = COLORS.monster; g.lineWidth = 2; g.beginPath(); g.moveTo(s.x - rad, s.y - rad); g.lineTo(s.x + rad, s.y + rad); g.moveTo(s.x + rad, s.y - rad); g.lineTo(s.x - rad, s.y + rad); g.stroke(); g.globalAlpha = 1; }
                 continue;
             }
-            if (s.x < -20 || s.y < -20 || s.x > this.cw + 20 || s.y > this.ch + 20) continue;
-            g.fillStyle = mob.forecast.startsWith("win") ? COLORS.monster : "#7a2a2a"; g.beginPath(); g.arc(s.x, s.y, rad, 0, 7); g.fill();
-            if (id === target) { g.strokeStyle = COLORS.target; g.lineWidth = 2; g.beginPath(); g.arc(s.x, s.y, rad + 3, 0, 7); g.stroke(); }
-            if (id === this.selectedMob) { g.strokeStyle = "#fff"; g.lineWidth = 2; g.beginPath(); g.arc(s.x, s.y, rad + 6, 0, 7); g.stroke(); }
+            const win = mob.forecast.startsWith("win");
+            const box = lay ? lay.box : [s.x - rad, s.y - rad, s.x + rad, s.y + rad];
+            const ring = (col, r) => { g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); if (lay) g.ellipse(s.x, s.y, r + spriteH * 0.3, (r + spriteH * 0.3) * 0.45, 0, 0, 7); else g.arc(s.x, s.y, rad + r, 0, 7); g.stroke(); };
+            if (lay) { g.fillStyle = win ? "#0007" : "#e5484d99"; g.beginPath(); g.ellipse(s.x, s.y, spriteH * 0.3, spriteH * 0.13, 0, 0, 7); g.fill(); drawLayers(g, lay.layers); }
+            else { g.fillStyle = win ? COLORS.monster : "#7a2a2a"; g.beginPath(); g.arc(s.x, s.y, rad, 0, 7); g.fill(); }
+            if (id === target) ring(COLORS.target, 3);
+            if (id === this.selectedMob) ring("#fff", 6);
             const c = cand && cand.get(id);
             if (c) {
-                g.strokeStyle = c.verdict.startsWith("chosen") ? "#52c41a" : c.verdict.startsWith("too strong") ? "#ff4d4f" : c.verdict.startsWith("unreachable") ? "#ffa940" : "#bfbfbf";
-                g.lineWidth = 2; g.beginPath(); g.arc(s.x, s.y, rad + 4, 0, 7); g.stroke();
-                g.fillStyle = "#fff"; g.font = font(11, true); g.fillText(c.rank ? "#" + c.rank : "✕", s.x + rad + 4, s.y - rad);
+                ring(c.verdict.startsWith("chosen") ? "#52c41a" : c.verdict.startsWith("too strong") ? "#ff4d4f" : c.verdict.startsWith("unreachable") ? "#ffa940" : "#bfbfbf", 4);
+                g.fillStyle = "#fff"; g.font = font(11, true); g.fillText(c.rank ? "#" + c.rank : "✕", box[2] + 2, box[1] + 10);
             }
-            if (m.hp < mob.maxHp) this.bar(g, s.x - 10, s.y + rad + 2, 20, 3, m.hp / mob.maxHp, "#e5484d");
-            if (z >= 9 || id === target) { g.fillStyle = COLORS.text; g.font = font(10); g.fillText(mob.name, s.x + rad + 2, s.y + rad + 9); }
-            this.hoverTargets.push({ x: s.x, y: s.y, r: rad + 3, id, text: mob.name + " #" + id + " (" + m.x + "," + m.y + ") HP " + m.hp + "/" + mob.maxHp + " · " + mob.forecast });
+            if (m.hp < mob.maxHp) this.bar(g, s.x - 12, box[1] - 6, 24, 3, m.hp / mob.maxHp, "#e5484d");
+            if (z >= 9 || id === target) { g.fillStyle = COLORS.text; g.font = font(10); const w = g.measureText(mob.name).width; g.fillText(mob.name, s.x - w / 2, Math.max(box[3], s.y + rad) + 11); }
+            const hr = Math.max(rad + 3, (box[3] - box[1]) / 2, (box[2] - box[0]) / 2);
+            this.hoverTargets.push({ x: (box[0] + box[2]) / 2, y: (box[1] + box[3]) / 2, r: hr, id, text: mob.name + " #" + id + " (" + m.x + "," + m.y + ") HP " + m.hp + "/" + mob.maxHp + " · " + mob.forecast });
         }
         const b = this.toScreen(me.x, me.y), vit = this.vitalsAt(t), sitting = act === "rest", br = Math.max(3.5, z * 0.5);
         if (target) { const m = this.mobAt(target, t), s = this.toScreen(m.x, m.y); g.strokeStyle = COLORS.target; g.globalAlpha = 0.6; g.lineWidth = 1.5; g.beginPath(); g.moveTo(b.x, b.y); g.lineTo(s.x, s.y); g.stroke(); g.globalAlpha = 1; }
-        g.fillStyle = COLORS.self; g.beginPath(); g.arc(b.x, b.y, br, 0, 7); g.fill(); g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.stroke();
+        const pl = this.player && Sprites.playerLayers(this.player, this.playerMoves, this.rp, t, me, b, act, target && this.mobAt(target, t), Math.max(22, Math.min(72, z * 2.6)));
+        if (pl) { g.fillStyle = "#0008"; g.beginPath(); g.ellipse(b.x, b.y + 2, br * 1.6, br * 0.7, 0, 0, 7); g.fill(); drawLayers(g, pl); }
+        else { g.fillStyle = COLORS.self; g.beginPath(); g.arc(b.x, b.y, br, 0, 7); g.fill(); g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.stroke(); }
         if (sitting) { g.fillStyle = "#9cd1ff"; g.font = font(12, true); g.fillText("z z", b.x + 6, b.y - 8); }
         this.bar(g, b.x - 14, b.y + br + 3, 28, 4, vit.hp / this.rp.maxHp, "#198754");
         this.bar(g, b.x - 14, b.y + br + 8, 28, 3, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff");
         this.hoverTargets.push({ x: b.x, y: b.y, r: br + 3, id: 0, text: "bot (" + me.cx + "," + me.cy + ") HP " + vit.hp + "/" + this.rp.maxHp + " SP " + vit.sp + "/" + this.rp.maxSp + " · " + ACTIVITY[act].label });
         const ev = this.rp.events;
-        for (let i = lastLE(ev, t, e => e.t); i >= 0 && ev[i].t > t - 1; i--) {
+        const u = Math.max(22, Math.min(72, z * 2.6)) / 2.6;
+        for (let i = lastLE(ev, t, e => e.t); i >= 0 && ev[i].t > t - Sprites.INDICATOR_SECONDS; i--) {
             const e = ev[i], age = t - e.t; let x, y, txt, col;
-            if (e.kind === "hit") { const m = this.mobAt(e.mob, e.t); if (!m) continue; const s = this.toScreen(m.x, m.y); x = s.x; y = s.y; txt = e.amount === 0 ? "miss" : String(e.amount); col = e.skill ? "#9cd1ff" : "#fff"; }
-            else if (e.kind === "hurt") { x = b.x; y = b.y; txt = e.amount === 0 ? "miss" : String(e.amount); col = "#ff6b6b"; }
+            if (e.kind === "hit" || e.kind === "hurt") { // client numbers: white on monsters, red on the player (ServerControllable.AttachDamageIndicator / AttachMissIndicator)
+                const m = this.mobAt(e.mob, e.kind === "hit" ? e.t : t), p = this.posAt(e.t); if (!m) continue;
+                const [vx, vy] = e.kind === "hit" ? [m, p] : [p, m], s = this.toScreen(vx.x, vx.y), miss = e.amount === 0, [fx, fy] = Sprites.flyAway(vx, vy);
+                Sprites.drawIndicator(g, miss ? "miss" : "damage", miss ? "Miss" : String(e.amount), e.kind === "hurt" ? "#f00" : "#fff", age, miss && e.kind === "hurt" ? b.x : s.x, miss && e.kind === "hurt" ? b.y : s.y, fx, -fy, u);
+                continue;
+            }
             else if (e.kind === "executed") { x = b.x; y = b.y - 14; txt = e.skill; col = "#69c0ff"; }
             else if (e.kind === "rejected" || e.kind === "no-effect") { x = b.x; y = b.y - 14; txt = e.skill + (e.kind === "rejected" ? " refused" : " no effect"); col = "#ffa940"; }
             else if (e.kind === "regen" && sitting) { x = b.x + 14; y = b.y; txt = "+" + e.amount; col = "#73d13d"; }

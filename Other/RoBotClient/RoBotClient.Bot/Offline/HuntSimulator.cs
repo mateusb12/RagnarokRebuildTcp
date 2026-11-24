@@ -174,7 +174,8 @@ public sealed class HuntSimulator
             _ => e.Kind,
         };
         _events.Add(new ReplayEvent(e.At, kind, text, kind == "hurt" ? _fightTarget?.Id ?? 0 : mob?.Id ?? 0, e.X, e.Y, e.Amount, e.HpLeft, skill,
-            kind.StartsWith("area") ? new { entity = e.Entity } : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) } : null));
+            kind.StartsWith("area") ? new { entity = e.Entity } : kind == "no-effect" ? new { serverTarget = ServerWorld.DeclaredTarget(e.Skill) }
+            : e.Motion > 0 ? new { motion = Math.Round(e.Motion, 3) } : null)); // motion: the swing began that long before (sprites only)
         Vitals(e.At);
     }
 
@@ -952,6 +953,7 @@ public sealed class HuntSimulator
         return new HuntReplay
         {
             Map = _o.Map, Width = _walk.Width, Height = _walk.Height, Walk = walk.ToString(), Duration = _o.DurationSeconds, Seed = _o.Seed,
+            BuildSpec = b,
             Build = $"Lv {b.Level}/{b.JobLevel} job {b.JobId}, STR {b.Str} AGI {b.Agi} VIT {b.Vit} INT {b.Int} DEX {b.Dex} LUK {b.Luk}; "
                     + $"gear {string.Join(", ", b.Equipment.Select(e => _data.ItemName(e.ItemId)))}",
             BuildSource = buildSource,

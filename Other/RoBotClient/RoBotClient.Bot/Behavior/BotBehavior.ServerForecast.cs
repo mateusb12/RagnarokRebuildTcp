@@ -44,6 +44,7 @@ public sealed partial class BotBehavior
                 SkillRules = rules.Select(r => $"{r.Skill} {r.Level}" + (r.EveryCooldown > 0 ? $" every {r.EveryCooldown}" : "")
                     + (r.Conditions.Count > 0 ? " if " + string.Join(" and ", r.Conditions.Select(c => $"{c.Lhs} {c.Op} {c.Value}")) : "")).ToList(),
                 Build = build,
+                Look = _bot.WithState(w => new Appearance(w.Self.IsMale, w.Self.HeadType, w.Self.HairColor)),
                 Live = live,
                 OldForecast = new ForecastSummary(forecast.CanWin ? 1 : 0, forecast.AttacksToKill, forecast.SecondsToKillMonster,
                     forecast.ExpectedDamageTaken, DamagePerAction: forecast.ExpectedDamagePerSwing,
