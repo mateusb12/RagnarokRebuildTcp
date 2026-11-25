@@ -27,7 +27,10 @@ public sealed partial class BotBehavior
     {
         var d = ServerDistance(x, y, target.Pos.X, target.Pos.Y);
         return d > reach + 1 && d <= range && map.IsWalkable(x, y) && !InOtherFixedReach(snap, x, y, target.Id)
-               && !CellNearHazard(x, y) && map.HasLineOfSight(x, y, target.Pos.X, target.Pos.Y);
+               && !CellNearHazard(x, y) && map.HasLineOfSight(x, y, target.Pos.X, target.Pos.Y)
+               // Not on or next to a warp, nor across one: mjolnir_11 lands arrivals a cell from the prt_fild02 warp, and
+               // walking to shoot a Mandragora from inside it bounced Bot5 between the two maps for 3 hours.
+               && (_data == null || !_data.World.IsInPortalFootprint(snap.Map, x, y, margin: 1) && !PathCrossesPortal(snap.Map, snap.SelfPos, x, y));
     }
 
     /// <summary>Nearest cell to shoot <paramref name="target"/> from untouched: the bot's own cell when it already

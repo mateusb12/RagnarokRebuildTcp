@@ -427,7 +427,7 @@ public sealed partial class BotBehavior
         // Grab nearby drops before seeking a new target (we aren't committed to a live target here).
         if (_config.AutoLoot)
         {
-            var drop = _bot.WithState(w => NearestLoot(w, snap.SelfPos));
+            var drop = _bot.WithState(w => NearestLoot(w, snap.Map, snap.SelfPos));
             if (drop != 0)
             {
                 Mode = BotMode.Looting;
@@ -1465,7 +1465,7 @@ public sealed partial class BotBehavior
     private bool AnyAdjacentMonster(Snapshot snap, int range = 3, bool aggressiveOnly = false) =>
         HuntPolicy.AnyAdjacentMonster(_data, snap.Monsters, snap.SelfPos, range, aggressiveOnly, _bot.HasHitMe);
 
-    private int NearestLoot(WorldState w, Position self)
+    private int NearestLoot(WorldState w, string map, Position self)
     {
         var bestId = 0;
         var bestDist = int.MaxValue;
@@ -1474,6 +1474,9 @@ public sealed partial class BotBehavior
             if (_config.LootBlacklist.Contains(g.ItemId)) continue;
             if (_skipDrops.Contains(g.DropId)) continue;
             if (CellNearHazard(g.X, g.Y)) continue; // don't walk into danger for loot
+            // Nor into a warp: a Zenorc's drop by orcsdun02's landing cell bounced Bot1 orcsdun02 <-> in_orcs01, the pickup
+            // walk crossing the warp each time it came back.
+            if (_data != null && (_data.World.IsInPortalFootprint(map, g.X, g.Y, margin: 1) || PathCrossesPortal(map, self, g.X, g.Y))) continue;
             var d = Math.Max(Math.Abs(g.X - self.X), Math.Abs(g.Y - self.Y));
             if (d > _config.LootRange || d >= bestDist) continue;
             bestDist = d;
