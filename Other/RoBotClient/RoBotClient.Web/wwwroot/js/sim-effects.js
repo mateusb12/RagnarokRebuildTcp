@@ -3,7 +3,7 @@
 // plays them. Which effect a skill fires, on whom and when, is read from the client's skill handlers. Effects the client
 // builds in C# code (DefaultSkillCastEffect, HitEffect, CastEffect, HealEffect, ...) are not drawn here.
 // Everything is a function of replay time t, so seeking and playing backwards show the same frame.
-const { lastLE } = await import("./sim-sprites.js" + new URL(import.meta.url).search);
+const { lastLE, swingAt } = await import("./sim-sprites.js" + new URL(import.meta.url).search);
 
 // SkillHandlers/Handlers/**: ExecuteSkillTargeted -> CameraFollower.AttachEffectToEntity(name, target or caster).
 const ON_EXECUTE = {
@@ -13,9 +13,10 @@ const ON_EXECUTE = {
 // OnHitEffect -> SendElementalHitEffect (one per hit, 0.2 s apart) -> ServerControllable.OnMessageElementalHit's STR;
 // FireBolt: FireArrow attaches "firehit1" once per bolt, 12 frames apart.
 const ON_HIT = { LightningBolt: "WindHit", FireBolt: "firehit1", FireAttack: "firehit1", WindAttack: "WindHit", EarthAttack: "EarthHit", HolyAttack: "HolyHit" };
-// ArcherArrow: arrow2 flying from the shooter at 38-42 units/s to land with the hit. PacketAttack fires one per bow
-// auto-attack, DoubleStrafeHandler two (offset in height). ArrowShower/ChargeArrow ones are not drawn.
-const ARROWS = { auto: [0], DoubleStrafe: [-0.15, 0.15] }, ARROW_SPEED = 40, ARROW_MAX = 0.6; // s: 24 cells
+// ArcherArrow: arrow2 leaves the shooter once the client's (padded) attack motion is over - PacketAttack and
+// DoubleStrafeHandler pass motionTime as its ActiveDelay - and flies at 38-42 units/s, homing on the target. One per
+// bow auto-attack, two for DoubleStrafe (offset in height). ArrowShower/ChargeArrow ones are not drawn.
+const ARROWS = { auto: [0], DoubleStrafe: [-0.15, 0.15] }, ARROW_SPEED = 40;
 const arrowImg = new Image(); arrowImg.src = "client-texture/arrow2.png";
 const WINDOW = 4; // s; the longest effect wired here (LightningBolt) runs 130 frames at 60 fps
 
@@ -46,7 +47,8 @@ export function index(rp) {
         }
         if (e.kind === "hurt" && ex && e.mob) out.push({ t0: e.t - (e.detail?.motion || 0), name: ex[0], on: ex[1] === "self" ? e.mob : 0 }); // a monster's cast on the bot
         if (rp.bow && e.kind === "hit" && e.mob && ARROWS[e.skill ?? "auto"])
-            ARROWS[e.skill ?? "auto"].forEach((dy, k) => out.push({ t0: e.t - ARROW_MAX, land: e.t + 0.03 * k, dy, on: e.mob, arrow: true }));
+            { const m = e.detail?.motion || 0, go = swingAt(rp, e) + Math.min(m * 1.1, m + 0.1); // PacketAttack's motionTime padding
+              ARROWS[e.skill ?? "auto"].forEach((dy, k) => out.push({ t0: go + 0.03 * k, dy, on: e.mob, arrow: true })); }
         if ((e.kind === "hit" || e.kind === "hurt") && hit && e.amount > 0) {
             const on = e.kind === "hit" ? e.mob : 0, n = Math.max(1, e.detail?.hits || 1);
             for (let k = 0; k < n; k++) out.push({ t0: e.t + 0.2 * k, name: hit, on });
@@ -71,12 +73,12 @@ export function draw(g, v, list, t) {
     }
 }
 
-// Flight time from the bot's cell at landing to the target's: the arrow is drawn only while it flies, 2 units up
+// Flight time from the bot to the target at launch (t0): the arrow is drawn only while it flies, 2 units up
 // (ArcherArrow's offset, drawn screen-up), 61x8 px at 1/65 unit per px, tip (right of the texture) towards the target.
 function drawArrow(g, v, f, t, U) {
-    const m = v.mobAt(f.on, t), p = v.posAt(f.land); if (!m || !p || !arrowImg.complete || !arrowImg.naturalWidth) return;
-    const a = v.toScreen(p.x, p.y), b = v.toScreen(m.x, m.y), flight = Math.hypot(m.x - p.x, m.y - p.y) / ARROW_SPEED;
-    const k = 1 - (f.land - t) / flight; if (k < 0 || k > 1) return;
+    const m = v.mobAt(f.on, t), m0 = v.mobAt(f.on, f.t0), p = v.posAt(f.t0); if (!m || !m0 || !p || !arrowImg.complete || !arrowImg.naturalWidth) return;
+    const a = v.toScreen(p.x, p.y), b = v.toScreen(m.x, m.y), flight = Math.hypot(m0.x - p.x, m0.y - p.y) / ARROW_SPEED;
+    const k = (t - f.t0) / flight; if (!(k >= 0 && k <= 1)) return;
     const up = (1.5 + f.dy) * U, x = a.x + (b.x - a.x) * k, y = a.y + (b.y - a.y) * k - up;
     g.save(); g.translate(x, y); g.rotate(Math.atan2(b.y - a.y, b.x - a.x));
     const w = arrowImg.naturalWidth / 65 * U, h = Math.max(2, arrowImg.naturalHeight / 65 * U);

@@ -209,13 +209,20 @@ export async function loadPlayer(spec) {
 // capped at 1.5 s, against the 0.6 s a player sprite's attack is drawn for.
 const playerSpeed = m => m > 0 ? Math.min(1.5, Math.min(m * 1.1, m + 0.1)) / 0.6 : 1;
 
+/** When the bot's swing for a hit started: the hit lands motion seconds later, plus the arrow's flight for a bow
+ *  (server: CombatEntity.DamageHandling.cs / DoubleStrafeHandler.cs add distance / ServerConfig.ArrowTravelTime, 44 cells/s). */
+export function swingAt(rp, e) {
+    const tr = rp.track, p = tr[Math.max(0, lastLE(tr, e.t, s => s.t))];
+    return e.t - (e.detail?.motion || 0) - (rp.bow && e.x >= 0 && p ? Math.hypot(e.x - p.x, e.y - p.y) / 44 : 0);
+}
+
 /** The bot's one-shot motions from the replay, by start time: swings (auto-attack hits started motion seconds before
  *  they landed; skills on execution, per the client's handler), cast bars (held), flinches, deaths. */
 export function indexPlayer(rp, P) {
     const out = [], ev = rp.events, how = s => P.skills[s] || P.skills["*"] || { execute: "attack", cast: "standby" };
     for (let i = 0; i < ev.length; i++) {
         const e = ev[i];
-        if (e.kind === "hit" && e.mob && !e.skill) out.push({ t0: e.t - (e.detail?.motion || 0), motion: P.attack, speed: playerSpeed(e.detail?.motion) });
+        if (e.kind === "hit" && e.mob && !e.skill) out.push({ t0: swingAt(rp, e), motion: P.attack, speed: playerSpeed(e.detail?.motion) });
         else if (e.kind === "executed" && e.skill) {
             const h = how(e.skill).execute;
             if (h === "attack") { const hit = ev.slice(i + 1, i + 40).find(x => x.kind === "hit" && x.skill === e.skill && x.t - e.t < 3); out.push({ t0: e.t, motion: P.attack, speed: playerSpeed(hit?.detail?.motion || 0.6) }); }
