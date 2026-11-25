@@ -859,11 +859,18 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
             }
         }
 
+        // Never sell the job's own weapon while none is worn: an Archer out of arrows unequips its bow, and the
+        // sell trip that funded new arrows then sold the bow too (Bot5, 11-24).
+        var keepType = RequiredWeaponType.GetValueOrDefault(JobName(w.Self.JobId));
+        bool IsKeepType(int itemId) => keepType != null && _data?.Gear.TryGetValue(itemId, out var g) == true && g.Type == keepType;
+        var wearingKeepType = w.Self.Inventory.Any(i => equipped.Contains(i.BagId) && IsKeepType(i.ItemId));
+
         // Default: ShopPolicy decides what's junk worth selling.
         foreach (var it in w.Self.Inventory)
         {
             if (orders.Count >= 100) break; // stay well under the server's per-order line cap
             if (queuedBagIds.Contains(it.BagId)) continue; // already queued explicitly
+            if (!wearingKeepType && IsKeepType(it.ItemId)) continue;
             var def = _data?.Item(it.ItemId);
             if (ShopPolicy.ShouldSell(def, it, equipped.Contains(it.BagId), _config))
                 orders.Add((it.BagId, it.ItemId, it.Count));

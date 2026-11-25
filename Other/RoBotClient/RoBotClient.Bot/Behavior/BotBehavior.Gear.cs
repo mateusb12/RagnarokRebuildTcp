@@ -152,12 +152,12 @@ public sealed partial class BotBehavior
 
         if (owned.Count > 0)
         {
-            if (!needsArrows || arrows >= ArrowLow || spendable < arrowPrice * 10) return false;
+            if (!needsArrows || arrows >= ArrowLow) return false;
+            SetRestockTarget(ArrowItemId, ArrowStock); // a sell trip below buys them with the proceeds
             // The shop keeps the fare home (DoBuyAsync), so fares must fit too. Bot5 (1200z, home anthell01) passed the
             // 500z check, paid 1200z to Payon, bought nothing and walked back — every 6 min for hours, stuck at level 25.
-            spendable -= ShopTripFares(snap, ArrowItemId);
-            if (spendable < arrowPrice * 10) return false;
-            SetRestockTarget(ArrowItemId, ArrowStock);
+            if (spendable >= arrowPrice * 10) spendable -= ShopTripFares(snap, ArrowItemId);
+            if (spendable < arrowPrice * 10) return SellLootForGear($"{zeny}z can't buy arrows");
             return TryBuyGear(new[] { (ArrowItemId, Math.Min(ArrowStock - arrows, spendable / arrowPrice)) }, $"the {job}'s bow needs arrows");
         }
 
@@ -174,7 +174,7 @@ public sealed partial class BotBehavior
                 _nextJobWeaponWarning = DateTime.UtcNow.AddMinutes(5);
                 OnLog?.Invoke($"Gear: no {requiredType?.ToLowerInvariant() ?? "weapon"} for a {job} and can't afford one yet ({zeny}z) — hunting with what it has.");
             }
-            return false;
+            return SellLootForGear($"{zeny}z can't buy a {requiredType?.ToLowerInvariant() ?? "weapon"}");
         }
         var price = _data.Item(pick.Id)!.Price;
         var buy = new List<(int, int)> { (pick.Id, 1) };
@@ -185,6 +185,19 @@ public sealed partial class BotBehavior
             SetRestockTarget(ArrowItemId, ArrowStock);
         }
         return TryBuyGear(buy, $"a {job} needs a {requiredType?.ToLowerInvariant() ?? "weapon"}: {_data.ItemName(pick.Id)}, atk {pick.Power}, {price}z");
+    }
+
+    // Broke but carrying loot: sell now instead of waiting for the 90% weight trigger. Bot5 sat at 500z with its bag
+    // 55% full of Jellopy and Sticky Mucus, knifing monsters for a day because arrows were out of reach and no sell
+    // trip ever came. The forced trip sells first, then buys restock targets (arrows) with the proceeds.
+    private DateTime _nextGearSell;
+    private bool SellLootForGear(string why)
+    {
+        if (DateTime.UtcNow < _nextGearSell || CountSaleableItems() < Math.Max(1, _config.JunkSellCount / 2)) return false;
+        _nextGearSell = DateTime.UtcNow.AddMinutes(10); // ponytail: a trip that still can't afford it won't loop faster than this
+        OnLog?.Invoke($"Gear: selling loot first ({why}).");
+        _forceShop = true;
+        return true;
     }
 
     private static string SlotLabel(EquipSlot s) => s switch
