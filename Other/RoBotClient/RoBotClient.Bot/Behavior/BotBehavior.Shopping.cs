@@ -25,6 +25,8 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     private int _shopX, _shopY;
     private string _shopNpcName = "";
     private int _shopSteps;
+    private int _shopStops; // vendors visited on this custom-buy trip
+    private const int MaxShopStops = 4; // ponytail: caps a trip on stale vendor data; raise if bots buy from more shops
     private DateTime _shopDeadline;
     private DateTime _shopNextAction;
     private DateTime _shopCooldownUntil = DateTime.MinValue;
@@ -207,7 +209,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
 
     private bool ShopTripActive => _shopPhase != ShopPhase.None;
 
-    /// <summary>Queue a one-shot custom buy at the nearest trader that stocks the first item in the list.
+    /// <summary>Queue a one-shot custom buy: the nearest trader stocking any listed item, then the next for what's left.
     /// Triggers a shop trip on the next tick that overrides the auto-restock loop.</summary>
     public void RequestBuyItems(IEnumerable<(int itemId, int qty)> items)
     {
@@ -350,11 +352,12 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         // Custom one-shot manifests (from MCP buy_item / sell_item) take priority over the auto-shop logic.
         if (_customBuyItems != null || _customSellItems != null)
         {
-            var requireItem = _customBuyItems != null && _customBuyItems.Count > 0 ? _customBuyItems[0].itemId : 0;
-            if (!ResolveShop(snap.Map, requireItem))
+            var required = _customBuyItems?.Select(b => b.itemId).ToList() ?? new List<int>();
+            _shopStops = 0;
+            if (!ResolveShop(snap.Map, required))
             {
-                OnLog?.Invoke(requireItem > 0
-                    ? $"Custom shop: no reachable trader stocks item #{requireItem} — aborting."
+                OnLog?.Invoke(required.Count > 0
+                    ? $"Custom shop: no reachable trader stocks {string.Join(", ", required.Select(_data!.ItemName))} — aborting."
                     : "Custom shop: no reachable trader — aborting.");
                 _customBuyItems = null;
                 _customSellItems = null;
@@ -648,6 +651,18 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
                     _shopSteps = 0;
                     _shopPhase = ShopPhase.Approach; // re-click the same NPC for the next goal
                 }
+                // Custom buy items this vendor doesn't stock (a shield at the Weapon Dealer): on to the next vendor.
+                else if (_customBuyItems is { Count: > 0 } rest && ++_shopStops < MaxShopStops
+                         && ResolveShop(snap.Map, rest.Select(b => b.itemId).ToList()))
+                {
+                    _shopGoal = ShopGoal.Buy;
+                    _shopOrderSent = false;
+                    _shopSteps = 0;
+                    _shopPhase = ShopPhase.Travel;
+                    _shopDeadline = ShopTripDeadline();
+                    _shopNextAction = DateTime.MinValue;
+                    OnLog?.Invoke($"AutoShop: next stop {_shopNpcName} in {_data!.MapName(_shopMap)} ({_shopMap}) for {string.Join(", ", rest.Select(b => _data.ItemName(b.itemId)))}.");
+                }
                 else
                 {
                     _shopPhase = ShopPhase.ReturnTravel;
@@ -684,6 +699,8 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
                 zeny -= buy * p;
                 _bot.Telemetry.Record(TelemetryEventType.Bought, snap.SelfLevel, _data?.ItemName(itemId) ?? $"#{itemId}", buy);
             }
+            // Whatever this vendor stocks is settled here (bought, or unaffordable); the rest goes to the next stop.
+            _customBuyItems.RemoveAll(b => npc.ShopItems.Any(s => s.Item1 == b.itemId));
             if (lines.Count == 0)
             {
                 OnLog?.Invoke("Custom buy: shop doesn't stock the requested item(s), or not enough zeny.");

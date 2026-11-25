@@ -111,13 +111,18 @@ public sealed partial class BotBehavior
         if (TryBuyJobWeapon(snap, job, inv.Select(i => i.ItemId), arrows, zeny)) return;
         var budget = zeny - GearZenyReserve;
 
+        // One trip buys everything affordable: arrows, then the best upgrade per slot (weapon first). Buying one item per
+        // trip walked Bot5 from its hunting map to Morroc and back for 400z Sandals right after a Cross Bow run.
+        var buys = new List<(int ItemId, int Qty)>();
+        var whys = new List<string>();
         if (preferred?.Contains("Bow") == true && arrows < ArrowLow && budget > 0)
         {
             SetRestockTarget(1750, ArrowStock); // later natural shop trips keep the quiver full
-            if (TryBuyGear(1750, Math.Min(ArrowStock - arrows, budget), "bow needs arrows")) return;
+            var qty = Math.Min(ArrowStock - arrows, budget / Math.Max(1, _data.Item(1750)?.Price ?? 1));
+            if (qty > 0) { buys.Add((1750, qty)); whys.Add("bow needs arrows"); budget -= qty * (_data.Item(1750)?.Price ?? 1); }
         }
 
-        var upgrade = _data.Gear.Values
+        var upgrades = _data.Gear.Values
             .Where(g => SlotOf(g) is { } s && !(s == EquipSlot.LeftHand && twoHanded))
             .Select(g => (g, item: _data.Item(g.Id), slot: SlotOf(g)!.Value, score: Score(g, 0))) // bows wait until arrows arrive
             .Where(c => c.item?.SoldBy is { Count: > 0 } && c.item.Price <= budget && c.score is { } sc
@@ -125,10 +130,16 @@ public sealed partial class BotBehavior
                         && c.g.Power > 0 // cosmetic gear (Flu Mask, def 0) is never worth a trip
                         && _gearBuyRetryAt.GetValueOrDefault(c.g.Id) < DateTime.UtcNow)
             .OrderBy(c => c.slot != EquipSlot.RightHand) // weapon first, then armor
-            .ThenByDescending(c => c.score)
-            .FirstOrDefault();
-        if (upgrade.item != null)
-            TryBuyGear(upgrade.g.Id, 1, $"{SlotLabel(upgrade.slot)} upgrade, {(upgrade.slot == EquipSlot.RightHand ? "atk" : "def")} {upgrade.g.Power}, {upgrade.item.Price}z");
+            .ThenByDescending(c => c.score);
+        var slotsTaken = new HashSet<EquipSlot>();
+        foreach (var c in upgrades)
+        {
+            if (c.item!.Price > budget || !slotsTaken.Add(c.slot)) continue; // best affordable one per slot
+            budget -= c.item.Price;
+            buys.Add((c.g.Id, 1));
+            whys.Add($"{SlotLabel(c.slot)} upgrade, {(c.slot == EquipSlot.RightHand ? "atk" : "def")} {c.g.Power}, {c.item.Price}z");
+        }
+        if (buys.Count > 0) TryBuyGear(buys, string.Join("; ", whys));
     }
 
     // The bare minimum before any other gear: a weapon of the job's own kind. An Archer needs a bow (and arrows, or the bow
@@ -220,11 +231,11 @@ public sealed partial class BotBehavior
 
     private bool TryBuyGear(int itemId, int qty, string why) => TryBuyGear(new[] { (itemId, qty) }, why);
 
-    // The first item picks the vendor (it must stock it); the rest are bought there too when it has them.
+    // The trip goes to the nearest vendor stocking any of them, then on to the next for what's left (StartShopTrip / TickConverseAsync).
     private bool TryBuyGear(IReadOnlyList<(int ItemId, int Qty)> items, string why)
     {
         if (items.Count == 0 || items[0].Qty <= 0) return false;
-        _gearBuyRetryAt[items[0].ItemId] = DateTime.UtcNow.AddMinutes(10); // unreachable vendor / failed trip: don't loop on it
+        foreach (var (id, _) in items) _gearBuyRetryAt[id] = DateTime.UtcNow.AddMinutes(10); // unreachable vendor / failed trip: don't loop on it
         OnLog?.Invoke($"Gear: buying {string.Join(" + ", items.Select(i => $"{i.Qty}x {_data!.ItemName(i.ItemId)}"))} ({why}).");
         RequestBuyItems(items);
         _customBuyWhy = why;
