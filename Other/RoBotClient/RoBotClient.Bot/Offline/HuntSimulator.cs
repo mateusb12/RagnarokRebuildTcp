@@ -182,7 +182,6 @@ public sealed class HuntSimulator
     }
 
     private string Name(Mob m) => m.Db.Name;
-    private static int Dist(int x0, int y0, int x1, int y1) => Math.Max(Math.Abs(x0 - x1), Math.Abs(y0 - y1));
     /// <summary>A trace line, and the same line as a replay event of &lt;paramref name="kind"/&gt; with what the decision saw.</summary>
     private void Log(string s, string kind = "note", int mob = 0, object? detail = null, int x = -1, int y = -1)
     {

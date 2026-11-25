@@ -105,7 +105,7 @@ public sealed partial class BotBehavior
         if (_kiteSweetSpot < 1) return false; // outranged / unkiteable — let parent FSM melee-fall back
 
         // Sample current gap; the dance-bug detector reads from this ring buffer.
-        var distNow = ChebyshevDist(snap.SelfPos, target.Pos);
+        var distNow = Dist(snap.SelfPos, target.Pos);
         PushDistanceSample(distNow);
 
         // Gap-closing detection. If positive (gap shrinking despite kiting), switch to Suspended.
@@ -281,7 +281,7 @@ public sealed partial class BotBehavior
             if (m.Hp <= 0) continue;
             var db = _data.Monster(m.ClassId);
             var range = db?.Range ?? 1;
-            var d = Math.Max(Math.Abs(m.Pos.X - cx), Math.Abs(m.Pos.Y - cy));
+            var d = Dist(m.Pos.X, m.Pos.Y, cx, cy);
             if (d <= range + 1) return true;
         }
         return false;
@@ -304,7 +304,7 @@ public sealed partial class BotBehavior
             if (!IsMonsterImmobile(db)) continue;
             var range = db?.Range ?? 1;
             if (range < 2) continue; // melee plant has no projectile zone to dodge
-            var d = Math.Max(Math.Abs(m.Pos.X - sx), Math.Abs(m.Pos.Y - sy));
+            var d = Dist(m.Pos.X, m.Pos.Y, sx, sy);
             if (d <= range) return true;
         }
         return false;
@@ -364,12 +364,12 @@ public sealed partial class BotBehavior
                 for (var i = 0; i < hostiles.Count; i++)
                 {
                     var h = hostiles[i];
-                    var hd = Math.Max(Math.Abs(h.x - cx), Math.Abs(h.y - cy));
+                    var hd = Dist(h.x, h.y, cx, cy);
                     if (hd <= h.range) { safe = false; break; }
                 }
                 if (!safe) continue;
                 // Score: walk distance from current cell — minimise the relocation step.
-                var score = Math.Max(Math.Abs(cx - self.X), Math.Abs(cy - self.Y));
+                var score = Dist(cx, cy, self.X, self.Y);
                 if (score < bestScore) { bestScore = score; bestX = cx; bestY = cy; }
             }
             if (bestScore != int.MaxValue) { gx = bestX; gy = bestY; return true; }
@@ -402,7 +402,4 @@ public sealed partial class BotBehavior
         var slope = (distNow - oldest.dist) / dt;
         return slope < -0.3;
     }
-
-    private static int ChebyshevDist(Position a, Position b) =>
-        Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
 }

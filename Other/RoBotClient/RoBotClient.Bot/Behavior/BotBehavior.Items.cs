@@ -182,14 +182,7 @@ public sealed partial class BotBehavior
             if (!allMatch) continue;
 
             // Item must be in inventory + useable (sending an unknown id disconnects the player).
-            var ok = _bot.WithState(w =>
-            {
-                if (_data != null && !_data.IsUsableItem(rule.ItemId)) return false;
-                foreach (var it in w.Self.Inventory)
-                    if (it.ItemId == rule.ItemId && it.Count > 0) return true;
-                return false;
-            });
-            if (!ok) continue;
+            if (!HasUsableItem(rule.ItemId)) continue;
 
             if (rule.EveryCooldown > 0)
                 _itemRuleCooldown[rule.ItemId] = DateTime.UtcNow.AddSeconds(rule.EveryCooldown);

@@ -106,7 +106,7 @@ public sealed partial class BotBehavior
         {
             case KafraStep.WalkToNpc:
             {
-                var dist = Math.Max(Math.Abs(npcX - snap.SelfPos.X), Math.Abs(npcY - snap.SelfPos.Y));
+                var dist = Dist(npcX, npcY, snap.SelfPos.X, snap.SelfPos.Y);
                 if (dist <= 3)
                 {
                     _kafraStep = KafraStep.ClickNpc;
@@ -248,7 +248,7 @@ public sealed partial class BotBehavior
         foreach (var e in w.Entities.Values)
         {
             if (!e.IsNpc) continue;
-            var d = Math.Max(Math.Abs(e.Position.X - kx), Math.Abs(e.Position.Y - ky));
+            var d = Dist(e.Position.X, e.Position.Y, kx, ky);
             if (d <= 2 && d < bestD) { bestD = d; best = e.Id; }
         }
         return best;

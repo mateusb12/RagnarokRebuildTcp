@@ -247,7 +247,7 @@ public sealed partial class BotBehavior
     private async Task<bool> TryEmergencyFlyWingAsync(Snapshot snap, CancellationToken ct)
     {
         if (snap.SelfMaxHp <= 0 || snap.SelfHp >= snap.SelfMaxHp * 0.25 || !Ambushed(snap, out var hurt)) return false;
-        if (!EscapeWingReady || !CanUseWing(_config.FlyWingItemId)) return false;
+        if (!EscapeWingReady || !HasUsableItem(_config.FlyWingItemId)) return false;
         OnLog?.Invoke($"Emergency: {hurt} — using a Fly Wing to get out.");
         ClearTarget();
         await UseEscapeWingAsync(_config.FlyWingItemId, 3, ct);
@@ -297,7 +297,7 @@ public sealed partial class BotBehavior
                 var hurt = Ambushed(snap, out var why) || KillsMeFast(snap, hz.name, nearestD, hz.radius, out why);
                 return (hurt, why);
             },
-            canFlyWing: () => EscapeWingReady && CanUseWing(_config.FlyWingItemId));
+            canFlyWing: () => EscapeWingReady && HasUsableItem(_config.FlyWingItemId));
         switch (flee.Kind)
         {
             case FleeKind.FlyWing:

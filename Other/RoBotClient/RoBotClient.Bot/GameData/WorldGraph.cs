@@ -491,6 +491,6 @@ public sealed class WorldGraph
 
     private static float ChebyshevDist(int ax, int ay, int bx, int by)
     {
-        return Math.Max(Math.Abs(ax - bx), Math.Abs(ay - by));
+        return Dist(ax, ay, bx, by);
     }
 }

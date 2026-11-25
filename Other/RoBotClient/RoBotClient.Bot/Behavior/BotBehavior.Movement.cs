@@ -16,23 +16,7 @@ public sealed partial class BotBehavior
     /// a portal cell (Shopping.cs reachable-portal checks). Including portal avoidance would inflate
     /// every portal's path cost since the destination IS a portal. Hazards still apply because we still
     /// want to walk around aggressive mobs on the way to the portal.</summary>
-    private Func<int, int, float>? MakeHazardOnlyCost()
-    {
-        var hz = HazardZones();
-        if (hz.Count == 0) return null;
-        return (x, y) =>
-        {
-            var cost = 0f;
-            for (var i = 0; i < hz.Count; i++)
-            {
-                var h = hz[i];
-                var d = Math.Max(Math.Abs(h.x - x), Math.Abs(h.y - y));
-                if (d <= h.radius) cost += 8f;
-                else if (d <= h.radius + 3) cost += 2f;
-            }
-            return cost;
-        };
-    }
+    private Func<int, int, float>? MakeHazardOnlyCost() => HuntPolicy.PathCost(_data, "", HazardZones(), portalBuffer: 0);
 
     /// <summary>Build a per-cell extra-cost closure for WalkMap.FindPath. Combines the visible hazard
     /// list (mob aggro cones) and the static portal layout (so the bot doesn't path through warp cells
@@ -212,7 +196,7 @@ public sealed partial class BotBehavior
         var best = int.MaxValue;
         foreach (var p in _data!.PortalsOn(map))
         {
-            var d = Math.Max(Math.Abs(p.X - self.X), Math.Abs(p.Y - self.Y));
+            var d = Dist(p.X, p.Y, self.X, self.Y);
             if (d <= within && d < best) { best = d; px = p.X; py = p.Y; }
         }
         return best != int.MaxValue;
@@ -221,7 +205,7 @@ public sealed partial class BotBehavior
     // True if the straight line from `from` to (tx,ty) steps onto any real warp footprint.
     private bool PathCrossesPortal(string map, Position from, int tx, int ty)
     {
-        var steps = Math.Max(Math.Abs(tx - from.X), Math.Abs(ty - from.Y));
+        var steps = Dist(tx, ty, from.X, from.Y);
         for (var i = 1; i <= steps; i++)
         {
             var x = from.X + (tx - from.X) * i / steps;

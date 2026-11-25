@@ -45,7 +45,7 @@ public sealed partial class BotBehavior
             // Nor into a warp: a Zenorc's drop by orcsdun02's landing cell bounced Bot1 orcsdun02 <-> in_orcs01, the pickup
             // walk crossing the warp each time it came back.
             if (_data != null && (_data.World.IsInPortalFootprint(map, g.X, g.Y, margin: 1) || PathCrossesPortal(map, self, g.X, g.Y))) continue;
-            var d = Math.Max(Math.Abs(g.X - self.X), Math.Abs(g.Y - self.Y));
+            var d = Dist(g.X, g.Y, self.X, self.Y);
             if (d > _config.LootRange || d >= bestDist) continue;
             bestDist = d;
             bestId = g.DropId;

@@ -222,7 +222,7 @@ public sealed partial class BotBehavior
             // Don't chase a mob standing on a portal apron — same safety as solo PickTarget.
             if (_config.PortalSafeDistance > 0 && _data != null
                 && _data.IsNearPortal(snap.Map, m.Pos.X, m.Pos.Y, _config.PortalSafeDistance)) continue;
-            var distToLeader = Math.Max(Math.Abs(m.Pos.X - leaderPos.X), Math.Abs(m.Pos.Y - leaderPos.Y));
+            var distToLeader = Dist(m.Pos.X, m.Pos.Y, leaderPos.X, leaderPos.Y);
             if (distToLeader > NearLeaderRadius) continue;
             // Force-hunt mirrors the solo PickTarget override: operator's allowlist beats the forecast veto.
             if (!_config.ForceHuntClassIds.Contains(m.ClassId) && !Forecast(snap, m).CanWin) continue;
@@ -299,7 +299,7 @@ public sealed partial class BotBehavior
     {
         ClearTarget();
         var (followX, followY) = ComputeFollowCell(leaderPos);
-        var dist = Math.Max(Math.Abs(snap.SelfPos.X - followX), Math.Abs(snap.SelfPos.Y - followY));
+        var dist = Dist(snap.SelfPos.X, snap.SelfPos.Y, followX, followY);
         if (dist > FollowRadius)
         {
             Mode = BotMode.Following;

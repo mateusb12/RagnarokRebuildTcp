@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using static RoBotClient.Bot.Grid;
 using ModelContextProtocol.Server;
 using RoBotClient.Bot.GameData;
 using RoBotClient.Bot.Manager;
@@ -69,7 +70,7 @@ public static class McpNpcTools
             foreach (var e in w.Entities.Values)
             {
                 if (!e.IsNpc) continue;
-                var dist = Math.Max(Math.Abs(e.Position.X - sx), Math.Abs(e.Position.Y - sy));
+                var dist = Dist(e.Position.X, e.Position.Y, sx, sy);
                 list.Add((dist, new { entityId = e.Id, name = e.Name, x = e.Position.X, y = e.Position.Y, dist }));
             }
             list.Sort((a, b) => a.dist.CompareTo(b.dist));
@@ -104,7 +105,7 @@ public static class McpNpcTools
                     if (!ev.IsNpc) continue;
                     if (ev.Name == null) continue;
                     if (ev.Name.IndexOf(namePattern, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    var d = Math.Max(Math.Abs(ev.Position.X - sx), Math.Abs(ev.Position.Y - sy));
+                    var d = Dist(ev.Position.X, ev.Position.Y, sx, sy);
                     if (d < bestDist) { bestDist = d; best = ev; }
                 }
                 if (best != null) return (best.Id, best.Name);

@@ -123,15 +123,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     }
 
     /// <summary>Inventory count of <paramref name="itemId"/> across all stacks (equipped excluded).</summary>
-    private int CountInInventory(int itemId) => _bot.WithState(w =>
-    {
-        var equipped = new HashSet<int>();
-        foreach (var b in w.Self.EquippedBagIds) if (b != 0) equipped.Add(b);
-        var n = 0;
-        foreach (var it in w.Self.Inventory)
-            if (it.ItemId == itemId && !equipped.Contains(it.BagId)) n += it.Count;
-        return n;
-    });
+    private int CountInInventory(int itemId) => _bot.WithState(w => w.Self.UnequippedCount(itemId));
 
     /// <summary>True when the restock list has any item below its target AND at least one reachable
     /// trader sells one of those shortfall items. Used by ShouldStartShopTrip as an extra trigger.</summary>
@@ -178,13 +170,11 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         // Find a (bagId, available) we can pull from.
         var match = _bot.WithState(w =>
         {
-            var equipped = new HashSet<int>();
-            foreach (var b in w.Self.EquippedBagIds) if (b != 0) equipped.Add(b);
             (int bagId, int count) best = (0, 0);
             foreach (var it in w.Self.Inventory)
             {
                 if (it.ItemId != req.itemId) continue;
-                if (equipped.Contains(it.BagId)) continue;
+                if (w.Self.IsEquipped(it.BagId)) continue;
                 if (best.bagId == 0 || it.BagId < best.bagId) best = (it.BagId, it.Count);
             }
             return best;
@@ -336,13 +326,11 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     private int CountSaleableItems() => _bot.WithState(w =>
     {
         if (_data == null) return 0;
-        var equipped = new HashSet<int>();
-        foreach (var bagId in w.Self.EquippedBagIds) if (bagId != 0) equipped.Add(bagId);
         var n = 0;
         foreach (var it in w.Self.Inventory)
         {
             var def = _data.Item(it.ItemId);
-            if (ShopPolicy.ShouldSell(def, it, equipped.Contains(it.BagId), _config)) n++;
+            if (ShopPolicy.ShouldSell(def, it, w.Self.IsEquipped(it.BagId), _config)) n++;
         }
         return n;
     });
@@ -367,12 +355,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
             _shopGoals.Clear();
             if (_customSellItems != null) _shopGoals.Enqueue(ShopGoal.Sell);
             if (_customBuyItems != null) _shopGoals.Enqueue(ShopGoal.Buy);
-            _shopGoal = _shopGoals.Dequeue();
-            _shopOrderSent = false;
-            _shopSteps = 0;
-            _shopPhase = ShopPhase.Travel;
-            _shopDeadline = ShopTripDeadline();
-            _shopNextAction = DateTime.MinValue;
+            BeginShopLeg(_shopGoals.Dequeue());
             var customWhat = _customSellItems != null && _customBuyItems != null ? "sell + buy"
                 : _customSellItems != null ? "sell" : "buy";
             OnLog?.Invoke($"Custom shop trip: heading to {_data!.MapName(_shopMap)} ({_shopMap}) to {customWhat} at '{_shopNpcName}'.");
@@ -426,12 +409,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         if (needSell) _shopGoals.Enqueue(ShopGoal.Sell);
         if (needBuy) _shopGoals.Enqueue(ShopGoal.Buy);
 
-        _shopGoal = _shopGoals.Dequeue();
-        _shopOrderSent = false;
-        _shopSteps = 0;
-        _shopPhase = ShopPhase.Travel;
-        _shopDeadline = ShopTripDeadline();
-        _shopNextAction = DateTime.MinValue;
+        BeginShopLeg(_shopGoals.Dequeue());
         var what = needSell && needBuy ? "sell + restock" : needSell ? "sell" : "restock";
         OnLog?.Invoke($"AutoShop: heading to {_data!.MapName(_shopMap)} ({_shopMap}) to {what} at '{_shopNpcName}'.");
         var restockNames = needBuy ? string.Join(", ", needBuyAny.Select(_data.ItemName)) : "";
@@ -503,12 +481,25 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         var plan = PlanRoute(fromMap, fromX, fromY, toMap, toX, toY);
         if (plan == null) return -1;
         var (lastX, lastY) = plan.Edges.Count > 0 ? (plan.Edges[^1].Dx, plan.Edges[^1].Dy) : (fromX, fromY);
-        return plan.Cost + Math.Max(Math.Abs(toX - lastX), Math.Abs(toY - lastY));
+        return plan.Cost + Dist(toX, toY, lastX, lastY);
     }
 
     private string? _shopWingTo; // save town to Butterfly Wing to at the start of this trip, if that beats walking
 
+    /// <summary>Head for the resolved shop (_shopMap / _shopNpcName) to do <paramref name="goal"/>, with a fresh trip deadline.</summary>
+    private void BeginShopLeg(ShopGoal goal)
+    {
+        _shopGoal = goal;
+        _shopOrderSent = false;
+        _shopSteps = 0;
+        _shopPhase = ShopPhase.Travel;
+        _shopDeadline = ShopTripDeadline();
+        _shopNextAction = DateTime.MinValue;
+    }
+
     private bool HasItem(int itemId) => itemId > 0 && _bot.WithState(w => w.Self.Inventory.Any(i => i.ItemId == itemId && i.Count > 0));
+    /// <summary>Held AND usable per the item DB: the server disconnects the player if sent an unknown/non-usable item id.</summary>
+    private bool HasUsableItem(int itemId) => HasItem(itemId) && _data?.IsUsableItem(itemId) == true;
 
     /// <summary>The town we respawn in: where we landed after the last death or Butterfly Wing, from saved telemetry.
     /// Null until that happened once.</summary>
@@ -655,12 +646,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
                 else if (_customBuyItems is { Count: > 0 } rest && ++_shopStops < MaxShopStops
                          && ResolveShop(snap.Map, rest.Select(b => b.itemId).ToList()))
                 {
-                    _shopGoal = ShopGoal.Buy;
-                    _shopOrderSent = false;
-                    _shopSteps = 0;
-                    _shopPhase = ShopPhase.Travel;
-                    _shopDeadline = ShopTripDeadline();
-                    _shopNextAction = DateTime.MinValue;
+                    BeginShopLeg(ShopGoal.Buy);
                     OnLog?.Invoke($"AutoShop: next stop {_shopNpcName} in {_data!.MapName(_shopMap)} ({_shopMap}) for {string.Join(", ", rest.Select(b => _data.ItemName(b.itemId)))}.");
                 }
                 else
@@ -813,31 +799,35 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
 
     private List<(int bagId, int itemId, int count)> BuildSellOrders(WorldState w)
     {
-        var equipped = new HashSet<int>();
-        foreach (var b in w.Self.EquippedBagIds)
-            if (b != 0) equipped.Add(b);
 
         var orders = new List<(int, int, int)>();
 
-        // Custom sell from MCP sell_item — only sell the requested item ids (qty <= 0 = sell every stack).
-        if (_customSellItems != null)
+        // Sell the requested item ids (qty <= 0 = every stack), never what we're wearing; taken records the bag ids used.
+        void AddRequestedSellOrders(List<(int itemId, int qty)> requests, HashSet<int>? taken)
         {
-            foreach (var (itemId, requestedQty) in _customSellItems)
+            foreach (var (itemId, requestedQty) in requests)
             {
                 var remaining = requestedQty <= 0 ? int.MaxValue : requestedQty;
                 foreach (var it in w.Self.Inventory)
                 {
                     if (orders.Count >= 100) break;
                     if (it.ItemId != itemId) continue;
-                    if (equipped.Contains(it.BagId)) continue; // never sell what we're wearing
+                    if (w.Self.IsEquipped(it.BagId)) continue; // never sell what we're wearing
                     var take = Math.Min(remaining, it.Count);
                     if (take <= 0) continue;
                     orders.Add((it.BagId, it.ItemId, take));
+                    taken?.Add(it.BagId);
                     remaining -= take;
                     if (remaining <= 0) break;
                 }
                 if (orders.Count >= 100) break;
             }
+        }
+
+        // Custom sell from MCP sell_item — only sell the requested item ids (qty <= 0 = sell every stack).
+        if (_customSellItems != null)
+        {
+            AddRequestedSellOrders(_customSellItems, null);
             return orders;
         }
 
@@ -857,30 +847,14 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         }
         if (queuedSnapshot != null)
         {
-            foreach (var (itemId, requestedQty) in queuedSnapshot)
-            {
-                var remaining = requestedQty <= 0 ? int.MaxValue : requestedQty;
-                foreach (var it in w.Self.Inventory)
-                {
-                    if (orders.Count >= 100) break;
-                    if (it.ItemId != itemId) continue;
-                    if (equipped.Contains(it.BagId)) continue;
-                    var take = Math.Min(remaining, it.Count);
-                    if (take <= 0) continue;
-                    orders.Add((it.BagId, it.ItemId, take));
-                    queuedBagIds.Add(it.BagId);
-                    remaining -= take;
-                    if (remaining <= 0) break;
-                }
-                if (orders.Count >= 100) break;
-            }
+            AddRequestedSellOrders(queuedSnapshot, queuedBagIds);
         }
 
         // Never sell the job's own weapon while none is worn: an Archer out of arrows unequips its bow, and the
         // sell trip that funded new arrows then sold the bow too (Bot5, 11-24).
         var keepType = RequiredWeaponType.GetValueOrDefault(JobName(w.Self.JobId));
         bool IsKeepType(int itemId) => keepType != null && _data?.Gear.TryGetValue(itemId, out var g) == true && g.Type == keepType;
-        var wearingKeepType = w.Self.Inventory.Any(i => equipped.Contains(i.BagId) && IsKeepType(i.ItemId));
+        var wearingKeepType = w.Self.Inventory.Any(i => w.Self.IsEquipped(i.BagId) && IsKeepType(i.ItemId));
 
         // Default: ShopPolicy decides what's junk worth selling.
         foreach (var it in w.Self.Inventory)
@@ -889,7 +863,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
             if (queuedBagIds.Contains(it.BagId)) continue; // already queued explicitly
             if (!wearingKeepType && IsKeepType(it.ItemId)) continue;
             var def = _data?.Item(it.ItemId);
-            if (ShopPolicy.ShouldSell(def, it, equipped.Contains(it.BagId), _config))
+            if (ShopPolicy.ShouldSell(def, it, w.Self.IsEquipped(it.BagId), _config))
                 orders.Add((it.BagId, it.ItemId, it.Count));
         }
         return orders;
@@ -1027,7 +1001,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     private void UpdateApronGate(RebuildSharedData.Data.Position selfPos)
     {
         if (_hasLeftApron) return;
-        var d = Math.Max(Math.Abs(selfPos.X - _landingCell.X), Math.Abs(selfPos.Y - _landingCell.Y));
+        var d = Dist(selfPos.X, selfPos.Y, _landingCell.X, _landingCell.Y);
         if (d >= ApronCells || DateTime.UtcNow > _apronExpiresAt + TimeSpan.FromSeconds(5))
             _hasLeftApron = true;
     }
@@ -1173,7 +1147,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
             ResetKafraStep();
             // Remember this entry so a future trap on the destination map can blacklist this portal.
             _lastEntryPortal = (snap.Map, px, py);
-            var dist = Math.Max(Math.Abs(px - snap.SelfPos.X), Math.Abs(py - snap.SelfPos.Y));
+            var dist = Dist(px, py, snap.SelfPos.X, snap.SelfPos.Y);
             if (dist <= 4) { await _bot.WalkToAsync(Math.Max(1, px), Math.Max(1, py), ct); return; }
             if (await TryTravelFlyWingAsync(snap, px, py, dist, ct)) return;
             await WalkPathTowardAsync(snap, px, py, 16, ct);
@@ -1262,7 +1236,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         {
             int x = random.Next(walk.Width), y = random.Next(walk.Height);
             if (!walk.IsWalkable(x, y)) continue;
-            total += Math.Max(Math.Abs(x - portalX), Math.Abs(y - portalY));
+            total += Dist(x, y, portalX, portalY);
             samples++;
         }
         double? average = samples > 0 ? total / samples : null;

@@ -113,7 +113,7 @@ public sealed partial class BotBehavior
         if (head.Target == SkillCastTarget.Enemy && targetId == 0) targetId = _targetId;
         if (head.Target == SkillCastTarget.Ally && targetId == 0)
         {
-            var ally = FindMostInjuredVisiblePlayer();
+            var ally = FindBestAlly(snap, null);
             if (ally != null) targetId = ally.Id;
         }
         if ((head.Target == SkillCastTarget.Enemy || head.Target == SkillCastTarget.Ally) && targetId == 0)
@@ -268,7 +268,7 @@ public sealed partial class BotBehavior
                 var center = aoe.OnSelf ? snap.SelfPos : target.Pos;
                 var hit = 0;
                 foreach (var m in snap.Monsters)
-                    if ((m.MaxHp <= 0 || m.Hp > 0) && Math.Max(Math.Abs(m.Pos.X - center.X), Math.Abs(m.Pos.Y - center.Y)) <= aoe.Radius) hit++;
+                    if ((m.MaxHp <= 0 || m.Hp > 0) && Dist(m.Pos.X, m.Pos.Y, center.X, center.Y) <= aoe.Radius) hit++;
                 if (!AoeWorthIt(snap, target, rule.Skill, level, hit, inputs, rules, knownLevel))
                 {
                     skipReasons.Add($"{rule.Skill}: area skill would hit {hit} enemy (and its buff is up or not worth the SP here)");
@@ -293,27 +293,6 @@ public sealed partial class BotBehavior
             return (rule, level);
         }
         return null;
-    }
-
-    private MonsterInfo? FindMostInjuredVisiblePlayer()
-    {
-        return _bot.WithState(w =>
-        {
-            MonsterInfo? best = null;
-            var bestHpPct = double.MaxValue;
-            foreach (var e in w.Entities.Values)
-            {
-                if (!e.IsPlayer) continue;
-                if (e.Id == w.Self.EntityId) continue;
-                var hpPct = e.MaxHp > 0 ? 100.0 * e.Hp / e.MaxHp : 100.0;
-                if (hpPct < bestHpPct)
-                {
-                    bestHpPct = hpPct;
-                    best = new MonsterInfo(e.Id, e.ClassId, e.Name, e.Position, e.Hp, e.MaxHp);
-                }
-            }
-            return best;
-        });
     }
 
     private List<SkillRule> GetSkillRules()
@@ -423,7 +402,8 @@ public sealed partial class BotBehavior
         return false;
     }
 
-    private MonsterInfo? FindBestAlly(Snapshot snap, SkillRule rule)
+    /// <summary>Most-injured visible player other than us that passes <paramref name="rule"/>'s conditions (any, when null).</summary>
+    private MonsterInfo? FindBestAlly(Snapshot snap, SkillRule? rule)
     {
         return _bot.WithState(w =>
         {
@@ -434,7 +414,7 @@ public sealed partial class BotBehavior
                 if (!e.IsPlayer) continue;
                 if (e.Id == w.Self.EntityId) continue; // self-target uses 'self', not 'ally'
                 var info = new MonsterInfo(e.Id, e.ClassId, e.Name, e.Position, e.Hp, e.MaxHp);
-                if (!EvaluateConditions(rule.Conditions, snap, info)) continue;
+                if (rule != null && !EvaluateConditions(rule.Conditions, snap, info)) continue;
                 var hpPct = e.MaxHp > 0 ? 100.0 * e.Hp / e.MaxHp : 100.0;
                 if (hpPct < bestHpPct) { bestHpPct = hpPct; best = info; }
             }
@@ -488,7 +468,7 @@ public sealed partial class BotBehavior
             case "target.hp": return target.Hp;
             case "target.maxhp": return target.MaxHp;
             case "target.hppct": return target.MaxHp > 0 ? 100.0 * target.Hp / target.MaxHp : 100.0;
-            case "target.dist": return Math.Max(Math.Abs(snap.SelfPos.X - target.Pos.X), Math.Abs(snap.SelfPos.Y - target.Pos.Y));
+            case "target.dist": return Dist(snap.SelfPos.X, snap.SelfPos.Y, target.Pos.X, target.Pos.Y);
             case "self.hp": return snap.SelfHp;
             case "self.maxhp": return snap.SelfMaxHp;
             case "self.hppct": return snap.SelfMaxHp > 0 ? 100.0 * snap.SelfHp / snap.SelfMaxHp : 100.0;

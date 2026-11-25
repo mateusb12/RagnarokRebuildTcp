@@ -46,8 +46,6 @@ public static class McpBotTools
         var detail = session.WithState(w =>
         {
             var s = w.Self;
-            var equipped = new HashSet<int>();
-            foreach (var b in s.EquippedBagIds) if (b != 0) equipped.Add(b);
             // Status effects on self — pulled from EntityView.Statuses (ApplyStatusEffect / RemoveStatusEffect
             // packets keep this live). Returns each active status by name with seconds remaining so the agent
             // can see "Poison: 8.4s" / "Blessing: 142.0s" alongside HP/SP.
@@ -72,7 +70,7 @@ public static class McpBotTools
                 inventory = s.Inventory.Select(it => new
                 {
                     it.BagId, it.ItemId, name = db.ItemName(it.ItemId), it.Count, it.Refine,
-                    equipped = equipped.Contains(it.BagId),
+                    equipped = s.IsEquipped(it.BagId),
                 }).ToList(),
                 skills = s.KnownSkills.Select(k => new { skill = k.Skill.ToString(), k.Level }).ToList(),
                 statusEffects = statuses,
@@ -219,14 +217,12 @@ public static class McpBotTools
         if (it == null) return new { error = $"No item '{item}'." };
         var (have, equippedCount) = s.WithState(w =>
         {
-            var equipped = new HashSet<int>();
-            foreach (var bagId in w.Self.EquippedBagIds) if (bagId != 0) equipped.Add(bagId);
             var totalHave = 0;
             var eq = 0;
             foreach (var inv in w.Self.Inventory)
                 if (inv.ItemId == it.Id)
                 {
-                    if (equipped.Contains(inv.BagId)) eq++;
+                    if (w.Self.IsEquipped(inv.BagId)) eq++;
                     else totalHave += inv.Count;
                 }
             return (totalHave, eq);
@@ -247,15 +243,7 @@ public static class McpBotTools
         var it = McpGameTools.ResolveItem(db, item);
         if (it == null) return new { error = $"No item '{item}'." };
         if (quantity <= 0) return new { error = "Quantity must be > 0." };
-        var unequippedHave = s.WithState(w =>
-        {
-            var equipped = new HashSet<int>();
-            foreach (var bagId in w.Self.EquippedBagIds) if (bagId != 0) equipped.Add(bagId);
-            var n = 0;
-            foreach (var inv in w.Self.Inventory)
-                if (inv.ItemId == it.Id && !equipped.Contains(inv.BagId)) n += inv.Count;
-            return n;
-        });
+        var unequippedHave = s.WithState(w => w.Self.UnequippedCount(it.Id));
         if (unequippedHave <= 0) return new { error = $"{botId} has no unequipped '{it.Name}' to drop." };
         var dropQty = Math.Min(quantity, unequippedHave);
         b.RequestDropItems(new[] { (it.Id, dropQty) });
@@ -370,16 +358,7 @@ public static class McpBotTools
         var s = bots.GetSession(botId);
         if (b == null || s == null) return new { error = $"No bot '{botId}'." };
         var targets = b.GetRestockTargets();
-        var inv = s.WithState(w =>
-        {
-            var equipped = new HashSet<int>();
-            foreach (var bid in w.Self.EquippedBagIds) if (bid != 0) equipped.Add(bid);
-            var counts = new Dictionary<int, int>();
-            foreach (var it in w.Self.Inventory)
-                if (!equipped.Contains(it.BagId))
-                    counts[it.ItemId] = counts.TryGetValue(it.ItemId, out var c) ? c + it.Count : it.Count;
-            return counts;
-        });
+        var inv = s.WithState(w => w.Self.UnequippedCounts());
         return new
         {
             count = targets.Count,

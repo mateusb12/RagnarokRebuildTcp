@@ -182,8 +182,6 @@ public static class HuntPolicy
     public static int ServerDistance(int x0, int y0, int x1, int y1) =>
         (int)Math.Round(Math.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)));
 
-    private static int Cheb(int x0, int y0, int x1, int y1) => Math.Max(Math.Abs(x0 - x1), Math.Abs(y0 - y1));
-
     /// <summary>The hazard to flee: the nearest one whose zone covers us (an ongoing flee lasts until past the warning band
     /// too). (-1, max) when none.</summary>
     internal static (int Index, int Distance) NearestHazardInReach(IReadOnlyList<(Position pos, int radius, string name, string engine, int id)> hazards,
@@ -193,7 +191,7 @@ public static class HuntPolicy
         var nearestD = int.MaxValue;
         for (var i = 0; i < hazards.Count; i++)
         {
-            var d = Cheb(self.X, self.Y, hazards[i].pos.X, hazards[i].pos.Y);
+            var d = Dist(self.X, self.Y, hazards[i].pos.X, hazards[i].pos.Y);
             var reach = hazards[i].radius + (fleeing ? HazardBuffer : 0);
             if (d <= reach && d < nearestD) { nearestD = d; bestIdx = i; }
         }
@@ -203,7 +201,7 @@ public static class HuntPolicy
     internal static bool CellNearHazard(IReadOnlyList<(Position pos, int radius, string name, string engine, int id)> hazards, int x, int y, int skip = -1)
     {
         for (var i = 0; i < hazards.Count; i++)
-            if (i != skip && Cheb(hazards[i].pos.X, hazards[i].pos.Y, x, y) <= hazards[i].radius) return true;
+            if (i != skip && Dist(hazards[i].pos.X, hazards[i].pos.Y, x, y) <= hazards[i].radius) return true;
         return false;
     }
 
@@ -211,7 +209,7 @@ public static class HuntPolicy
     /// <paramref name="zones"/>: the hazards in view plus the remembered ones (see BotBehavior.ApproachNearHazard).</summary>
     public static bool ApproachNearHazard(Position self, Position target, IReadOnlyList<(int id, Position pos, int radius)> zones, out int hazard, out string where)
     {
-        var n = Math.Max(1, Cheb(self.X, self.Y, target.X, target.Y));
+        var n = Math.Max(1, Dist(self.X, self.Y, target.X, target.Y));
         for (var i = n; i >= 1; i--) // target cell first, so "where" names it when both apply
         {
             int x = self.X + (target.X - self.X) * i / n, y = self.Y + (target.Y - self.Y) * i / n;
@@ -219,7 +217,7 @@ public static class HuntPolicy
             foreach (var h in zones)
             {
                 hazard = h.id;
-                var d = Cheb(h.pos.X, h.pos.Y, x, y);
+                var d = Dist(h.pos.X, h.pos.Y, x, y);
                 if (d > h.radius + buffer) continue;
                 where = i < n ? $"the walk to it crosses (at ({x},{y}))" : d <= h.radius ? "it stands inside" : $"it stands {d - h.radius} cell(s) outside";
                 return true;
@@ -258,7 +256,7 @@ public static class HuntPolicy
             for (var i = 0; i < hzList.Count; i++)
             {
                 var h = hzList[i];
-                var d = Math.Max(Math.Abs(h.x - x), Math.Abs(h.y - y));
+                var d = Dist(h.x, h.y, x, y);
                 if (d <= h.radius) cost += 8f;          // inside aggro — strong penalty (path detours unless no choice)
                 else if (d <= h.radius + 3) cost += 2f; // 3-cell warning buffer
             }
@@ -335,8 +333,8 @@ public static class HuntPolicy
             if (m.Id == target.Id) continue;
             if (m.MaxHp > 0 && m.Hp <= 0) continue;
             var db = data?.Monster(m.ClassId);
-            var joins = (targetAssists && m.ClassId == target.ClassId && Cheb(m.Pos.X, m.Pos.Y, target.Pos.X, target.Pos.Y) <= AssistRadius)
-                        || (IsAggressive(db) && Cheb(self.X, self.Y, m.Pos.X, m.Pos.Y) <= HazardRadius(db))
+            var joins = (targetAssists && m.ClassId == target.ClassId && Dist(m.Pos.X, m.Pos.Y, target.Pos.X, target.Pos.Y) <= AssistRadius)
+                        || (IsAggressive(db) && Dist(self.X, self.Y, m.Pos.X, m.Pos.Y) <= HazardRadius(db))
                         || (standsAtTarget && db is { } fixedDb && IsImmobile(fixedDb)
                             && ServerDistance(m.Pos.X, m.Pos.Y, target.Pos.X, target.Pos.Y) <= fixedDb.Range + 1);
             if (joins) group.Add(m);
@@ -356,7 +354,7 @@ public static class HuntPolicy
             if (m.MaxHp > 0 && m.Hp <= 0) continue;
             var db = data?.Monster(m.ClassId);
             if (!IsAggressive(db) && !hasHitMe(m.Id)) continue;
-            if (Cheb(self.X, self.Y, m.Pos.X, m.Pos.Y) <= ThreatReach(db)) return true;
+            if (Dist(self.X, self.Y, m.Pos.X, m.Pos.Y) <= ThreatReach(db)) return true;
         }
         return false;
     }
@@ -370,7 +368,7 @@ public static class HuntPolicy
             if (m.MaxHp > 0 && m.Hp <= 0) continue;
             // "Will attack": aggressive, or already fighting us (Bot3 sat down mid-fight with a Horn and sat/stood under its hits).
             if (aggressiveOnly && !IsAggressive(data?.Monster(m.ClassId)) && !hasHitMe(m.Id)) continue;
-            if (Cheb(self.X, self.Y, m.Pos.X, m.Pos.Y) <= range) return true;
+            if (Dist(self.X, self.Y, m.Pos.X, m.Pos.Y) <= range) return true;
         }
         return false;
     }
@@ -389,7 +387,7 @@ public static class HuntPolicy
             var cost = 0f;
             foreach (var h in zones)
             {
-                var d = Math.Max(Math.Abs(h.x - x), Math.Abs(h.y - y));
+                var d = Dist(h.x, h.y, x, y);
                 if (d <= h.radius) cost += 40f * (h.radius - d + 1);
             }
             return cost;
@@ -398,7 +396,7 @@ public static class HuntPolicy
         var step = FurthestStraightLineSafeStep(data, mapName, self.X, self.Y, path, Math.Min(8, path.Count - 1), (g.x, g.y));
         if (step < 1) { whyNot = "a portal is in the way"; return null; }
         var wp = path[step];
-        if (Cheb(wp.x, wp.y, threat.X, threat.Y) > Cheb(self.X, self.Y, threat.X, threat.Y)) return wp;
+        if (Dist(wp.x, wp.y, threat.X, threat.Y) > Dist(self.X, self.Y, threat.X, threat.Y)) return wp;
         whyNot = $"the way to my goal ({g.x},{g.y}) goes toward it";
         return null;
     }
@@ -438,7 +436,7 @@ public static class HuntPolicy
                     || !walkMap.IsWalkable(candidate.x, candidate.y)
                     || WalkMayCrossPortal(data, map, self.X, self.Y, candidate.x, candidate.y, allowedPortalCell: null)
                     || data.World.IsInPortalFootprint(map, candidate.x, candidate.y)
-                    || Cheb(candidate.x, candidate.y, threat.X, threat.Y) < Cheb(self.X, self.Y, threat.X, threat.Y))
+                    || Dist(candidate.x, candidate.y, threat.X, threat.Y) < Dist(self.X, self.Y, threat.X, threat.Y))
                     continue;
 
                 var onward = walkMap.FindPath(candidate.x, candidate.y, goalX, goalY, 4000, pathCost);
@@ -493,7 +491,7 @@ public static class HuntPolicy
             if (!map.TryFindWalkableNear(tx, ty, 5, out var fx, out var fy)
                 || CellNearHazard(hazards, fx, fy, skip: index)
                 || InOtherFixedReach(data, monsters, fx, fy, 0) // fleeing a Thief Bug into a Flora's reach killed Bot5
-                || Cheb(fx, fy, hz.pos.X, hz.pos.Y) <= nearestD)
+                || Dist(fx, fy, hz.pos.X, hz.pos.Y) <= nearestD)
                 continue;
 
             // A direct flee vector can point straight through a warp: plan around portal footprints, then send only a

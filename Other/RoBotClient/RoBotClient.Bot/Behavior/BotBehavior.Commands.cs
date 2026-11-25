@@ -51,7 +51,7 @@ public sealed partial class BotBehavior
         }
 
         // On the target map: walk to the spot, then hold position.
-        if (Math.Max(Math.Abs(_parkX - snap.SelfPos.X), Math.Abs(_parkY - snap.SelfPos.Y)) <= 2)
+        if (Dist(_parkX, _parkY, snap.SelfPos.X, snap.SelfPos.Y) <= 2)
             return; // arrived — idle here
         if (stuck) { ResetStuck(snap.SelfPos); await NudgeAsync(snap, ct); return; }
         if (DateTime.UtcNow < _nextPark) return;

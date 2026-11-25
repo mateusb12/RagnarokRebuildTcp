@@ -24,13 +24,11 @@ public sealed partial class BotBehavior
         foreach (var e in w.Entities.Values)
         {
             if (!e.IsNpc) continue;
-            var d = Math.Max(Math.Abs(e.Position.X - x), Math.Abs(e.Position.Y - y));
+            var d = Dist(e.Position.X, e.Position.Y, x, y);
             if (d <= 3 && d < bestD) { bestD = d; best = e.Id; }
         }
         return best;
     }
-
-    private static int Dist(Position a, Position b) => Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
 
     internal sealed record MonsterInfo(int Id, int ClassId, string Name, Position Pos, int Hp, int MaxHp);
 

@@ -20,13 +20,11 @@ public sealed partial class BotBehavior
     private const int ConfineCells = 10;
     private static readonly TimeSpan ConfinedFlyWing = TimeSpan.FromSeconds(30), ConfinedButterflyWing = TimeSpan.FromSeconds(60);
 
-    private bool CanUseWing(int itemId) => HasItem(itemId) && _data?.IsUsableItem(itemId) == true;
-
     /// <summary>Fly Wing first (same map, cheap); a Butterfly Wing (back to the save point) only when the caller allows it.
     /// 0 when neither is usable.</summary>
     private int PickEscapeWing(bool butterflyOk) =>
-        CanUseWing(_config.FlyWingItemId) ? _config.FlyWingItemId
-        : butterflyOk && CanUseWing(_config.ButterflyWingItemId) ? _config.ButterflyWingItemId : 0;
+        HasUsableItem(_config.FlyWingItemId) ? _config.FlyWingItemId
+        : butterflyOk && HasUsableItem(_config.ButterflyWingItemId) ? _config.ButterflyWingItemId : 0;
 
     private string WingName(int itemId) => itemId == _config.FlyWingItemId ? "Fly Wing" : "Butterfly Wing";
 
@@ -53,7 +51,7 @@ public sealed partial class BotBehavior
         _nudgeAnchor.last = now;
         var confined = now - a.since;
         if (confined < ConfinedFlyWing) return false;
-        var (fly, butterfly) = (CanUseWing(_config.FlyWingItemId), CanUseWing(_config.ButterflyWingItemId));
+        var (fly, butterfly) = (HasUsableItem(_config.FlyWingItemId), HasUsableItem(_config.ButterflyWingItemId));
         var item = PickEscapeWing(confined >= ConfinedButterflyWing);
         if (!_confinedLogged)
         {
@@ -96,7 +94,7 @@ public sealed partial class BotBehavior
         if (stuck && snap.SelfPos is not { X: 0, Y: 0 } // (0,0) = position not received yet after a map change
             && EscapeWingReady && _data?.GetWalkMap(snap.Map) is { } here
             && !here.IsWalkable(snap.SelfPos.X, snap.SelfPos.Y)
-            && CanUseWing(_config.FlyWingItemId))
+            && HasUsableItem(_config.FlyWingItemId))
         {
             OnLog?.Invoke($"Standing in a wall at ({snap.SelfPos.X},{snap.SelfPos.Y}) on {snap.Map} — using a Fly Wing to get out.");
             await UseEscapeWingAsync(_config.FlyWingItemId, 3, ct);

@@ -43,6 +43,24 @@ public sealed class SelfState
     public readonly List<SkillEntry> GrantedSkills = new();
     public readonly List<InventoryItemView> Inventory = new();
     public readonly int[] EquippedBagIds = new int[10];
+    /// <summary>True when the stack in <paramref name="bagId"/> is worn: equipped stacks are never consumed, sold or dropped.</summary>
+    public bool IsEquipped(int bagId) => bagId != 0 && Array.IndexOf(EquippedBagIds, bagId) >= 0;
+    /// <summary>Item id → count across all unequipped stacks.</summary>
+    public Dictionary<int, int> UnequippedCounts()
+    {
+        var counts = new Dictionary<int, int>();
+        foreach (var it in Inventory)
+            if (!IsEquipped(it.BagId)) counts[it.ItemId] = counts.GetValueOrDefault(it.ItemId) + it.Count;
+        return counts;
+    }
+    /// <summary>Count of <paramref name="itemId"/> across all unequipped stacks.</summary>
+    public int UnequippedCount(int itemId)
+    {
+        var n = 0;
+        foreach (var it in Inventory)
+            if (it.ItemId == itemId && !IsEquipped(it.BagId)) n += it.Count;
+        return n;
+    }
     public int AmmoId;
     public int BaseExp;
     public int Kills;

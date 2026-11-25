@@ -67,16 +67,7 @@ public sealed partial class BotBehavior
         }
         ReloadItemScriptIfChanged();
         var rescues = new List<(int, int, int)>();
-        var invCounts = _bot.WithState(w =>
-        {
-            var equipped = new HashSet<int>();
-            foreach (var bid in w.Self.EquippedBagIds) if (bid != 0) equipped.Add(bid);
-            var counts = new Dictionary<int, int>();
-            foreach (var it in w.Self.Inventory)
-                if (!equipped.Contains(it.BagId))
-                    counts[it.ItemId] = counts.GetValueOrDefault(it.ItemId) + it.Count;
-            return counts;
-        });
+        var invCounts = _bot.WithState(w => w.Self.UnequippedCounts());
         foreach (var r in _itemRules)
         {
             var hpTrig = false;
@@ -336,18 +327,7 @@ public sealed partial class BotBehavior
         ReloadItemScriptIfChanged();
         if (_itemRules.Count == 0) return 0;
         // Tally inventory by item id (skip equipped — they're not consumable here).
-        var invByItem = _bot.WithState(w =>
-        {
-            var equipped = new HashSet<int>();
-            foreach (var bid in w.Self.EquippedBagIds) if (bid != 0) equipped.Add(bid);
-            var counts = new Dictionary<int, int>();
-            foreach (var it in w.Self.Inventory)
-            {
-                if (equipped.Contains(it.BagId)) continue;
-                counts[it.ItemId] = counts.GetValueOrDefault(it.ItemId) + it.Count;
-            }
-            return counts;
-        });
+        var invByItem = _bot.WithState(w => w.Self.UnequippedCounts());
         var buffer = 0.0;
         foreach (var r in _itemRules)
         {
