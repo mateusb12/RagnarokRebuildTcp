@@ -41,7 +41,14 @@ public sealed class HuntSimulator
     public const int ViewDistance = 21;             // ServerConfig.MaxViewDistance, Chebyshev (Position.InRange)
     public const double SecondsPerCell = 0.15;      // the server's base player MoveSpeed
     public const double DiagonalFactor = 1.4142;    // WorldObject: a diagonal step takes MoveSpeed * 1.4142
-    private const int MeleeRange = 1;
+    // Where the approach stops: the server's CharacterStat.Range (bow range + Vulture Eye), not melee. A fixed 1 walked
+    // archers up to every target, eating hits a live archer never takes.
+    private int Reach => _world.AttackRange;
+    // The server also refuses a ranged hit without line of sight (Player.PerformAttack), so the approach stops at the first
+    // cell that has both, as its attack move does.
+    // Range is the server's DistanceCache.IntDistance (rounded Euclidean), not the square Dist: 12 cells diagonal is 17.
+    private bool CanHit(int x, int y, Mob m) => (int)Math.Round(Math.Sqrt((x - m.X) * (x - m.X) + (y - m.Y) * (y - m.Y))) <= Reach
+                                                && _walk.HasLineOfSight(x, y, m.X, m.Y);
     private const int ReachExpansions = 6000;       // IsReachable's A* budget
     private const int MaxChaseRepaths = 30;         // ponytail: then give the target up; live has no such count
 
@@ -678,7 +685,7 @@ public sealed class HuntSimulator
         _restToWin = false;
         var path = world.Paths[m];
         // Stop at the first cell in attack range, as the server's attack move does.
-        var stop = path.FindIndex(c => Dist(c.x, c.y, m.X, m.Y) <= MeleeRange);
+        var stop = path.FindIndex(c => CanHit(c.x, c.y, m));
         Picks++;
         var hidden = _mobs.Where(o => o.Alive && Dist(_x, _y, o.X, o.Y) > ViewDistance && ForecastOf(o).CanWin).ToList();
         if (hidden.Count > 0)
@@ -1211,9 +1218,14 @@ public sealed class HuntSimulator
         Log($"start on {_o.Map} ({_walk.Width}x{_walk.Height}, {WalkableCells} walkable cells), {_mobs.Count} monsters spawned", "start");
         Boundary();
         var lookNow = true;
+        var (stuckAt, stuckTicks) = (-1.0, 0);
         while (_t < _o.DurationSeconds)
         {
             OnProgress?.Invoke(_t / _o.DurationSeconds);
+            // A tick that never moves the clock repeats forever: fail with what it keeps doing instead of hanging.
+            if (_t != stuckAt) (stuckAt, stuckTicks) = (_t, 0);
+            else if (++stuckTicks > 10_000)
+                throw new InvalidOperationException($"simulation stuck at {_t:0.##}s (clock not advancing); last events:\n  " + string.Join("\n  ", Trace.TakeLast(12)));
             Respawns();
             // The live tick order: AvoidHazardsAsync before resting and hunting; a flee tick ends the tick.
             if (FleeIfThreatened()) { lookNow = true; continue; }
@@ -1234,22 +1246,22 @@ public sealed class HuntSimulator
                     // each time it moves, as the server's attack move does.
                     var stop = path.Count > 1 ? Walk(path, WalkKind.Approach, stopOnSighting: false, chase: mob) : WalkStop.Arrived;
                     for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && mob.Alive && _t < _o.DurationSeconds
-                                          && Dist(_x, _y, mob.X, mob.Y) > MeleeRange && repaths < MaxChaseRepaths; repaths++)
+                                          && !CanHit(_x, _y, mob) && repaths < MaxChaseRepaths; repaths++)
                     {
                         var again = _walk.FindPath(_x, _y, mob.X, mob.Y, ReachExpansions);
                         if (again == null) break;
-                        stop = Walk(again.Take(again.FindIndex(c => Dist(c.x, c.y, mob.X, mob.Y) <= MeleeRange) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: mob);
+                        stop = Walk(again.Take(again.FindIndex(c => CanHit(c.x, c.y, mob)) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: mob);
                     }
                     if (_t >= _o.DurationSeconds) break;
                     if (stop is WalkStop.Threat or WalkStop.Died || !mob.Alive) { _wanderDest = null; lookNow = true; continue; }
-                    if (Dist(_x, _y, mob.X, mob.Y) > MeleeRange)
+                    if (!CanHit(_x, _y, mob))
                     {
                         Log($"lost {Name(mob)} #{mob.Id}: it kept wandering out of reach", "abandon", mob.Id);
                         _wanderDest = null;
                         lookNow = true;
                         continue;
                     }
-                    if (Dist(_x, _y, mob.X, mob.Y) > MeleeRange) throw new InvalidOperationException("fight started out of range");
+                    if (!CanHit(_x, _y, mob)) throw new InvalidOperationException("fight started out of range");
                     var searched = _t - _lastFightEnd;
                     if (Fight(mob)) SearchPerKill.Add(searched);
                     _lastFightEnd = _t;

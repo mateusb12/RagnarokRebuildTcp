@@ -597,21 +597,27 @@ public sealed class ServerWorld
                     }
                     var range = Math.Max(1, self.GetStat(CharacterStat.Range));
                     var steps2 = StepsIntoRange(target.Character.Position, range);
-                    if (steps2 == 0 && DistanceCache.IntDistance(_player.Character.Position, target.Character.Position) > range)
+                    if (steps2 == 0 && (DistanceCache.IntDistance(_player.Character.Position, target.Character.Position) > range
+                                        || !_map.WalkData.HasLineOfSight(_player.Character.Position, target.Character.Position)))
                     {
-                        Emit("abandon", $"target out of reach and the straight line is blocked: fight abandoned (pathing back is not simulated)");
+                        Emit("abandon", $"target out of reach and the straight line is blocked: fight abandoned (pathing back is not simulated); "
+                            + $"player {_player.Character.Position}, target {target.Character.Position}, distance {DistanceCache.IntDistance(_player.Character.Position, target.Character.Position)}, "
+                            + $"range {range}, line of sight {_map.WalkData.HasLineOfSight(_player.Character.Position, target.Character.Position)}");
                         outcome = 2;
                         break;
                     }
                     if (steps2 > 0)
                     {
                         // ponytail: straight-line approach at MoveSpeed per cell; the live server paths the walk (TargetForAttack)
-                        Emit("reach", $"target out of reach ({DistanceCache.IntDistance(_player.Character.Position, target.Character.Position)} > {range}): walking {steps2} cells", amount: steps2);
+                        var gap = DistanceCache.IntDistance(_player.Character.Position, target.Character.Position);
+                        Emit("reach", (gap > range ? $"target out of reach ({gap} > {range})" : $"no line of sight at {gap} cells") + $": walking {steps2} cells", amount: steps2);
                         holdUntil = t + steps2 * _player.Character.MoveSpeed;
                         continue;
                     }
                     if (!PerformAttack(_player, target.Character))
-                        throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position};");
+                        throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position}; "
+                            + $"range {range}, line of sight {_player.Character.Map!.WalkData.HasLineOfSight(_player.Character.Position, target.Character.Position)}, "
+                            + $"player {_player.Character.State}, valid target {enemy.IsValidTarget(self)}");
                     actions++;
                     continue;
                 }
@@ -809,7 +815,8 @@ public sealed class ServerWorld
     {
         var p = _player.Character.Position;
         var steps = 0;
-        while (DistanceCache.IntDistance(p, target) > range)
+        // Into range AND line of sight: Player.PerformAttack refuses a ranged hit through a wall.
+        while (p != target && (DistanceCache.IntDistance(p, target) > range || !_map.WalkData.HasLineOfSight(p, target)))
         {
             var next = new Position(p.X + Math.Sign(target.X - p.X), p.Y + Math.Sign(target.Y - p.Y));
             if (!_map.WalkData.IsCellWalkable(next.X, next.Y)) break;
