@@ -124,7 +124,7 @@ public sealed class HuntSimulator
     private bool _restToWin;                        // the live _restToWin: the last pick found fights winnable at full HP only
     public int Kills, Deaths, PickDecisions, Picks, WanderDestinations, ViewEntries;
     public long Exp;
-    public double WanderSeconds, ApproachSeconds, FightSeconds, IdleSeconds, NoHuntableAliveSeconds, DamageTaken;
+    public double WanderSeconds, ApproachSeconds, FightSeconds, IdleSeconds, PostKillSeconds, NoHuntableAliveSeconds, DamageTaken;
     public int Steps, DiagonalSteps;
     public int WalkableCells;
     private readonly int[,] _visits;
@@ -601,12 +601,12 @@ public sealed class HuntSimulator
     }
 
     /// <summary>Time passes standing (a held flee, a wedged wander): the world runs on.</summary>
-    private void Wait(double seconds, bool flee)
+    private void Wait(double seconds, bool flee, bool postKill = false)
     {
         var dt = Math.Min(seconds, _o.DurationSeconds - _t);
         if (dt <= 0) return;
         _t += dt;
-        if (flee) FleeSeconds += dt; else IdleSeconds += dt;
+        if (flee) FleeSeconds += dt; else if (postKill) PostKillSeconds += dt; else IdleSeconds += dt;
         if (!flee && !HuntableAliveAnywhere()) NoHuntableAliveSeconds += dt;
         Respawns();
         AdvanceWorld(walking: false);
@@ -971,6 +971,14 @@ public sealed class HuntSimulator
             return false;
         }
         if (_cfg.HealHpPercent > 0 && _world.Hp < _cfg.HealHpPercent * _world.MaxHp) FightsEndedUnderHealHp++;
+        // The live bot only sees the kill on its next 0.25 s tick, and a walk it sends meanwhile waits out the killing
+        // swing's move lock (melee: AttackMotionTime 1.0 s vs damage at 0.6 s; a bow's are equal). Measured live (Bot5,
+        // 503 kills): kill -> next action median 0.25 s, mean 0.62 s.
+        var gap = Math.Max(LiveTickSeconds, _world.MoveLockUntil - _t);
+        // ponytail: TODO loot. No items here, so AutoLoot is a flat cost per kill: live map summaries show ~0.4 s/kill
+        // ("loot 0.4"). Model drops + pickup walks if loot time matters per map.
+        if (_cfg.AutoLoot) gap += LootSecondsPerKill;
+        Wait(gap, flee: false, postKill: true);
         return true;
     }
 
@@ -1013,6 +1021,7 @@ public sealed class HuntSimulator
     }
 
     private const double LiveTickSeconds = 0.25; // BotBehavior's tick loop delay
+    private const double LootSecondsPerKill = 0.4; // live pay_fild06 map summaries, "loot 0.4" s/kill
     private const double ResitSeconds = 1.5;     // TickRestAsync's _nextSit throttle
 
     private (double Hp, double Sp) RestFractions() =>
@@ -1296,7 +1305,7 @@ public sealed class HuntSimulator
             Walk(route, WalkKind.Wander, stopOnSighting: true);
             lookNow = true; // stopped for a sighting, or arrived: look either way
         }
-        var accounted = WanderSeconds + ApproachSeconds + FightSeconds + IdleSeconds + RestSeconds + FleeSeconds;
+        var accounted = WanderSeconds + ApproachSeconds + FightSeconds + IdleSeconds + PostKillSeconds + RestSeconds + FleeSeconds;
         if (Math.Abs(accounted - _t) > 1e-6)
             throw new InvalidOperationException($"clock {_t:F6}s but walking + fighting + idle + resting + fleeing = {accounted:F6}s");
         Log($"end: {Kills} kills, {Exp} exp", "end");
@@ -1337,7 +1346,7 @@ public sealed class HuntSimulator
         L($"Kills/h {Kills / hours:F0}, EXP/h {Exp / hours:F0} sustained; {Exp / huntHours:F0} EXP/h over the {_o.DurationSeconds - RestSeconds:F0}s not spent sitting");
         double Pct(double s) => 100 * s / _o.DurationSeconds;
         L($"Time: wandering without a target {WanderSeconds:F0}s ({Pct(WanderSeconds):F1}%), walking to targets {ApproachSeconds:F0}s ({Pct(ApproachSeconds):F1}%), "
-          + $"fighting {FightSeconds:F0}s ({Pct(FightSeconds):F1}%), resting {RestSeconds:F0}s ({Pct(RestSeconds):F1}%), fleeing {FleeSeconds:F0}s ({Pct(FleeSeconds):F1}%), wedged/idle {IdleSeconds:F0}s ({Pct(IdleSeconds):F1}%)");
+          + $"fighting {FightSeconds:F0}s ({Pct(FightSeconds):F1}%), resting {RestSeconds:F0}s ({Pct(RestSeconds):F1}%), fleeing {FleeSeconds:F0}s ({Pct(FleeSeconds):F1}%), wedged/idle {IdleSeconds:F0}s ({Pct(IdleSeconds):F1}%), after kills (tick, move lock, loot) {PostKillSeconds:F0}s ({Pct(PostKillSeconds):F1}%)");
         L($"Threats: monster AIs targeted the bot {Aggros} times; {Flees} flees, {FightsLeft} fights broken off to flee, {WalkInterruptions} walks interrupted (hazard or hit), "
           + $"{Deaths} deaths; at most {_peakActive} monsters under their server AI at once");
         L($"Search (wander + walk-up) per kill: {Summary(SearchPerKill)}");

@@ -87,7 +87,7 @@ public sealed class SimSprites(string assetsDir, MonsterSprites sprites)
         return new
         {
             body = anim.Body, head = anim.Head, parts,
-            attackMotion = jw == null ? 1 : look.IsMale ? jw.AttackMale : jw.AttackFemale,
+            attackMotion = jw == null ? 1 : look.IsMale ? jw.AttackMale : jw.AttackFemale, weaponClass,
             skills = Motions.Value, look = lookFrom,
         };
 

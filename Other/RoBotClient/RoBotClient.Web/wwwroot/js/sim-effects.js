@@ -13,6 +13,10 @@ const ON_EXECUTE = {
 // OnHitEffect -> SendElementalHitEffect (one per hit, 0.2 s apart) -> ServerControllable.OnMessageElementalHit's STR;
 // FireBolt: FireArrow attaches "firehit1" once per bolt, 12 frames apart.
 const ON_HIT = { LightningBolt: "WindHit", FireBolt: "firehit1", FireAttack: "firehit1", WindAttack: "WindHit", EarthAttack: "EarthHit", HolyAttack: "HolyHit" };
+// ArcherArrow: arrow2 flying from the shooter at 38-42 units/s to land with the hit. PacketAttack fires one per bow
+// auto-attack, DoubleStrafeHandler two (offset in height). ArrowShower/ChargeArrow ones are not drawn.
+const ARROWS = { auto: [0], DoubleStrafe: [-0.15, 0.15] }, ARROW_SPEED = 40, ARROW_MAX = 0.6; // s: 24 cells
+const arrowImg = new Image(); arrowImg.src = "client-texture/arrow2.png";
 const WINDOW = 4; // s; the longest effect wired here (LightningBolt) runs 130 frames at 60 fps
 
 const cache = new Map();
@@ -41,6 +45,8 @@ export function index(rp) {
             if (on != null) out.push({ t0: e.t, name: ex[0], on });
         }
         if (e.kind === "hurt" && ex && e.mob) out.push({ t0: e.t - (e.detail?.motion || 0), name: ex[0], on: ex[1] === "self" ? e.mob : 0 }); // a monster's cast on the bot
+        if (rp.bow && e.kind === "hit" && e.mob && ARROWS[e.skill ?? "auto"])
+            ARROWS[e.skill ?? "auto"].forEach((dy, k) => out.push({ t0: e.t - ARROW_MAX, land: e.t + 0.03 * k, dy, on: e.mob, arrow: true }));
         if ((e.kind === "hit" || e.kind === "hurt") && hit && e.amount > 0) {
             const on = e.kind === "hit" ? e.mob : 0, n = Math.max(1, e.detail?.hits || 1);
             for (let k = 0; k < n; k++) out.push({ t0: e.t + 0.2 * k, name: hit, on });
@@ -54,13 +60,28 @@ export function index(rp) {
 export function draw(g, v, list, t) {
     const U = Math.max(v.zoom, 8);
     for (let i = lastLE(list, t, f => f.t0); i >= 0 && list[i].t0 > t - WINDOW; i--) {
-        const f = list[i], fx = get(f.name); if (!fx) continue;
+        const f = list[i];
+        if (f.arrow) { drawArrow(g, v, f, t, U); continue; }
+        const fx = get(f.name); if (!fx) continue;
         const frame = Math.floor((t - f.t0) * fx.frameRate) + 1; // RoEffectRenderer starts at time 1/FrameRate
         if (frame > fx.maxKey) continue;
         const p = f.on ? v.mobAt(f.on, t) : v.posAt(t); if (!p) continue;
         const s = v.toScreen(p.x, p.y);
         drawStr(g, fx, frame, s.x, s.y + 2, U);
     }
+}
+
+// Flight time from the bot's cell at landing to the target's: the arrow is drawn only while it flies, 2 units up
+// (ArcherArrow's offset, drawn screen-up), 61x8 px at 1/65 unit per px, tip (right of the texture) towards the target.
+function drawArrow(g, v, f, t, U) {
+    const m = v.mobAt(f.on, t), p = v.posAt(f.land); if (!m || !p || !arrowImg.complete || !arrowImg.naturalWidth) return;
+    const a = v.toScreen(p.x, p.y), b = v.toScreen(m.x, m.y), flight = Math.hypot(m.x - p.x, m.y - p.y) / ARROW_SPEED;
+    const k = 1 - (f.land - t) / flight; if (k < 0 || k > 1) return;
+    const up = (1.5 + f.dy) * U, x = a.x + (b.x - a.x) * k, y = a.y + (b.y - a.y) * k - up;
+    g.save(); g.translate(x, y); g.rotate(Math.atan2(b.y - a.y, b.x - a.x));
+    const w = arrowImg.naturalWidth / 65 * U, h = Math.max(2, arrowImg.naturalHeight / 65 * U);
+    g.drawImage(arrowImg, -w, -h / 2, w, h); // tip at the arrow's position
+    g.restore();
 }
 
 // RoEffectRenderer.UpdateAnimationLayer: the newest key (Type 0) at or before the frame, moved by the following delta key

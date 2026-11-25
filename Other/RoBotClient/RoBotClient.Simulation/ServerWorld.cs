@@ -167,6 +167,8 @@ public sealed class ServerWorld
 
     public readonly Dictionary<CharacterSkill, SkillLedger> Skills = new();
     public double Clock { get; private set; }
+    /// <summary>When the server lets the player walk again (WorldObject.MoveLockTime: a swing locks it for AttackMotionTime).</summary>
+    public double MoveLockUntil => _player.Character.MoveLockTime;
     public int MapWidth => _map.Width;
     public int MapHeight => _map.Height;
     public int PlayerId => _player.Character.Id;
@@ -614,6 +616,9 @@ public sealed class ServerWorld
                         holdUntil = t + steps2 * _player.Character.MoveSpeed;
                         continue;
                     }
+                    // A queued cast out of range ran Character.TryMove (UpdateWithQueuedCast): the sim never walks the player
+                    // through server movement (StepsIntoRange does it), so that Moving would stick and PerformAttack refuse forever.
+                    if (_player.Character.State == CharacterState.Moving) _player.Character.StopMovingImmediately();
                     if (!PerformAttack(_player, target.Character))
                         throw new InvalidOperationException($"the server refused the auto-attack on {target.Character.Name} at {_player.Character.Position} -> {target.Character.Position}; "
                             + $"range {range}, line of sight {_player.Character.Map!.WalkData.HasLineOfSight(_player.Character.Position, target.Character.Position)}, "

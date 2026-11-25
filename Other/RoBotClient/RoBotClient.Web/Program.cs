@@ -114,6 +114,7 @@ var sharedIcons = File.Exists(sharedIconsFile)
     : new Dictionary<string, string>();
 MapRepoPngs("/minimap/{name}.png", Path.Combine("RebuildClient", "Assets", "Maps", "minimap"), new Dictionary<string, string>());
 MapRepoPngs("/icons/{name}.png", Path.Combine("RebuildClient", "Assets", "Sprites", "Imported", "Icons", "Sprites"), sharedIcons);
+MapRepoPngs("/client-texture/{name}.png", Path.Combine("RebuildClient", "Assets", "Textures", "Resources"), new Dictionary<string, string>()); // arrow2 (sim-effects.js)
 MapRepoPngs("/monster-atlas/{name}.png", Path.Combine("RebuildClient", "Assets", "Sprites", "Imported", "Monsters", "Atlas"), new Dictionary<string, string>());
 // Player body/head atlases for the dashboard portraits (Korean file names, so not MapRepoPngs' ASCII-only pattern).
 var charactersDir = ResolveRepoSubdir(Path.Combine("RebuildClient", "Assets", "Sprites", "Imported", "Characters"));

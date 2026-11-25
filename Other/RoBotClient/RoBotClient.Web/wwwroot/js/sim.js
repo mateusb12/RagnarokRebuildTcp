@@ -49,6 +49,7 @@ export async function mount(root, url, player, skillNames) {
     let rp;
     try { const r = await fetch(url); if (!r.ok) throw new Error(r.status + " " + r.statusText); rp = await r.json(); }
     catch (e) { root.innerHTML = '<div class="alert alert-danger small">Could not load the replay: ' + esc(e.message) + "</div>"; return; }
+    rp.bow = player?.weaponClass === 12; // PacketAttack: WeaponClass 12 shoots an arrow per auto-attack
     current = new Viewer(root, rp);
     current.skillNames = skillNames;
     const v = current, P = await Sprites.loadPlayer(player);
