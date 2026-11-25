@@ -94,6 +94,12 @@ public sealed class HuntSimulator
     private readonly BotBehaviorConfig _cfg;
     private readonly Random _rng;
     private readonly Random _mobRng;                // monster wandering: its own stream, so it doesn't shift the bot's draws
+    private readonly Random _lootRng;
+    private readonly Dictionary<int, int> _bag = new(); // item id -> count picked up this run
+    private readonly List<(int DropId, int ItemId, int Count, int X, int Y, double Expires)> _ground = new(); // drops not picked up yet
+    private readonly HashSet<int> _skipDrops = new(); // no path: BotBehavior's _skipDrops
+    private int _nextDropId;
+    private double _nextLoot;
     private readonly List<Mob> _mobs = new();
     private readonly Dictionary<int, Forecast> _forecasts = new();
     private CombatSheet? _sheet;
@@ -171,6 +177,7 @@ public sealed class HuntSimulator
         _walk = data.GetWalkMap(options.Map) ?? throw new ArgumentException($"No walk map for '{options.Map}'.");
         _rng = new Random(options.Seed);
         _mobRng = new Random(unchecked(options.Seed * 7919 + 17));
+        _lootRng = new Random(unchecked(options.Seed * 104729 + 31)); // drops: own stream, the bot's and the world's draws stay as before
         _visits = new int[(_walk.Width + 7) / 8, (_walk.Height + 7) / 8];
         var errors = new List<string>();
         _rules = BotBehavior.ParseSkillScript(options.SkillScript ?? "", errors);
@@ -845,7 +852,7 @@ public sealed class HuntSimulator
         return null;
     }
 
-    private enum WalkKind { Wander, Approach, Flee }
+    private enum WalkKind { Wander, Approach, Flee, Loot }
     private enum WalkStop { Arrived, Sighting, TargetMoved, Threat, Hit, Died, Time }
     private int _hurts; // monster hits that landed on the player (OnWorld), to tell a step on which the bot was hit
 
@@ -863,8 +870,8 @@ public sealed class HuntSimulator
             && Crop(path) is var crop && !crop.Contains("too long"))
             (_bestDetour, ObstacleExample) = (detour, $"from ({path[0].x},{path[0].y}) to ({path[^1].x},{path[^1].y}) the straight line crosses blocked cells; "
                 + $"A* walks {path.Count - 1} steps (straight distance {Dist(path[0].x, path[0].y, path[^1].x, path[^1].y)}), every step walkable:\n" + crop);
-        Note("route", $"{(approach ? "walk to the target" : kind == WalkKind.Flee ? "flee" : "wander")}: A* route of {path.Count - 1} steps to ({path[^1].x},{path[^1].y})"
-            + (stopOnSighting ? ", stops when a monster comes into view" : ""), detail: new { approach, flee = kind == WalkKind.Flee, path = path.SelectMany(c => new[] { c.x, c.y }).ToArray() });
+        Note("route", $"{(approach ? "walk to the target" : kind == WalkKind.Flee ? "flee" : kind == WalkKind.Loot ? "walk to a drop" : "wander")}: A* route of {path.Count - 1} steps to ({path[^1].x},{path[^1].y})"
+            + (stopOnSighting ? ", stops when a monster comes into view" : ""), detail: new { approach, flee = kind == WalkKind.Flee, loot = kind == WalkKind.Loot, path = path.SelectMany(c => new[] { c.x, c.y }).ToArray() });
         var start = _t;
         for (var i = 1; i < path.Count && _t < _o.DurationSeconds; i++)
         {
@@ -877,7 +884,7 @@ public sealed class HuntSimulator
             var dt = SecondsPerCell * (diagonal ? DiagonalFactor : 1);
             if (kind == WalkKind.Wander && !HuntableAliveAnywhere()) NoHuntableAliveSeconds += dt;
             _t += dt;
-            if (approach) ApproachSeconds += dt; else if (kind == WalkKind.Flee) FleeSeconds += dt; else WanderSeconds += dt;
+            if (approach) ApproachSeconds += dt; else if (kind == WalkKind.Flee) FleeSeconds += dt; else if (kind == WalkKind.Loot) PostKillSeconds += dt; else WanderSeconds += dt;
             (_x, _y) = (nx, ny);
             _track.Add(new ReplayStep(_t, _x, _y, dt));
             Steps++;
@@ -975,9 +982,6 @@ public sealed class HuntSimulator
         // swing's move lock (melee: AttackMotionTime 1.0 s vs damage at 0.6 s; a bow's are equal). Measured live (Bot5,
         // 503 kills): kill -> next action median 0.25 s, mean 0.62 s.
         var gap = Math.Max(LiveTickSeconds, _world.MoveLockUntil - _t);
-        // ponytail: TODO loot. No items here, so AutoLoot is a flat cost per kill: live map summaries show ~0.4 s/kill
-        // ("loot 0.4"). Model drops + pickup walks if loot time matters per map.
-        if (_cfg.AutoLoot) gap += LootSecondsPerKill;
         Wait(gap, flee: false, postKill: true);
         return true;
     }
@@ -1018,10 +1022,57 @@ public sealed class HuntSimulator
             + $" +{m.Db.Exp} exp; respawns at {m.RespawnAt:F1}s", "kill", m.Id,
             new { exp = m.Db.Exp, byArea, respawnAt = m.RespawnAt, fightSeconds = fight?.Seconds, actions = fight?.Actions, skillActions = fight?.SkillActions,
                 damageTaken = fight?.DamageTaken });
+        DropItems(m);
+    }
+
+    /// <summary>Monster.DoMonsterDrops: the server's drop table, each drop on its own cell around the corpse (GetNextTileForDrop:
+    /// the corpse's cell, then SE, W, N, ...), on the ground for 60 s (GroundItem.Expiration).</summary>
+    private void DropItems(Mob m)
+    {
+        var i = 0;
+        foreach (var (id, n) in ServerWorld.RollDrops(m.Db.Id, _lootRng))
+        {
+            var (dx, dy) = i == 0 ? (0, 0) : (i % 3) switch { 0 => (0, 1), 1 => (1, -1), _ => (-1, 0) };
+            var (x, y) = _walk.IsWalkable(m.X + dx, m.Y + dy) ? (m.X + dx, m.Y + dy) : (m.X, m.Y);
+            var drop = ++_nextDropId;
+            _ground.Add((drop, id, n, x, y, _t + GroundItemSeconds));
+            Log($"{Name(m)} #{m.Id} dropped {_data.ItemName(id)} x{n} at ({x},{y})", "drop", m.Id,
+                new { dropId = drop, itemId = id, name = _data.ItemName(id), code = _data.Item(id)?.Code, count = n }, x, y);
+            i++;
+        }
+    }
+
+    /// <summary>BotBehavior.TickLootAsync, one tick: the nearest drop within LootRange (not blacklisted, not by a hazard) is
+    /// sent a pickup at most every LootCooldownSeconds; the server walks the player next to it (PacketPickUpItem: within
+    /// 1 cell) and picks it up on arrival. True when it looted (or tried), so the tick ends there as live.</summary>
+    private bool LootTick()
+    {
+        _ground.RemoveAll(g => g.Expires <= _t);
+        if (!_cfg.AutoLoot) return false;
+        var near = _ground.Where(g => !_cfg.LootBlacklist.Contains(g.ItemId) && !_skipDrops.Contains(g.DropId)
+                                     && !HuntPolicy.CellNearHazard(_hazards, g.X, g.Y) && Dist(g.X, g.Y, _x, _y) <= _cfg.LootRange)
+            .OrderBy(g => Dist(g.X, g.Y, _x, _y)).ToList();
+        if (near.Count == 0) return false;
+        var g = near[0];
+        if (_t < _nextLoot) Wait(_nextLoot - _t, flee: false, postKill: true); // the live _nextLoot throttle
+        _nextLoot = _t + _cfg.LootCooldownSeconds;
+        if (Dist(g.X, g.Y, _x, _y) > 1)
+        {
+            var path = _walk.FindPath(_x, _y, g.X, g.Y, ReachExpansions);
+            if (path == null) { _skipDrops.Add(g.DropId); Log($"can't reach {_data.ItemName(g.ItemId)} at ({g.X},{g.Y}): skipped", "loot-skip", x: g.X, y: g.Y); return true; }
+            var cut = path.FindIndex(c => Dist(c.x, c.y, g.X, g.Y) <= 1);
+            if (Walk(path.Take(cut + 1).ToList(), WalkKind.Loot, stopOnSighting: false) != WalkStop.Arrived) return true;
+        }
+        if (!_ground.Remove(g)) return true; // expired on the way
+        var total = _bag[g.ItemId] = _bag.GetValueOrDefault(g.ItemId) + g.Count;
+        Log($"pickup {_data.ItemName(g.ItemId)} +{g.Count} ({total} in the bag)", "loot", 0,
+            new { dropId = g.DropId, itemId = g.ItemId, name = _data.ItemName(g.ItemId), code = _data.Item(g.ItemId)?.Code, count = g.Count, total }, g.X, g.Y);
+        Wait(LiveTickSeconds, flee: false, postKill: true); // the next tick sees the next drop
+        return true;
     }
 
     private const double LiveTickSeconds = 0.25; // BotBehavior's tick loop delay
-    private const double LootSecondsPerKill = 0.4; // live pay_fild06 map summaries, "loot 0.4" s/kill
+    private const double GroundItemSeconds = 60;   // GroundItem.Expiration
     private const double ResitSeconds = 1.5;     // TickRestAsync's _nextSit throttle
 
     private (double Hp, double Sp) RestFractions() =>
@@ -1241,6 +1292,7 @@ public sealed class HuntSimulator
             {
                 lookNow = false;
                 if (RestIfDue()) { lookNow = true; continue; } // TickRestAsync runs before the target pick
+                if (LootTick()) { lookNow = true; continue; } // TickLootAsync: drops before a new target
                 var visible = Visible();
                 _inView.Clear();
                 foreach (var m in visible) _inView.Add(m.Id);
@@ -1450,7 +1502,7 @@ public sealed class HuntSimulator
             $"This run: {Flees} flees ({FleeTicks} flee ticks, {FleeSeconds:F0}s), {FightsLeft} fights broken off, {WalkInterruptions} walks interrupted.");
         Add("Threat forecasts", "approximated", "Hazards use the server-code duel at the current HP (the live server-forecast engine, not its hand-formula 'old' one); a pack is its members' duels killed quickest first while the rest keep hitting, not BattleSimulator.ForecastGroup's hand formula. Fly Wings don't exist (no inventory), so KillsMeFast isn't evaluated; the flee never winged out.",
             "Borderline hazards and packs can be judged slightly differently than live; a live bot carrying Fly Wings escapes ambushes this one fights through.");
-        Add("Items", "absent", "No potions, looting, zeny or inventory (gemstones, arrows to consume).", "HP comes back only by regen and sitting; skills needing ammo or catalysts are refused by the server.");
+        Add("Items", "approximated", "Kills roll the server's drop table onto the ground around the corpse; with AutoLoot the bot walks to each (nearest first, within LootRange, one pickup per LootCooldownSeconds) and picks it up (see the Inventory tab). No potions, zeny, weight, or using what was picked up (gemstones, arrows).", $"HP comes back only by regen and sitting; skills needing ammo or catalysts are refused by the server. This run picked up {_bag.Values.Sum()} items of {_bag.Count} kinds.");
         Add("Other players", "absent", "No party (ally rules never fire), no other players competing for monsters.", "Kill-stealing and party support don't exist here.");
         Add("Death", "approximated", "A death (in a fight, walking or sitting) revives at full HP at the run's start cell; the killer's class is avoided as live does. No EXP penalty, no save-point return trip.", "A dying build looks better than it would live.");
         Add("Progression", "absent", "The build is fixed for the whole run: no level-ups, stat or skill points.", "A long run keeps the recorded build's stats, HP and kill speed throughout.");

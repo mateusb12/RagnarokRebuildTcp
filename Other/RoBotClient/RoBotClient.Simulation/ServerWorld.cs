@@ -277,6 +277,19 @@ public sealed class ServerWorld
         }
     }
 
+    /// <summary>Monster.DoMonsterDrops' roll (the server's drop table, chance per 10000, count range) for a monster class,
+    /// on the caller's random stream so it doesn't shift the run's GameRandom. Monster.Die isn't run here (see above).
+    /// ponytail: no AddDropPercent, MVP guaranteed drop or the monster's stolen inventory; add if a map needs them.</summary>
+    public static List<(int ItemId, int Count)> RollDrops(int classId, Random rng)
+    {
+        var got = new List<(int, int)>();
+        if (!DataManager.MonsterIdLookup.TryGetValue(classId, out var mb) || !DataManager.MonsterDropData.TryGetValue(mb.Code, out var drops)) return got;
+        foreach (var d in drops.DropChances)
+            if (rng.Next(10000) <= d.Chance)
+                got.Add((d.Id, d.CountMax > 1 ? rng.Next(d.CountMin, d.CountMax + 1) : 1));
+        return got;
+    }
+
     /// <summary>Where the server has the player now (its own skills can move it: Back Slide, Teleport, walking into range).</summary>
     public (int X, int Y) PlayerPosition => (_player.Character.Position.X, _player.Character.Position.Y);
 

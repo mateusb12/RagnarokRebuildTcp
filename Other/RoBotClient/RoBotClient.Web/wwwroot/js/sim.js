@@ -15,7 +15,7 @@ const COLORS = {
 const ACTIVITY = {
     wander: { label: "wandering", color: "#8e7cc3" }, approach: { label: "walking to target", color: "#ffe066" },
     fight: { label: "fighting", color: "#e5484d" }, rest: { label: "resting", color: "#3b9dff" },
-    idle: { label: "wedged / idle", color: "#6c757d" }, flee: { label: "fleeing", color: "#ff8c42" }, none: { label: "deciding", color: "#2b303b" },
+    idle: { label: "wedged / idle", color: "#6c757d" }, flee: { label: "fleeing", color: "#ff8c42" }, loot: { label: "looting", color: "#f6c344" }, none: { label: "deciding", color: "#2b303b" },
 };
 const CATEGORY = {
     decision: ["pick", "nopick", "wander", "idle", "cast-decision", "attack-decision", "sit", "stand", "flee", "flee-move", "flee-end", "threat"],
@@ -23,15 +23,16 @@ const CATEGORY = {
     recovery: ["regen", "sit-refused", "stand-refused"],
     world: ["spawn", "area-start", "area-end", "area-status", "world", "sighting", "route", "start", "end", "note"],
     problem: ["failed"],
+    items: ["drop", "loot", "loot-skip"],
 };
 const KNOWN = new Set(Object.values(CATEGORY).flat());
 const MINOR = new Set(["hit", "hurt", "regen", "spawn", "attack-decision", "route", "area-status", "world", "castbar", "reach"]);
-const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon", "aggro", "flee", "flee-end", "threat"]);
+const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon", "aggro", "flee", "flee-end", "threat", "loot"]);
 const BADGE = {
     pick: "text-bg-success", nopick: "text-bg-warning", wander: "text-bg-secondary", idle: "text-bg-secondary", kill: "text-bg-success",
     death: "text-bg-danger", failed: "text-bg-danger", rejected: "text-bg-warning", "no-effect": "text-bg-warning", sit: "text-bg-info", stand: "text-bg-info",
     "cast-decision": "text-bg-primary", executed: "text-bg-primary", engage: "text-bg-light", hurt: "text-bg-danger", hit: "text-bg-dark",
-    aggro: "text-bg-danger", "monster-cast": "text-bg-danger", flee: "text-bg-warning", "flee-move": "text-bg-warning", threat: "text-bg-warning", "flee-end": "text-bg-secondary",
+    loot: "text-bg-warning", drop: "text-bg-light", "loot-skip": "text-bg-secondary", aggro: "text-bg-danger", "monster-cast": "text-bg-danger", flee: "text-bg-warning", "flee-move": "text-bg-warning", threat: "text-bg-warning", "flee-end": "text-bg-secondary",
 };
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -40,6 +41,14 @@ const pct = v => (100 * v).toFixed(0) + "%";
 const n1 = v => v == null ? "—" : (+v).toFixed(1);
 
 let current = null;
+
+const itemIcon = code => "icons/" + encodeURIComponent(code || "") + ".png"; // as WorldMap / BotDetail ItemIcon
+const images = new Map();
+/** map.js's loader: undefined while loading, null when missing. */
+function image(url) {
+    if (!images.has(url)) { images.set(url, undefined); const img = new Image(); img.onload = () => images.set(url, img); img.onerror = () => images.set(url, null); img.src = url; }
+    return images.get(url);
+}
 
 /** player: the bot's body and head sprite actions (MonsterSprites.PlayerAnim, camelCase), or null for a dot. */
 export async function mount(root, url, player, skillNames) {
@@ -90,6 +99,12 @@ class Viewer {
         const cut = (id, t) => { const l = this.mobLife.get(id); while (l?.length && l[l.length - 1].t > t && !l[l.length - 1].real) l.pop(); return l?.[l.length - 1]; };
         const die = (id, t) => { const p = cut(id, t); if (p?.alive) push(this.mobLife, id, { t, alive: false, x: p.x, y: p.y, dir: p.dir }); };
         this.areas = [];           // {t0, t1, x, y, skill, text}
+        // Drops on the ground: from the kill ("drop") until picked up ("loot", same dropId) or 60 s (GroundItem.Expiration).
+        this.ground = new Map();
+        for (const e of rp.events) {
+            if (e.kind === "drop") this.ground.set(e.detail.dropId, { x: e.x, y: e.y, name: e.detail.name, code: e.detail.code, count: e.detail.count, t0: e.t, t1: Math.min(rp.duration, e.t + 60) });
+            else if (e.kind === "loot" && this.ground.has(e.detail?.dropId)) this.ground.get(e.detail.dropId).t1 = e.t;
+        }
         const openAreas = new Map();
         // Wanders (rp.mobMoves, compact) merge into the timeline; on a tie the move comes first so an engage at that instant cuts it.
         const D = [[0, 1], [1, 1], [1, 0], [1, -1], [0, -1], [-1, -1], [-1, 0], [-1, 1]]; // HuntSimulator.StepDirs
@@ -116,7 +131,7 @@ class Viewer {
         let cur = "none", from = 0, fightMob = 0;
         const to = (act, t) => { if (act === cur) return; if (t > from) this.segments.push({ t0: from, t1: t, act: cur }); cur = act; from = t; };
         for (const e of rp.events) {
-            if (e.kind === "route") to(e.detail?.approach ? "approach" : e.detail?.flee ? "flee" : "wander", e.t);
+            if (e.kind === "route") to(e.detail?.approach ? "approach" : e.detail?.flee ? "flee" : e.detail?.loot ? "loot" : "wander", e.t);
             else if (e.kind === "flee") to("flee", e.t);
             else if (e.kind === "flee-end") to("none", e.t);
             else if (e.kind === "engage") { to("fight", e.t); fightMob = e.mob; }
@@ -177,7 +192,7 @@ class Viewer {
 '        <div class="form-check form-check-inline small mb-0"><input class="form-check-input" type="checkbox" data-a="follow" checked id="sim-follow"><label class="form-check-label" for="sim-follow">follow bot</label></div>' +
 '        <button class="btn btn-sm btn-outline-secondary" data-a="fit">Fit map</button>' +
 '        <select class="form-select form-select-sm" data-a="jump" style="width:auto">' + opt("", "Jump to next…") +
-           ["pick", "nopick", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "idle", "wander", "cast-decision"].map(k => opt(k, k)).join("") + '</select>' +
+           ["pick", "nopick", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "idle", "wander", "cast-decision", "loot"].map(k => opt(k, k)).join("") + '</select>' +
 '      </div>' +
 '      <canvas class="sim-strip mt-2" style="width:100%;height:46px;display:block;cursor:pointer;border-radius:4px" title="Timeline: click or drag to seek"></canvas>' +
 '      <div class="d-flex flex-wrap gap-3 small text-secondary mt-1">' +
@@ -187,7 +202,9 @@ class Viewer {
 '    </div></div>' +
 '  </div>' +
 '  <div class="col-xl-4">' +
-'    <div class="card" style="height:100%"><div class="card-body p-2 sim-inspector small" style="max-height:690px;overflow:auto"></div></div>' +
+'    <div class="card" style="height:100%">' +
+'      <ul class="nav nav-tabs small px-2 pt-2"><li class="nav-item"><a href="#" class="nav-link py-1 active" data-tab="world">World</a></li><li class="nav-item"><a href="#" class="nav-link py-1" data-tab="inventory">Inventory</a></li></ul>' +
+'      <div class="card-body p-2 sim-inspector small" style="max-height:650px;overflow:auto"></div></div>' +
 '  </div>' +
 '  <div class="col-12">' +
 '    <div class="card"><div class="card-body p-2">' +
@@ -223,6 +240,12 @@ class Viewer {
         q('[data-a="minor"]').onchange = () => { this.listDirty = true; this.renderList(); };
         q('[data-a="search"]').oninput = () => { this.listDirty = true; this.renderList(); };
         this.list.onclick = e => { const row = e.target.closest("[data-i]"); if (row) this.select(this.rp.events[+row.dataset.i]); };
+        this.tab = "world";
+        this.root.querySelectorAll("[data-tab]").forEach(a => a.onclick = e => {
+            e.preventDefault(); this.tab = a.dataset.tab;
+            this.root.querySelectorAll("[data-tab]").forEach(b => b.classList.toggle("active", b === a));
+            this.inspect();
+        });
         this.inspector.onclick = e => {
             const a = e.target.closest("[data-ev]"); if (a) { e.preventDefault(); this.select(this.rp.events[+a.dataset.ev]); return; }
             const m = e.target.closest("[data-mob]"); if (m) { e.preventDefault(); this.selectedMob = +m.dataset.mob; this.selected = null; this.inspect(); return; }
@@ -321,7 +344,7 @@ class Viewer {
         const v0 = this.toScreen(me.cx - 21.5, me.cy + 21.5);
         g.strokeStyle = COLORS.view; g.lineWidth = 1; g.setLineDash([4, 4]); g.strokeRect(v0.x, v0.y, 43 * z, 43 * z); g.setLineDash([]);
         const act = this.activityAt(t);
-        if (act === "wander" || act === "approach") {
+        if (act === "wander" || act === "approach" || act === "loot") {
             const route = this.lastOf(["route"], t);
             if (route && route.detail && route.detail.path) {
                 const p = route.detail.path; let start = 0;
@@ -339,6 +362,14 @@ class Viewer {
             g.fillRect(s.x - z * 1.5, s.y - z * 1.5, z * 3, z * 3); g.strokeRect(s.x - z * 1.5, s.y - z * 1.5, z * 3, z * 3);
             if (z >= 4) { g.fillStyle = COLORS.area; g.font = font(10); g.fillText(a.skill || "event", s.x - z * 1.5, s.y - z * 1.5 - 2); }
         }
+        // drops: the item's icon on its cell (map.js drawItem), a gold diamond until it loads
+        for (const it of this.ground.values()) if (it.t0 <= t && t < it.t1) {
+            const s = this.toScreen(it.x, it.y), img = image(itemIcon(it.code)), k = Math.max(10, Math.min(36, z * 1.3));
+            if (s.x < -k || s.y < -k || s.x > this.cw + k || s.y > this.ch + k) continue;
+            const pop = Math.min(1, (t - it.t0) / 0.3); // a short drop bounce, as the client's isNewDrop
+            const y = s.y - Math.sin(pop * Math.PI) * k * 0.6;
+            if (img) { g.imageSmoothingEnabled = true; g.drawImage(img, s.x - k / 2, y - k / 2, k, k); g.imageSmoothingEnabled = false; }
+            else { const d = k * 0.3; g.fillStyle = "#ffd54a"; g.beginPath(); g.moveTo(s.x, y - d); g.lineTo(s.x + d, y); g.lineTo(s.x, y + d); g.lineTo(s.x - d, y); g.closePath(); g.fill(); }        }
         const target = this.targetAt(t), rad = Math.max(2.5, z * 0.42);
         const sel = this.selected;
         const cand = sel && (sel.kind === "pick" || sel.kind === "nopick") && Math.abs(sel.t - t) < 1e-6 ? new Map(sel.detail.candidates.map(c => [c.mob, c])) : null;
@@ -431,6 +462,17 @@ class Viewer {
         g.fillStyle = COLORS.text; g.font = font(12, true); g.fillText(fmtT(t) + "  " + ACTIVITY[act].label, 16, 24);
         this.bar(g, 16, 32, 150, 8, vit.hp / this.rp.maxHp, "#198754"); g.font = font(10); g.fillStyle = COLORS.text; g.fillText("HP " + vit.hp + "/" + this.rp.maxHp, 172, 40);
         this.bar(g, 16, 46, 150, 6, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff"); g.fillStyle = COLORS.text; g.fillText("SP " + vit.sp + "/" + this.rp.maxSp, 172, 53);
+        // "Jellopy - 1 obtained." for 3 s at the top middle, as map.js drawToast (Unity's ItemObtainedToast)
+        for (let i = lastLE(ev, t, e => e.t); i >= 0 && ev[i].t > t - 3; i--) {
+            if (ev[i].kind !== "loot") continue;
+            const d = ev[i].detail || {}, txt = d.name + " - " + d.count + " obtained.", img = image(itemIcon(d.code)), k = img ? 20 : 0;
+            g.font = font(12, true); g.textBaseline = "middle";
+            const w = g.measureText(txt).width + (k ? k + 6 : 0), left = g.canvas.width / dpr() / 2 - w / 2, mid = 8 + 14;
+            g.fillStyle = "#000000aa"; g.fillRect(left - 6, 8, w + 12, 28);
+            if (img) g.drawImage(img, left, mid - k / 2, k, k);
+            g.fillStyle = COLORS.text; g.fillText(txt, left + k + (k ? 6 : 0), mid); g.textBaseline = "alphabetic";
+            break;
+        }
     }
     /** Where the HP bar's white trail ends at t, replayed from the drops in the last 2 s (it drains in under 0.4 s), so
      *  seeking and playing backwards show the same thing. */
@@ -520,7 +562,23 @@ class Viewer {
     mobLink(id) { const m = this.mobs.get(id); return m ? '<a href="#" data-mob="' + id + '">' + esc(m.name) + " #" + id + "</a>" : "#" + id; }
 
     inspect() {
+        if (this.tab === "inventory") { this.inspector.innerHTML = this.inventory(); return; }
         this.inspector.innerHTML = this.selectedMob ? this.explainMob(this.selectedMob) : this.selected ? this.explain(this.selected) : this.now();
+    }
+
+    /** The bag at t: every "loot" event so far (HuntSimulator.Loot), as the Character page's inventory card shows it. */
+    inventory() {
+        const t = this.t, got = this.rp.events.filter(e => e.kind === "loot" && e.t <= t), bag = new Map();
+        for (const e of got) { const d = e.detail || {}, it = bag.get(d.itemId) || { name: d.name, code: d.code, count: 0 }; it.count += d.count; bag.set(d.itemId, it); }
+        let h = '<div class="fw-semibold mb-1">Inventory at ' + fmtT(t) + ' <span class="text-secondary">(' + bag.size + ")</span></div>";
+        if (!bag.size) return h + '<div class="text-secondary">empty' + (this.rp.events.some(e => e.kind === "loot") ? "" : " (nothing dropped this run, or AutoLoot is off)") + "</div>";
+        h += '<div class="mb-2" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.25rem">';
+        for (const it of [...bag.values()].sort((a, b) => a.name.localeCompare(b.name)))
+            h += '<div class="d-flex align-items-center gap-1 border rounded px-1 py-1" title="' + esc(it.name) + '"><img src="' + itemIcon(it.code)
+                + '" alt="" width="24" height="24" style="object-fit:contain;flex:none" onerror="this.style.visibility=\'hidden\'"><span class="text-truncate flex-grow-1">'
+                + esc(it.name) + '</span><span class="fw-semibold">' + it.count + "</span></div>";
+        h += '</div><div class="fw-semibold">Pickups</div>';
+        return h + [...got].reverse().map(e => '<div>' + this.link(e, fmtT(e.t)) + " " + esc(e.detail?.name) + " +" + e.detail?.count + "</div>").join("");
     }
 
     now() {
