@@ -362,14 +362,6 @@ class Viewer {
             g.fillRect(s.x - z * 1.5, s.y - z * 1.5, z * 3, z * 3); g.strokeRect(s.x - z * 1.5, s.y - z * 1.5, z * 3, z * 3);
             if (z >= 4) { g.fillStyle = COLORS.area; g.font = font(10); g.fillText(a.skill || "event", s.x - z * 1.5, s.y - z * 1.5 - 2); }
         }
-        // drops: the item's icon on its cell (map.js drawItem), a gold diamond until it loads
-        for (const it of this.ground.values()) if (it.t0 <= t && t < it.t1) {
-            const s = this.toScreen(it.x, it.y), img = image(itemIcon(it.code)), k = Math.max(10, Math.min(36, z * 1.3));
-            if (s.x < -k || s.y < -k || s.x > this.cw + k || s.y > this.ch + k) continue;
-            const pop = Math.min(1, (t - it.t0) / 0.3); // a short drop bounce, as the client's isNewDrop
-            const y = s.y - Math.sin(pop * Math.PI) * k * 0.6;
-            if (img) { g.imageSmoothingEnabled = true; g.drawImage(img, s.x - k / 2, y - k / 2, k, k); g.imageSmoothingEnabled = false; }
-            else { const d = k * 0.3; g.fillStyle = "#ffd54a"; g.beginPath(); g.moveTo(s.x, y - d); g.lineTo(s.x + d, y); g.lineTo(s.x, y + d); g.lineTo(s.x - d, y); g.closePath(); g.fill(); }        }
         const target = this.targetAt(t), rad = Math.max(2.5, z * 0.42);
         const sel = this.selected;
         const cand = sel && (sel.kind === "pick" || sel.kind === "nopick") && Math.abs(sel.t - t) < 1e-6 ? new Map(sel.detail.candidates.map(c => [c.mob, c])) : null;
@@ -410,6 +402,15 @@ class Viewer {
         }
         const b = this.toScreen(me.x, me.y), vit = this.vitalsAt(t), sitting = act === "rest", br = Math.max(3.5, z * 0.5);
         if (target) { const m = this.mobAt(target, t), s = this.toScreen(m.x, m.y); g.strokeStyle = COLORS.target; g.globalAlpha = 0.6; g.lineWidth = 1.5; g.beginPath(); g.moveTo(b.x, b.y); g.lineTo(s.x, s.y); g.stroke(); g.globalAlpha = 1; }
+        // drops: the item's icon on its cell (map.js drawItem), a gold diamond until it loads
+        for (const it of this.ground.values()) if (it.t0 <= t && t < it.t1) {
+            const s = this.toScreen(it.x, it.y), img = image(itemIcon(it.code)), k = Math.max(10, Math.min(36, z * 1.3));
+            if (s.x < -k || s.y < -k || s.x > this.cw + k || s.y > this.ch + k) continue;
+            // Unity GroundItem.Update: an animated drop starts 0.2 up at 20 units/s, gravity 120/s² (≈0.35 s in the air, ≈1.9 tiles high)
+            const a = t - it.t0, h = Math.max(0, 0.2 + 20 * a - 60 * a * a), y = s.y - h * z;
+            g.fillStyle = "#0006"; g.beginPath(); g.ellipse(s.x, s.y + k * 0.35, k * 0.35, k * 0.14, 0, 0, 7); g.fill(); // SpriteUtil.AttachShadowToGameObject
+            if (img) { g.imageSmoothingEnabled = true; g.drawImage(img, s.x - k / 2, y - k / 2, k, k); g.imageSmoothingEnabled = false; }
+            else { const d = k * 0.3; g.fillStyle = "#ffd54a"; g.beginPath(); g.moveTo(s.x, y - d); g.lineTo(s.x + d, y); g.lineTo(s.x, y + d); g.lineTo(s.x - d, y); g.closePath(); g.fill(); }        }
         const pl = this.player && Sprites.playerLayers(this.player, this.playerMoves, this.rp, t, me, b, act, target && this.mobAt(target, t), Math.max(z, 8) * 1.5 / 50);
         if (pl) { g.fillStyle = "#0008"; g.beginPath(); g.ellipse(b.x, b.y + 2, br * 1.6, br * 0.7, 0, 0, 7); g.fill(); drawLayers(g, pl); }
         else { g.fillStyle = COLORS.self; g.beginPath(); g.arc(b.x, b.y, br, 0, 7); g.fill(); g.strokeStyle = "#fff"; g.lineWidth = 1.5; g.stroke(); }

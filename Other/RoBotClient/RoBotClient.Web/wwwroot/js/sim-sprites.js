@@ -17,7 +17,7 @@ export const hpColor = pct => pct <= 0.25 ? "#dc3545" : pct <= 0.5 ? "#ffc107" :
 
 // Client motion layout (RoAnimationHelper.GetMotionIdForSprite): action = motion + facing.
 export const MON = { idle: 0, walk: 8, attack: 16, hit: 24, dead: 32 };
-export const PLR = { idle: 0, walk: 8, sit: 16, standby: 32, throw: 40, hit: 48, dead: 64, attack2: 80, attack1: 88, casting: 96 };
+export const PLR = { idle: 0, walk: 8, sit: 16, pickup: 24, standby: 32, throw: 40, hit: 48, dead: 64, attack2: 80, attack1: 88, casting: 96 };
 
 /** RO Direction (South 0, SouthWest 1 ... SouthEast 7) from a world offset, Y up. */
 export function facing(dx, dy) { if (!dx && !dy) return 0; return [6, 5, 4, 3, 2, 1, 0, 7][((Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) % 8) + 8) % 8]; }
@@ -234,6 +234,8 @@ export function indexPlayer(rp, P) {
             out.push({ t0: e.t, until: Math.min(e.t + (e.amount || 0) / 1000, end ? end.t : Infinity), motion: c === "attack" ? P.attack : c === "standby" ? PLR.standby : PLR.casting, hold: c !== "standby" });
         }
         else if (e.kind === "hurt" && e.amount > 0) out.push({ t0: e.t, motion: PLR.hit, speed: 1 });
+        // PacketPickUpItem (client): LookAt the item, StopImmediate, ChangeMotion(SpriteMotion.PickUp)
+        else if (e.kind === "loot" && e.x >= 0) out.push({ t0: e.t, motion: PLR.pickup, speed: 1, at: { x: e.x, y: e.y } });
         else if (e.kind === "death") out.push({ t0: e.t, until: e.t + 2, motion: PLR.dead, speed: 1, hold: true, dead: true });
     }
     return out.sort((a, b) => a.t0 - b.t0);
@@ -252,9 +254,11 @@ export function playerLayers(P, moves, rp, t, me, b, act, tm, px) {
     for (let i = lastLE(moves, t, m => m.t0), n = 0; i >= 0 && n < 12; i--, n++) {
         const m = moves[i], age = (t - m.t0) * 1000;
         if (m.until != null && t >= m.until) continue;
+        const was = dir; if (m.at) dir = facing(m.at.x - me.x, m.at.y - me.y);
         if (m.until != null && m.hold && !m.dead) { motion = m.motion; fi = 0; break; }
         const f = once(action(m.motion), age, m.speed || 1, m.hold);
         if (f != null) { motion = m.motion; fi = f; break; }
+        dir = was;
     }
     if (motion == null) {
         // Idle and sit hold the head-facing frame (0: straight ahead); walk and battle stance loop.

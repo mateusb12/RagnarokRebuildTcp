@@ -169,6 +169,13 @@ public sealed class ServerWorld
     public double Clock { get; private set; }
     /// <summary>When the server lets the player walk again (WorldObject.MoveLockTime: a swing locks it for AttackMotionTime).</summary>
     public double MoveLockUntil => _player.Character.MoveLockTime;
+
+    /// <summary>Until when the player's attack delay runs: the server holds a queued pickup until it ends
+    /// (Player.Update: QueuedAction.PickUpItem waits on !InAttackCooldown).</summary>
+    public double AttackCooldownUntil => _player.Character.AttackCooldown;
+
+    /// <summary>Player.TryPickup's "no attacking for 0.3s after picking up an item".</summary>
+    public void PickedUp(double at) => _player.Character.AttackCooldown = at + 0.3;
     public int MapWidth => _map.Width;
     public int MapHeight => _map.Height;
     public int PlayerId => _player.Character.Id;

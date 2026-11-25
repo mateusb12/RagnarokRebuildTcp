@@ -1063,7 +1063,10 @@ public sealed class HuntSimulator
             var cut = path.FindIndex(c => Dist(c.x, c.y, g.X, g.Y) <= 1);
             if (Walk(path.Take(cut + 1).ToList(), WalkKind.Loot, stopOnSighting: false) != WalkStop.Arrived) return true;
         }
+        // PacketPickUpItem / Player.Update: the server holds the pickup until the attack delay is over (the killing swing's)
+        if (_t < _world.AttackCooldownUntil) Wait(_world.AttackCooldownUntil - _t, flee: false, postKill: true);
         if (!_ground.Remove(g)) return true; // expired on the way
+        _world.PickedUp(_t); // Player.TryPickup: no attacking for 0.3 s after
         var total = _bag[g.ItemId] = _bag.GetValueOrDefault(g.ItemId) + g.Count;
         Log($"pickup {_data.ItemName(g.ItemId)} +{g.Count} ({total} in the bag)", "loot", 0,
             new { dropId = g.DropId, itemId = g.ItemId, name = _data.ItemName(g.ItemId), code = _data.Item(g.ItemId)?.Code, count = g.Count, total }, g.X, g.Y);
