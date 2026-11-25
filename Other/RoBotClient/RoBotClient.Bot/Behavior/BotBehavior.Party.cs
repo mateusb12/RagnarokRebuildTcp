@@ -100,11 +100,7 @@ public sealed partial class BotBehavior
                             // On target SWITCH attack immediately. On a continuing target, the server keeps
                             // the auto-attack going server-side; only re-send Attack after the 3s safety
                             // cooldown to keep the packet rate down.
-                            if (switched || DateTime.UtcNow >= _nextAttack)
-                            {
-                                _nextAttack = DateTime.UtcNow.AddSeconds(3);
-                                await _bot.AttackAsync(_targetId, ct);
-                            }
+                            await SendAttackAsync(_targetId, now: switched, ct);
                             return true;
                         }
                     }
@@ -130,11 +126,7 @@ public sealed partial class BotBehavior
                     }
                     Mode = BotMode.Hunting;
                     if (await TickSkillsAsync(snap, m, ct)) return true;
-                    if (switched || DateTime.UtcNow >= _nextAttack)
-                    {
-                        _nextAttack = DateTime.UtcNow.AddSeconds(3);
-                        await _bot.AttackAsync(_targetId, ct);
-                    }
+                    await SendAttackAsync(_targetId, now: switched, ct);
                     return true;
                 }
             }
@@ -164,11 +156,7 @@ public sealed partial class BotBehavior
                         }
                         Mode = BotMode.Hunting;
                         if (await TickSkillsAsync(snap, ownTarget, ct)) return true;
-                        if (switched || DateTime.UtcNow >= _nextAttack)
-                        {
-                            _nextAttack = DateTime.UtcNow.AddSeconds(3);
-                            await _bot.AttackAsync(_targetId, ct);
-                        }
+                        await SendAttackAsync(_targetId, now: switched, ct);
                         return true;
                     }
                 }

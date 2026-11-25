@@ -158,9 +158,8 @@ public sealed partial class BotBehavior
                 _targetClass = best.ClassId;
                 TargetName = best.Name;
                 Mode = BotMode.Hunting;
-                _nextAttack = DateTime.UtcNow.AddSeconds(3);
                 OnLog?.Invoke($"Following !engage — switching to '{best.Name}'.");
-                await _bot.AttackAsync(best.Id, ct);
+                await SendAttackAsync(best.Id, now: true, ct);
                 return true;
             }
 

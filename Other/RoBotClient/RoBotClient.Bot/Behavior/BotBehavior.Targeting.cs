@@ -68,6 +68,22 @@ public sealed partial class BotBehavior
         return true;
     }
 
+    // The server drops the attack lock now and then (and during every walk), so a running fight re-sends Attack this often.
+    private static readonly TimeSpan AttackResend = TimeSpan.FromSeconds(3);
+
+    /// <summary>Sends Attack on <paramref name="targetId"/>: right away when <paramref name="now"/>, otherwise only once the
+    /// re-send is due.</summary>
+    private async Task SendAttackAsync(int targetId, bool now, CancellationToken ct)
+    {
+        // NoAutoAttack: pure casters (Mage / Wizard / skill-only builds) skip the auto re-assert.
+        // The skill script is the entire combat loop in that mode. Without an auto-attack the bot
+        // also can't waste its swing animation on a wrong-element target while the skill cooldown
+        // ticks. Skills, heals, walking, looting still work the same.
+        if (_config.NoAutoAttack || (!now && DateTime.UtcNow < _nextAttack)) return;
+        _nextAttack = DateTime.UtcNow + AttackResend;
+        await _bot.AttackAsync(targetId, ct);
+    }
+
     private async Task EngageAsync(Snapshot snap, MonsterInfo target, BattleForecast forecast, string why, CancellationToken ct)
     {
         _targetId = target.Id;
@@ -79,7 +95,7 @@ public sealed partial class BotBehavior
         RecordDuelStart(snap, target, forecast);
         var source = _config.ServerForecast == ServerForecastMode.On ? $" [forecast: {_decision?.Source ?? "old, not a PickTarget decision"}]" : "";
         _decision = null;
-        _nextAttack = DateTime.UtcNow.AddSeconds(3);
+        _nextAttack = DateTime.UtcNow + AttackResend;
         _duel = new DuelStart(DateTime.UtcNow, snap.SelfHp, snap.SelfSp, target.Name);
         OnLog?.Invoke($"Engaging {target.Name} (hp {target.MaxHp}): my hit ~{forecast.MyDamagePerHit}@{forecast.MyHitChance:P0}, " +
                       $"its hit ~{forecast.MonsterDamagePerHit}@{forecast.MonsterHitChance:P0}, " +
@@ -91,8 +107,8 @@ public sealed partial class BotBehavior
         // A fixed monster is shot from a safe cell; the next tick walks there first (the server's attack-walk would stop
         // at the first in-range cell, maybe inside another plant's reach).
         var walkFirst = SnipesFixed(snap, target) && FindFiringSpot(snap, target) is { } spot && (spot.X != snap.SelfPos.X || spot.Y != snap.SelfPos.Y);
-        if (!_config.NoAutoAttack && !walkFirst)
-            await _bot.AttackAsync(target.Id, ct);
+        if (!walkFirst)
+            await SendAttackAsync(target.Id, now: true, ct);
     }
 
     /// <summary>One tick against the committed target: abandon it when stuck, otherwise position, cast, kite or attack.</summary>
@@ -117,16 +133,7 @@ public sealed partial class BotBehavior
         // melee-style attack re-assert below. The predicate inside ShouldKiteThisTarget gates all
         // negative-space cases (melee, tank, stationary mob, equal-range mob, etc.).
         if (await TryKiteEngagementAsync(snap, current, ct)) return;
-        // NoAutoAttack: pure casters (Mage / Wizard / skill-only builds) skip the auto re-assert.
-        // The skill script is the entire combat loop in that mode. Without an auto-attack the bot
-        // also can't waste its swing animation on a wrong-element target while the skill cooldown
-        // ticks. Skills, heals, walking, looting still work the same.
-        if (_config.NoAutoAttack) return;
-        if (DateTime.UtcNow >= _nextAttack)
-        {
-            _nextAttack = DateTime.UtcNow.AddSeconds(3);
-            await _bot.AttackAsync(_targetId, ct); // re-assert in case the server dropped the attack lock
-        }
+        await SendAttackAsync(_targetId, now: false, ct); // re-assert in case the server dropped the attack lock
         return;
     }
 

@@ -572,7 +572,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
 
             case ShopPhase.Approach:
                 if (!InShopRoom(snap)) { _shopPhase = ShopPhase.Travel; return; } // wrong room of an indoor map
-                var npcId = _bot.WithState(FindNpcEntityId);
+                var npcId = _bot.WithState(w => FindNpcNear(w, _shopX, _shopY));
                 if (npcId != 0) // NPC is in view — the server has no click range check, so click from here
                 {
                     _shopOrderSent = false;
@@ -620,7 +620,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
                 // The server silently drops a click inside its input cooldown, which every walk step starts: the bot clicked
                 // right after its last step and waited out the whole conversation ("conversation stalled", 11-16: Bot2 looped
                 // on prt_fild05's Tool Dealer every ~2 min). No reply after ~2 s: click again.
-                if (_shopSteps % 4 == 0 && _bot.WithState(FindNpcEntityId) is var npcId and not 0)
+                if (_shopSteps % 4 == 0 && _bot.WithState(w => FindNpcNear(w, _shopX, _shopY)) is var npcId and not 0)
                     await _bot.NpcClickAsync(npcId, ct);
                 return;
             case NpcPhase.Dialog:
@@ -893,19 +893,6 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
                 orders.Add((it.BagId, it.ItemId, it.Count));
         }
         return orders;
-    }
-
-    private int FindNpcEntityId(WorldState w)
-    {
-        var best = 0;
-        var bestD = int.MaxValue;
-        foreach (var e in w.Entities.Values)
-        {
-            if (!e.IsNpc) continue;
-            var d = Math.Max(Math.Abs(e.Position.X - _shopX), Math.Abs(e.Position.Y - _shopY));
-            if (d <= 3 && d < bestD) { bestD = d; best = e.Id; }
-        }
-        return best;
     }
 
     /// <summary>The last A* path the travel walker planned (map, cells start..goal), for the dashboard's world view.
@@ -1281,39 +1268,6 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         double? average = samples > 0 ? total / samples : null;
         if (average is { } value) _averageLandingDistance[(map, portalX, portalY)] = value;
         return average;
-    }
-
-    /// <summary>Wing-escape regardless of <see cref="BotBehaviorConfig.AutoEscapeWhenStuck"/> — the
-    /// trap branch knows the bot has zero forward path and Fly Wing is the only recovery short of a
-    /// server restart. Throttled so we don't fire one every tick.</summary>
-    private DateTime _nextWingEscape = DateTime.MinValue;
-    private async Task TryTrapWingEscapeAsync(double trapSecs, CancellationToken ct)
-    {
-        if (_data == null) return;
-        if (DateTime.UtcNow < _nextWingEscape) return;
-        // Find what we have. Fly Wing first; Butterfly Wing only after the longer threshold so we don't
-        // throw the bot back to save point on a 5-second trap that Fly Wing alone could solve.
-        var (hasFly, hasButterfly) = _bot.WithState(w =>
-        {
-            var fly = false; var b = false;
-            foreach (var it in w.Self.Inventory)
-            {
-                if (it.ItemId == _config.FlyWingItemId) fly = true;
-                else if (it.ItemId == _config.ButterflyWingItemId) b = true;
-            }
-            return (fly, b);
-        });
-
-        var pick = 0;
-        if (hasFly && _data.IsUsableItem(_config.FlyWingItemId))
-            pick = _config.FlyWingItemId;
-        else if (trapSecs >= 15.0 && hasButterfly && _data.IsUsableItem(_config.ButterflyWingItemId))
-            pick = _config.ButterflyWingItemId;
-        if (pick == 0) return;
-
-        _nextWingEscape = DateTime.UtcNow.AddSeconds(3);
-        OnLog?.Invoke($"Sub-region trap escape: using {(pick == _config.FlyWingItemId ? "Fly Wing" : "Butterfly Wing")} (trapped {trapSecs:F0}s).");
-        await _bot.UseInventoryItemAsync(pick, -1, ct);
     }
 
     /// <summary>True if we can find a walkable portal on the current map that leads (eventually) toward

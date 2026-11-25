@@ -196,19 +196,6 @@ public sealed partial class BotBehavior
 
     private static int FindOr(int found, int fallback) => found >= 0 ? found : fallback;
 
-    private int FindNpcNear(WorldState w, int x, int y)
-    {
-        var best = 0;
-        var bestD = int.MaxValue;
-        foreach (var e in w.Entities.Values)
-        {
-            if (!e.IsNpc) continue;
-            var d = Math.Max(Math.Abs(e.Position.X - x), Math.Abs(e.Position.Y - y));
-            if (d <= 3 && d < bestD) { bestD = d; best = e.Id; }
-        }
-        return best;
-    }
-
     private async Task AbortJobChangeAsync(string reason, CancellationToken ct)
     {
         OnLog?.Invoke($"Job change aborted: {reason}.");

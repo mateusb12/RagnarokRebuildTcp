@@ -122,9 +122,7 @@ public sealed partial class BotBehavior
         if (_kiteFireAfterStep && snap.SelfPos.X == _kiteLastSelfPos.X && snap.SelfPos.Y == _kiteLastSelfPos.Y)
         {
             _kiteFireAfterStep = false;
-            _nextAttack = DateTime.UtcNow.AddSeconds(3);
-            if (!_config.NoAutoAttack)
-                await _bot.AttackAsync(target.Id, ct);
+            await SendAttackAsync(target.Id, now: true, ct);
         }
         _kiteLastSelfPos = snap.SelfPos;
 
@@ -134,11 +132,7 @@ public sealed partial class BotBehavior
         if (_kiteMode == KiteMode.Suspended)
         {
             // Anchor-and-trade: stand still, re-fire on _nextAttack like the melee path.
-            if (DateTime.UtcNow >= _nextAttack && !_config.NoAutoAttack)
-            {
-                _nextAttack = DateTime.UtcNow.AddSeconds(3);
-                await _bot.AttackAsync(target.Id, ct);
-            }
+            await SendAttackAsync(target.Id, now: false, ct);
             // Once the gap re-opens (mob's RandomMove drifted away, or stun expired), exit Suspended.
             if (distNow >= _kiteSweetSpot + 2) { _kiteMode = KiteMode.Active; ResetKiteSampling(); }
             return true;
@@ -202,11 +196,7 @@ public sealed partial class BotBehavior
         }
 
         // SETTLED — at sweet spot OR swing-imminent OR step-cooldown-cooling. Fire on cooldown.
-        if (DateTime.UtcNow >= _nextAttack && !_config.NoAutoAttack)
-        {
-            _nextAttack = DateTime.UtcNow.AddSeconds(3);
-            await _bot.AttackAsync(target.Id, ct);
-        }
+        await SendAttackAsync(target.Id, now: false, ct);
         return true;
     }
 

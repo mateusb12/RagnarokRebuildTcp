@@ -16,6 +16,20 @@ public sealed partial class BotBehavior
         return null;
     }
 
+    /// <summary>Nearest NPC within 3 cells of (x, y), or 0: the shop or job NPC we walked to.</summary>
+    private static int FindNpcNear(WorldState w, int x, int y)
+    {
+        var best = 0;
+        var bestD = int.MaxValue;
+        foreach (var e in w.Entities.Values)
+        {
+            if (!e.IsNpc) continue;
+            var d = Math.Max(Math.Abs(e.Position.X - x), Math.Abs(e.Position.Y - y));
+            if (d <= 3 && d < bestD) { bestD = d; best = e.Id; }
+        }
+        return best;
+    }
+
     private static int Dist(Position a, Position b) => Math.Max(Math.Abs(a.X - b.X), Math.Abs(a.Y - b.Y));
 
     internal sealed record MonsterInfo(int Id, int ClassId, string Name, Position Pos, int Hp, int MaxHp);

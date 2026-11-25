@@ -20,6 +20,25 @@ public sealed partial class BotBehavior
     private const int ConfineCells = 10;
     private static readonly TimeSpan ConfinedFlyWing = TimeSpan.FromSeconds(30), ConfinedButterflyWing = TimeSpan.FromSeconds(60);
 
+    private bool CanUseWing(int itemId) => HasItem(itemId) && _data?.IsUsableItem(itemId) == true;
+
+    /// <summary>Fly Wing first (same map, cheap); a Butterfly Wing (back to the save point) only when the caller allows it.
+    /// 0 when neither is usable.</summary>
+    private int PickEscapeWing(bool butterflyOk) =>
+        CanUseWing(_config.FlyWingItemId) ? _config.FlyWingItemId
+        : butterflyOk && CanUseWing(_config.ButterflyWingItemId) ? _config.ButterflyWingItemId : 0;
+
+    private string WingName(int itemId) => itemId == _config.FlyWingItemId ? "Fly Wing" : "Butterfly Wing";
+
+    private bool EscapeWingReady => DateTime.UtcNow >= _nextEscapeItem;
+
+    /// <summary>Every wing escape goes through here, so they all share one throttle.</summary>
+    private async Task UseEscapeWingAsync(int itemId, double throttleSeconds, CancellationToken ct)
+    {
+        _nextEscapeItem = DateTime.UtcNow.AddSeconds(throttleSeconds);
+        await _bot.UseInventoryItemAsync(itemId, -1, ct);
+    }
+
     /// <summary>True when it used a wing instead of nudging.</summary>
     private async Task<bool> EscapeConfinementAsync(Snapshot snap, CancellationToken ct)
     {
@@ -34,9 +53,8 @@ public sealed partial class BotBehavior
         _nudgeAnchor.last = now;
         var confined = now - a.since;
         if (confined < ConfinedFlyWing) return false;
-        var (fly, butterfly) = (CountInInventory(_config.FlyWingItemId) > 0 && _data?.IsUsableItem(_config.FlyWingItemId) == true,
-            CountInInventory(_config.ButterflyWingItemId) > 0 && _data?.IsUsableItem(_config.ButterflyWingItemId) == true);
-        var item = fly ? _config.FlyWingItemId : butterfly && confined >= ConfinedButterflyWing ? _config.ButterflyWingItemId : 0;
+        var (fly, butterfly) = (CanUseWing(_config.FlyWingItemId), CanUseWing(_config.ButterflyWingItemId));
+        var item = PickEscapeWing(confined >= ConfinedButterflyWing);
         if (!_confinedLogged)
         {
             _confinedLogged = true;
@@ -45,10 +63,9 @@ public sealed partial class BotBehavior
                 + $"(mode {Mode}, planned path {planned}, {HazardZones().Count} hazard zone(s)); "
                 + (fly ? "using a Fly Wing." : butterfly ? $"no Fly Wing, Butterfly Wing at {ConfinedButterflyWing.TotalSeconds:F0}s." : "no Fly Wing or Butterfly Wing to escape with."));
         }
-        if (item == 0 || now < _nextEscapeItem) return false;
-        _nextEscapeItem = now.AddSeconds(5);
-        OnLog?.Invoke($"Stuck: using a {(item == _config.FlyWingItemId ? "Fly Wing" : "Butterfly Wing")} after {confined.TotalSeconds:F0}s confined near ({a.at.X},{a.at.Y}).");
-        await _bot.UseInventoryItemAsync(item, -1, ct);
+        if (item == 0 || !EscapeWingReady) return false;
+        OnLog?.Invoke($"Stuck: using a {WingName(item)} after {confined.TotalSeconds:F0}s confined near ({a.at.X},{a.at.Y}).");
+        await UseEscapeWingAsync(item, 5, ct);
         _nudgeAnchor = default;
         return true;
     }
@@ -56,45 +73,18 @@ public sealed partial class BotBehavior
     private async Task<bool> TryEscapeStuckAsync(Snapshot snap, CancellationToken ct)
     {
         if (!_config.AutoEscapeWhenStuck || _data == null) return false;
-        if (DateTime.UtcNow < _nextEscapeItem) return false;
+        if (!EscapeWingReady) return false;
 
         var stuckSecs = (DateTime.UtcNow - _lastProgressAt).TotalSeconds;
         if (stuckSecs < _config.FlyWingStuckSeconds) return false;
 
-        var (hasFly, hasButterfly) = _bot.WithState(w =>
-        {
-            var fly = false; var bfly = false;
-            foreach (var it in w.Self.Inventory)
-            {
-                if (it.Count <= 0) continue;
-                if (it.ItemId == _config.FlyWingItemId) fly = true;
-                else if (it.ItemId == _config.ButterflyWingItemId) bfly = true;
-            }
-            return (fly, bfly);
-        });
-
         // Prefer Fly Wing first — same map, cheap, fast. Fall back to Butterfly Wing only after a longer
         // wait (we've either run out of Fly Wings or none were in the bag in the first place).
-        int itemId;
-        string itemName;
-        if (hasFly && _data.IsUsableItem(_config.FlyWingItemId))
-        {
-            itemId = _config.FlyWingItemId;
-            itemName = "Fly Wing";
-        }
-        else if (hasButterfly && stuckSecs >= _config.ButterflyWingStuckSeconds && _data.IsUsableItem(_config.ButterflyWingItemId))
-        {
-            itemId = _config.ButterflyWingItemId;
-            itemName = "Butterfly Wing";
-        }
-        else
-        {
-            return false;
-        }
+        var itemId = PickEscapeWing(stuckSecs >= _config.ButterflyWingStuckSeconds);
+        if (itemId == 0) return false;
 
-        OnLog?.Invoke($"Stuck for {stuckSecs:F0}s — using {itemName} to escape.");
-        _nextEscapeItem = DateTime.UtcNow.AddSeconds(5); // throttle so we don't blow the whole stack at once
-        await _bot.UseInventoryItemAsync(itemId, -1, ct);
+        OnLog?.Invoke($"Stuck for {stuckSecs:F0}s — using {WingName(itemId)} to escape.");
+        await UseEscapeWingAsync(itemId, 5, ct); // throttle so we don't blow the whole stack at once
         ResetStuck(snap.SelfPos);
         return true;
     }
@@ -104,15 +94,28 @@ public sealed partial class BotBehavior
     private async Task<bool> TryEscapeWallAsync(Snapshot snap, bool stuck, CancellationToken ct)
     {
         if (stuck && snap.SelfPos is not { X: 0, Y: 0 } // (0,0) = position not received yet after a map change
-            && DateTime.UtcNow >= _nextEscapeItem && _data?.GetWalkMap(snap.Map) is { } here
+            && EscapeWingReady && _data?.GetWalkMap(snap.Map) is { } here
             && !here.IsWalkable(snap.SelfPos.X, snap.SelfPos.Y)
-            && _bot.WithState(w => w.Self.Inventory.Any(it => it.ItemId == _config.FlyWingItemId && it.Count > 0)))
+            && CanUseWing(_config.FlyWingItemId))
         {
-            _nextEscapeItem = DateTime.UtcNow.AddSeconds(3);
             OnLog?.Invoke($"Standing in a wall at ({snap.SelfPos.X},{snap.SelfPos.Y}) on {snap.Map} — using a Fly Wing to get out.");
-            await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
+            await UseEscapeWingAsync(_config.FlyWingItemId, 3, ct);
             return true;
         }
         return false;
+    }
+
+    /// <summary>Wing-escape regardless of <see cref="BotBehaviorConfig.AutoEscapeWhenStuck"/> — the
+    /// trap branch knows the bot has zero forward path and Fly Wing is the only recovery short of a
+    /// server restart. Throttled so we don't fire one every tick.</summary>
+    private async Task TryTrapWingEscapeAsync(double trapSecs, CancellationToken ct)
+    {
+        if (!EscapeWingReady) return;
+        // Find what we have. Fly Wing first; Butterfly Wing only after the longer threshold so we don't
+        // throw the bot back to save point on a 5-second trap that Fly Wing alone could solve.
+        var pick = PickEscapeWing(trapSecs >= 15.0);
+        if (pick == 0) return;
+        OnLog?.Invoke($"Sub-region trap escape: using {WingName(pick)} (trapped {trapSecs:F0}s).");
+        await UseEscapeWingAsync(pick, 3, ct);
     }
 }

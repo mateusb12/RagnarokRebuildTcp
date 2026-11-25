@@ -247,12 +247,10 @@ public sealed partial class BotBehavior
     private async Task<bool> TryEmergencyFlyWingAsync(Snapshot snap, CancellationToken ct)
     {
         if (snap.SelfMaxHp <= 0 || snap.SelfHp >= snap.SelfMaxHp * 0.25 || !Ambushed(snap, out var hurt)) return false;
-        if (DateTime.UtcNow < _nextEscapeItem || _data?.IsUsableItem(_config.FlyWingItemId) != true
-            || CountInInventory(_config.FlyWingItemId) <= 0) return false;
+        if (!EscapeWingReady || !CanUseWing(_config.FlyWingItemId)) return false;
         OnLog?.Invoke($"Emergency: {hurt} — using a Fly Wing to get out.");
-        _nextEscapeItem = DateTime.UtcNow.AddSeconds(3);
         ClearTarget();
-        await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
+        await UseEscapeWingAsync(_config.FlyWingItemId, 3, ct);
         return true;
     }
 
@@ -299,16 +297,14 @@ public sealed partial class BotBehavior
                 var hurt = Ambushed(snap, out var why) || KillsMeFast(snap, hz.name, nearestD, hz.radius, out why);
                 return (hurt, why);
             },
-            canFlyWing: () => DateTime.UtcNow >= _nextEscapeItem && _data?.IsUsableItem(_config.FlyWingItemId) == true
-                              && _bot.WithState(w => w.Self.Inventory.Any(it => it.ItemId == _config.FlyWingItemId && it.Count > 0)));
+            canFlyWing: () => EscapeWingReady && CanUseWing(_config.FlyWingItemId));
         switch (flee.Kind)
         {
             case FleeKind.FlyWing:
                 OnLog?.Invoke(flee.Message);
                 _lastFleeAction = $"Fly Wing away from '{hz.name}'";
                 _lastFleeAt = DateTime.UtcNow;
-                _nextEscapeItem = DateTime.UtcNow.AddSeconds(3); // let the teleport land before judging again
-                await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
+                await UseEscapeWingAsync(_config.FlyWingItemId, 3, ct); // let the teleport land before judging again
                 break;
             case FleeKind.WalkBlind: // no walk map
                 await _bot.WalkToAsync(flee.X, flee.Y, ct);
