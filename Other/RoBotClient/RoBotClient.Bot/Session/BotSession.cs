@@ -132,7 +132,7 @@ public sealed class BotSession : IAsyncDisposable
             if (item != null) equipment.Add(new EquippedItem((EquipSlot)slot, item.ItemId, item.Refine, item.Cards.ToArray()));
         }
         var build = new PlayerBuild(self.Level, self.JobLevel, self.JobId, self.Str, self.Agi, self.Vit, self.Int, self.Dex, self.Luk,
-            skills, equipment, self.AmmoId);
+            skills, equipment, self.AmmoId, self.UnequippedCounts());
         var live = new LiveStats(self.MaxHp, self.MaxSp, self.Attack, self.AttackMax, self.Def, self.MDef, self.Hit, self.Flee,
             self.AddCrit, self.Stats.GetValueOrDefault(CharacterStat.PerfectDodge), self.AttackSpeed);
         return (build, live);
@@ -149,8 +149,8 @@ public sealed class BotSession : IAsyncDisposable
         duel.EndedAt = DuelClock(duel);
         // A gear change mid-fight (Bot5 equipped a Knife halfway through a Poring) makes the engagement build wrong.
         var atEnd = CaptureCombatState().Build; // _stateLock is re-entrant
-        if (duel.Build != null && System.Text.Json.JsonSerializer.Serialize(atEnd, DuelStore.JsonOptions)
-            != System.Text.Json.JsonSerializer.Serialize(duel.Build, DuelStore.JsonOptions))
+        if (duel.Build != null && System.Text.Json.JsonSerializer.Serialize(atEnd.CombatOnly(), DuelStore.JsonOptions)
+            != System.Text.Json.JsonSerializer.Serialize(duel.Build.CombatOnly(), DuelStore.JsonOptions))
             duel.BuildAtEnd = atEnd;
         if (OnDuelEnded is { } handler) ThreadPool.QueueUserWorkItem(_ => { try { handler(duel); } catch { } });
     }
@@ -727,11 +727,17 @@ public sealed class BotSession : IAsyncDisposable
         _lastUsedItemAt = DateTime.UtcNow;
         _lastUsedItemId = itemId;
         Telemetry.Record(TelemetryEventType.UsedItem, World.Self.Level, _lastUsedItemName);
+        return _conn.SendPacketAsync(UseItemPacket(itemId, target), ct);
+    }
+
+    /// <summary>The UseInventoryItem packet (the offline HuntSimulator sends the same bytes to its server copy).</summary>
+    public static PacketWriter UseItemPacket(int itemId, int target = -1)
+    {
         var w = new PacketWriter();
         w.WritePacketType(PacketType.UseInventoryItem);
         w.Write(itemId);
         w.Write(target);
-        return _conn.SendPacketAsync(w, ct);
+        return w;
     }
 
     /// <summary>Equip an inventory item by its bag id. The server validates job/level/position and just

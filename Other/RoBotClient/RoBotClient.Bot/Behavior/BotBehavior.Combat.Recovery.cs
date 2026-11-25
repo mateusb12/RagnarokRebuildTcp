@@ -31,42 +31,15 @@ public sealed partial class BotBehavior
     private async Task MaybeDrinkBuffAsync(Snapshot snap, CancellationToken ct)
     {
         if (_data == null || _targetId == 0 || DateTime.UtcNow < _nextBuff) return;
-        var pick = _bot.WithState(w => w.Self.Inventory.Where(it => it.Count > 0 && _data.IsUsableItem(it.ItemId))
-            .Select(it => _data.Buff(it.ItemId)).OfType<GameDatabase.BuffItem>()
-            .Where(b => !snap.SelfStatuses.Contains(b.Status) && BuffIsWorthIt(snap, b))
-            .OrderByDescending(b => b.Power).ThenBy(b => _data.Consumable(b.Id, _config.HealingItemIds) != GameDatabase.ConsumableKind.Misc).FirstOrDefault());
+        var pick = HuntPolicy.BuffToDrink(_data, _config, snap.SelfLevel, snap.SelfJobId, _bot.WithState(w => w.Self.UnequippedCounts()), snap.SelfStatuses);
         if (pick == null) return;
         _nextBuff = DateTime.UtcNow.AddSeconds(5); // the status packet lands after the use
         OnLog?.Invoke($"Buff: drinking {_data.ItemName(pick.Id)} ({pick.Status}).");
         await _bot.UseInventoryItemAsync(pick.Id, -1, ct);
     }
 
-    // Free drops (herbs, Monster's Feed) first, then the configured healing items, then anything else that heals.
-    // Validating against the DB is mandatory: the server disconnects the player if sent an unknown/non-usable item id.
-    private int FindHealItem(WorldState w)
-    {
-        if (_data == null) return 0;
-        foreach (var it in w.Self.Inventory)
-            if (it.Count > 0 && HealPerUse(it.ItemId) > 0 && _data.IsUsableItem(it.ItemId) && _data.Consumable(it.ItemId, _config.HealingItemIds) == GameDatabase.ConsumableKind.Misc)
-                return it.ItemId;
-        foreach (var id in _config.HealingItemIds)
-        {
-            if (!_data.IsUsableItem(id)) continue;
-            foreach (var it in w.Self.Inventory)
-                if (it.ItemId == id && it.Count > 0) return id;
-        }
-        // Then anything else that heals HP (Novice Potions, Apples, Meat, herbs), cheapest zeny per HP first.
-        var best = 0;
-        var bestCost = double.MaxValue;
-        foreach (var it in w.Self.Inventory)
-        {
-            var heal = HealPerUse(it.ItemId);
-            if (it.Count <= 0 || heal <= 0 || !_data.IsUsableItem(it.ItemId)) continue;
-            var cost = (double)_data.UsableItemPrice(it.ItemId) / heal;
-            if (cost < bestCost) { bestCost = cost; best = it.ItemId; }
-        }
-        return best;
-    }
+    // HuntPolicy.HealItem: shared with the offline HuntSimulator.
+    private int FindHealItem(WorldState w) => _data == null ? 0 : HuntPolicy.HealItem(_data, _config, w.Self.UnequippedCounts());
 
     // Sit to recover HP/SP when we're hurt and out of usable healing items. Stands back up once nearly full,
     // a monster comes within reach (sitting is cancelled on taking damage anyway), or a heal item appears.

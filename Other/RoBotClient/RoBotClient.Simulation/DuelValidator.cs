@@ -209,7 +209,7 @@ public static class DuelValidator
 
     private static List<StaticCheck> StaticChecks(IReadOnlyList<DuelRecord> records) => records
         .Where(r => r.Build != null && r.Live != null && DuelSimulator.IsKnownMonster(r.MonsterClassId))
-        .GroupBy(r => (r.Character, Build: JsonSerializer.Serialize(r.Build), Live: JsonSerializer.Serialize(r.Live),
+        .GroupBy(r => (r.Character, Build: JsonSerializer.Serialize(r.Build!.CombatOnly()), Live: JsonSerializer.Serialize(r.Live),
             Statuses: string.Join(",", r.OwnStatuses?.Select(s => $"{s.Status}:{s.Value1}") ?? [])))
         .Select(g =>
         {

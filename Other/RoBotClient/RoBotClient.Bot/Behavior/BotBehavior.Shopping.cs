@@ -1330,13 +1330,11 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     private int Income(int zeny, int homeFares) => Math.Max(0, zeny - homeFares - Math.Max(0, _zenyBaseline));
 
     // Buff consumables worth carrying: per status, the strongest NPC-sold item this bot may drink, with its share of the
-    // consumable weight. ponytail: only attack speed is valued (useless to spell killers); add a status here once the
-    // bot can tell what it's worth.
+    // consumable weight (HuntPolicy.BuffWorthIt).
     private const double BuffShareOfConsumableWeight = 0.25;
     private bool KillsWithSpells(Snapshot snap) => HuntPolicy.KillsWithSpells(_config, snap.SelfJobId);
 
-    private bool BuffIsWorthIt(Snapshot snap, GameDatabase.BuffItem b) =>
-        b.Status == CharacterStatusEffect.IncreasedAttackSpeed && !KillsWithSpells(snap) && b.Usable(snap.SelfLevel, snap.SelfJobId);
+    private bool BuffIsWorthIt(Snapshot snap, GameDatabase.BuffItem b) => HuntPolicy.BuffWorthIt(_config, b, snap.SelfLevel, snap.SelfJobId);
     private List<(GameDatabase.BuffItem Buff, int Target)> BuffTargets(Snapshot snap, int maxWeight)
     {
         if (_data == null || maxWeight <= 0) return new();

@@ -44,12 +44,16 @@ public sealed class HuntReplay
     public required string Fingerprint { get; init; }
     /// <summary>The simulated build itself (job, equipment), and the character's look when its duel record had one: for drawing it.</summary>
     public PlayerBuild? BuildSpec { get; init; }
+    /// <summary>The bag the run started with (the build's unequipped items), named for the Inventory tab.</summary>
+    public List<ReplayItem>? StartInventory { get; init; }
     public Appearance? Look { get; set; }
 }
 
 public sealed record ReplayMob(int Id, int ClassId, string Name, int Level, int Exp, int MaxHp, bool Pinned, int[] Area, string Respawn, string Forecast);
 
 /// <summary>The player arrived at (X, Y) at T after a step of Dt seconds (0: placed there, e.g. moved during a fight).</summary>
+public sealed record ReplayItem(int ItemId, string Name, string? Code, int Count);
+
 public sealed record ReplayStep(double T, int X, int Y, double Dt);
 
 public sealed record ReplayVitals(double T, int Hp, int Sp);

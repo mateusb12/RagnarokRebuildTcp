@@ -27,7 +27,13 @@ public sealed record PlayerBuild(
     int Str, int Agi, int Vit, int Int, int Dex, int Luk,
     IReadOnlyDictionary<CharacterSkill, int> LearnedSkills,
     IReadOnlyList<EquippedItem> Equipment,
-    int AmmoItemId = 0);
+    int AmmoItemId = 0,
+    IReadOnlyDictionary<int, int>? Inventory = null)
+{
+    /// <summary>What decides combat: the build without <see cref="Inventory"/> (unequipped item id → count, carried for
+    /// the offline hunt; it changes with every pickup or potion), for comparing builds.</summary>
+    public PlayerBuild CombatOnly() => this with { Inventory = null };
+}
 
 /// <summary>What the player does in one attack slot: an auto-attack (Skill = None) or a targeted skill.</summary>
 public readonly record struct PlayerAction(CharacterSkill Skill, int Level)

@@ -45,7 +45,7 @@ public sealed partial class BotBehavior
         _itemRuleCooldown.Clear();
     }
 
-    private static List<ItemRule> ParseItemScript(string src, out string diagnostics)
+    public static List<ItemRule> ParseItemScript(string src, out string diagnostics)
     {
         var rules = new List<ItemRule>();
         var diag = new List<string>();
@@ -122,7 +122,11 @@ public sealed partial class BotBehavior
         return false;
     }
 
-    private double ItemLhsValue(Snapshot snap, string lhs)
+    private double ItemLhsValue(Snapshot snap, string lhs) =>
+        ItemLhs(snap, lhs, (DateTime.UtcNow - _lastProgressAt).TotalSeconds, () => snap.Monsters.Count(m => IsHuntable(m)));
+
+    /// <summary>An item-script condition's left-hand value; the offline HuntSimulator reads its own world through it too.</summary>
+    internal static double ItemLhs(Snapshot snap, string lhs, double stuckSeconds, Func<int> enemies)
     {
         // self.status.<name> works in the item DSL too — "use 506 if self.status.poison == 1" for
         // Green Potion when poisoned, "use Blessing scroll if self.status.blessing == 0", etc.
@@ -135,8 +139,8 @@ public sealed partial class BotBehavior
         {
             "hppct" => snap.SelfMaxHp > 0 ? 100.0 * snap.SelfHp / snap.SelfMaxHp : 100,
             "sppct" => snap.SelfMaxSp > 0 ? 100.0 * snap.SelfSp / snap.SelfMaxSp : 100,
-            "stuck" => (DateTime.UtcNow - _lastProgressAt).TotalSeconds,
-            "enemies" => snap.Monsters.Count(m => IsHuntable(m)),
+            "stuck" => stuckSeconds,
+            "enemies" => enemies(),
             "dead" => snap.SelfDead ? 1 : 0,
             // Common debuff/buff convenience flags (same names as the skill DSL).
             "poisoned"     => snap.SelfStatuses.Contains(CharacterStatusEffect.Poison) ? 1 : 0,
@@ -172,27 +176,21 @@ public sealed partial class BotBehavior
         ReloadItemScriptIfChanged();
         if (_itemRules.Count == 0) return false;
 
-        foreach (var rule in _itemRules)
-        {
-            if (_itemRuleCooldown.TryGetValue(rule.ItemId, out var until) && DateTime.UtcNow < until) continue;
-
-            var allMatch = true;
-            foreach (var c in rule.Conditions)
-                if (!EvalOp(ItemLhsValue(snap, c.Lhs), c.Op, c.Value)) { allMatch = false; break; }
-            if (!allMatch) continue;
-
-            // Item must be in inventory + useable (sending an unknown id disconnects the player).
-            if (!HasUsableItem(rule.ItemId)) continue;
-
-            if (rule.EveryCooldown > 0)
-                _itemRuleCooldown[rule.ItemId] = DateTime.UtcNow.AddSeconds(rule.EveryCooldown);
-            else
-                _itemRuleCooldown[rule.ItemId] = DateTime.UtcNow.AddSeconds(1.0); // soft anti-spam
-
-            OnLog?.Invoke($"Item rule fired: use {rule.ItemId} ({_data?.ItemName(rule.ItemId) ?? "?"}).");
-            await _bot.UseInventoryItemAsync(rule.ItemId, -1, ct);
-            return true;
-        }
-        return false;
+        // Item must be in inventory + useable (sending an unknown id disconnects the player).
+        var rule = ChooseItemRule(_itemRules, lhs => ItemLhsValue(snap, lhs),
+            id => !(_itemRuleCooldown.TryGetValue(id, out var until) && DateTime.UtcNow < until), HasUsableItem);
+        if (rule == null) return false;
+        _itemRuleCooldown[rule.ItemId] = DateTime.UtcNow.AddSeconds(ItemRuleCooldown(rule));
+        OnLog?.Invoke($"Item rule fired: use {rule.ItemId} ({_data?.ItemName(rule.ItemId) ?? "?"}).");
+        await _bot.UseInventoryItemAsync(rule.ItemId, -1, ct);
+        return true;
     }
+
+    /// <summary>The first rule (top to bottom) whose item is off its cooldown, whose conditions all hold and whose item is
+    /// held: TickItemRulesAsync's choice, shared with the offline HuntSimulator.</summary>
+    public static ItemRule? ChooseItemRule(IReadOnlyList<ItemRule> rules, Func<string, double> lhs, Func<int, bool> offCooldown, Func<int, bool> held) =>
+        rules.FirstOrDefault(r => offCooldown(r.ItemId) && r.Conditions.All(c => EvalOp(lhs(c.Lhs), c.Op, c.Value)) && held(r.ItemId));
+
+    /// <summary>Seconds before a fired rule's item may fire again: its "every", else a 1 s anti-spam.</summary>
+    public static double ItemRuleCooldown(ItemRule rule) => rule.EveryCooldown > 0 ? rule.EveryCooldown : 1.0;
 }

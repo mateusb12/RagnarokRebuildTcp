@@ -301,55 +301,13 @@ public sealed partial class BotBehavior
     /// <summary>Average HP one use restores, from the server's item effect script (0 = doesn't heal HP).</summary>
     private int HealPerUse(int itemId) => _data?.HpRecovery(itemId) ?? 0;
 
-    /// <summary>Estimate an "effective HP buffer" the bot gets from healing potions it actually carries
-    /// AND has an item-script rule for. A Mage with 50 White Potions and `use 504 if hppct < 60` is much
-    /// harder to kill than the raw HP number — this is how the forecast acknowledges that. Returns 0
-    /// when there's no item script, no matching rule, or no inventory. Capped at 1.5×MaxHp so a hoarder
-    /// doesn't get treated as effectively immortal.</summary>
+    /// <summary>The "effective HP buffer" from the potions carried (HuntPolicy.PotionHpBuffer): a Mage with 50 White
+    /// Potions and `use 504 if hppct < 60` is much harder to kill than the raw HP number.</summary>
     private double EstimatePotionHpBuffer(Snapshot snap)
     {
-        if (string.IsNullOrEmpty(_config.ItemScript))
-        {
-            // No script: MaybeHealAsync eats whatever heals, so count the biggest heals held, at most 5 uses a fight.
-            if (_config.HealHpPercent <= 0) return 0;
-            var heals = _bot.WithState(w => w.Self.Inventory.Where(it => it.Count > 0 && HealPerUse(it.ItemId) > 0 && _data?.IsUsableItem(it.ItemId) == true)
-                .Select(it => (Heal: HealPerUse(it.ItemId), it.Count)).ToList());
-            double total = 0;
-            var uses = 0;
-            foreach (var (heal, count) in heals.OrderByDescending(h => h.Heal))
-            {
-                var take = Math.Min(count, 5 - uses);
-                total += take * heal;
-                if ((uses += take) >= 5) break;
-            }
-            return Math.Min(total, snap.SelfMaxHp * 1.5);
-        }
+        if (_data == null) return 0;
         ReloadItemScriptIfChanged();
-        if (_itemRules.Count == 0) return 0;
-        // Tally inventory by item id (skip equipped — they're not consumable here).
-        var invByItem = _bot.WithState(w => w.Self.UnequippedCounts());
-        var buffer = 0.0;
-        foreach (var r in _itemRules)
-        {
-            // Only count rules that fire on LOW HP (hppct < / <= X). Stuck-only / status-only rules
-            // (e.g. Fly Wing on stuck>=8) aren't a survivability factor in a 1v1 forecast.
-            var triggersOnLowHp = false;
-            for (var i = 0; i < r.Conditions.Count; i++)
-            {
-                var c = r.Conditions[i];
-                if (!string.Equals(c.Lhs, "hppct", StringComparison.OrdinalIgnoreCase)) continue;
-                if (c.Op == "<" || c.Op == "<=") { triggersOnLowHp = true; break; }
-            }
-            if (!triggersOnLowHp) continue;
-            var healPerUse = HealPerUse(r.ItemId);
-            if (healPerUse <= 0) continue;
-            if (!invByItem.TryGetValue(r.ItemId, out var count) || count <= 0) continue;
-            // Cap usable potions per fight by inventory AND by a realistic 5-uses-per-fight ceiling —
-            // even an infinite stack runs into cast-time / animation throttling.
-            var usable = Math.Min(count, 5);
-            buffer += usable * healPerUse;
-        }
-        return Math.Min(buffer, snap.SelfMaxHp * 1.5);
+        return HuntPolicy.PotionHpBuffer(_data, _config, _itemRules, _bot.WithState(w => w.Self.UnequippedCounts()), snap.SelfMaxHp);
     }
 
     // The pack that piles on if we engage this target: same-type assist monsters that can see it, plus any

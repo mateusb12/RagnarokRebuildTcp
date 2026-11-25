@@ -23,16 +23,16 @@ const CATEGORY = {
     recovery: ["regen", "sit-refused", "stand-refused"],
     world: ["spawn", "area-start", "area-end", "area-status", "world", "sighting", "route", "start", "end", "note"],
     problem: ["failed"],
-    items: ["drop", "loot", "loot-skip"],
+    items: ["drop", "loot", "loot-skip", "use", "use-refused", "use-skip", "teleport"],
 };
 const KNOWN = new Set(Object.values(CATEGORY).flat());
 const MINOR = new Set(["hit", "hurt", "regen", "spawn", "attack-decision", "route", "area-status", "world", "castbar", "reach"]);
-const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon", "aggro", "flee", "flee-end", "threat", "loot"]);
+const MAJOR = new Set(["pick", "nopick", "wander", "idle", "engage", "kill", "death", "sit", "stand", "rejected", "no-effect", "failed", "fight-end", "sit-refused", "abandon", "aggro", "flee", "flee-end", "threat", "loot", "use", "teleport"]);
 const BADGE = {
     pick: "text-bg-success", nopick: "text-bg-warning", wander: "text-bg-secondary", idle: "text-bg-secondary", kill: "text-bg-success",
     death: "text-bg-danger", failed: "text-bg-danger", rejected: "text-bg-warning", "no-effect": "text-bg-warning", sit: "text-bg-info", stand: "text-bg-info",
     "cast-decision": "text-bg-primary", executed: "text-bg-primary", engage: "text-bg-light", hurt: "text-bg-danger", hit: "text-bg-dark",
-    loot: "text-bg-warning", drop: "text-bg-light", "loot-skip": "text-bg-secondary", aggro: "text-bg-danger", "monster-cast": "text-bg-danger", flee: "text-bg-warning", "flee-move": "text-bg-warning", threat: "text-bg-warning", "flee-end": "text-bg-secondary",
+    loot: "text-bg-warning", drop: "text-bg-light", "loot-skip": "text-bg-secondary", use: "text-bg-info", "use-refused": "text-bg-secondary", "use-skip": "text-bg-secondary", teleport: "text-bg-primary", aggro: "text-bg-danger", "monster-cast": "text-bg-danger", flee: "text-bg-warning", "flee-move": "text-bg-warning", threat: "text-bg-warning", "flee-end": "text-bg-secondary",
 };
 
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
@@ -567,10 +567,11 @@ class Viewer {
         this.inspector.innerHTML = this.selectedMob ? this.explainMob(this.selectedMob) : this.selected ? this.explain(this.selected) : this.now();
     }
 
-    /** The bag at t: every "loot" event so far (HuntSimulator.Loot), as the Character page's inventory card shows it. */
+    /** The bag at t: the build's inventory (startInventory), plus every "loot" event so far, minus every "use", as the Character page's inventory card shows it. */
     inventory() {
-        const t = this.t, got = this.rp.events.filter(e => e.kind === "loot" && e.t <= t), bag = new Map();
-        for (const e of got) { const d = e.detail || {}, it = bag.get(d.itemId) || { name: d.name, code: d.code, count: 0 }; it.count += d.count; bag.set(d.itemId, it); }
+        const t = this.t, got = this.rp.events.filter(e => (e.kind === "loot" || e.kind === "use") && e.t <= t), bag = new Map();
+        for (const s of this.rp.startInventory || []) bag.set(s.itemId, { name: s.name, code: s.code, count: s.count });
+        for (const e of got) { const d = e.detail || {}, it = bag.get(d.itemId) || { name: d.name, code: d.code, count: 0 }; it.count += e.kind === "use" ? -d.count : d.count; if (it.count > 0) bag.set(d.itemId, it); else bag.delete(d.itemId); }
         let h = '<div class="fw-semibold mb-1">Inventory at ' + fmtT(t) + ' <span class="text-secondary">(' + bag.size + ")</span></div>";
         if (!bag.size) return h + '<div class="text-secondary">empty' + (this.rp.events.some(e => e.kind === "loot") ? "" : " (nothing dropped this run, or AutoLoot is off)") + "</div>";
         h += '<div class="mb-2" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.25rem">';
@@ -578,8 +579,8 @@ class Viewer {
             h += '<div class="d-flex align-items-center gap-1 border rounded px-1 py-1" title="' + esc(it.name) + '"><img src="' + itemIcon(it.code)
                 + '" alt="" width="24" height="24" style="object-fit:contain;flex:none" onerror="this.style.visibility=\'hidden\'"><span class="text-truncate flex-grow-1">'
                 + esc(it.name) + '</span><span class="fw-semibold">' + it.count + "</span></div>";
-        h += '</div><div class="fw-semibold">Pickups</div>';
-        return h + [...got].reverse().map(e => '<div>' + this.link(e, fmtT(e.t)) + " " + esc(e.detail?.name) + " +" + e.detail?.count + "</div>").join("");
+        h += '</div><div class="fw-semibold">Pickups and uses</div>';
+        return h + [...got].reverse().map(e => '<div>' + this.link(e, fmtT(e.t)) + " " + esc(e.detail?.name) + (e.kind === "use" ? " -" : " +") + e.detail?.count + "</div>").join("");
     }
 
     now() {
@@ -696,7 +697,7 @@ class Viewer {
                 h += why("the player's HP reached 0 under the hits below" + (d.forecastWinRate != null ? "; the target's fight forecast gave a " + pct(d.forecastWinRate) + " win rate" : "") + "."
                     + (d.killer ? " Blamed on " + this.mobLink(d.killer) + " (the last attacker, as live): its class is avoided as a target for a while (live rule)." : ""));
                 h += '<div class="fw-semibold">Last hits taken</div><ul class="ps-3">' + this.lastHurtBefore(e.t).map(x => "<li>" + this.link(x) + "</li>").join("") + "</ul>";
-                h += '<div class="text-secondary">Not modelled: the death penalty and the walk back from the save point. The bot is revived at full HP at the run\'s start cell.</div>';
+                h += '<div class="text-secondary">A death ends the run: the rates are over the time lived.</div>';
                 break;
             case "engage":
                 h += why(d.why === "cornered" ? "cornered by a hazard with no way out: the live flee fights back (HuntPolicy.ChooseFlee)." : "the bot reached attack range of its target.");

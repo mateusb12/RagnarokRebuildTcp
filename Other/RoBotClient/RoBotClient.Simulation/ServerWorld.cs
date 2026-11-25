@@ -14,6 +14,7 @@ using RoRebuildServer.Simulation.Util;
 using RoRebuildServer.Data;
 using RoRebuildServer.EntityComponents;
 using RoRebuildServer.EntityComponents.Character;
+using RoRebuildServer.EntityComponents.Items;
 using RoRebuildServer.EntityComponents.Util;
 using RoRebuildServer.EntitySystem;
 using RoRebuildServer.Networking;
@@ -164,6 +165,8 @@ public sealed class ServerWorld
     private readonly Dictionary<int, Monster> _monsters = new();
     private readonly PacketSkill _skillPacketHandler = new();
     private readonly PacketSitStand _sitStandHandler = new();
+    private readonly PacketUseInventoryItem _useItemHandler = new();
+    private bool _itemRemoved; // DrainPackets saw the server take an item out of the player's bag
 
     public readonly Dictionary<CharacterSkill, SkillLedger> Skills = new();
     public double Clock { get; private set; }
@@ -173,6 +176,45 @@ public sealed class ServerWorld
     /// <summary>Until when the player's attack delay runs: the server holds a queued pickup until it ends
     /// (Player.Update: QueuedAction.PickUpItem waits on !InAttackCooldown).</summary>
     public double AttackCooldownUntil => _player.Character.AttackCooldown;
+
+    /// <summary>The bot's UseInventoryItem packet through the server's PacketUseInventoryItem: the item's OnValidate, the
+    /// input delay and its OnUse script (a potion's heal, a Concentration Potion's status). True when the server took the
+    /// item (its RemoveItemFromInventory packet); false when it refused (dead, input delay, OnValidate). The server keeps
+    /// no bag here: the caller counts what is left.</summary>
+    public bool UseItem(byte[] packet, int length)
+    {
+        lock (ServerCombatRuntime.Gate)
+        {
+            Enter();
+            DrainPackets();
+            _itemRemoved = false;
+            Receive(packet, length);
+            DrainPackets();
+            return _itemRemoved;
+        }
+    }
+
+    /// <summary>A picked-up item into the server's bag (Player.TryPickup's AddItemToInventory).</summary>
+    public void AddItem(int itemId, int count)
+    {
+        lock (ServerCombatRuntime.Gate) _player.AddItemToInventory(new ItemReference(itemId, count));
+    }
+
+    /// <summary>Why the server's PacketUseInventoryItem would not take &lt;paramref name="itemId"/&gt; now (null: it would).</summary>
+    public string? UseItemRefusal(int itemId)
+    {
+        lock (ServerCombatRuntime.Gate)
+        {
+            Enter();
+            if (!_connection.IsPlayerAlive) return "player not alive";
+            if (!_player.CanPerformCharacterActions()) return $"can't act (input delay {_player.InputActionCooldown:F2}s, state {_player.Character.State})";
+            if (!DataManager.ItemList.TryGetValue(itemId, out var item) || !DataManager.UseItemInfo.TryGetValue(itemId, out var info)) return "unknown item";
+            if (item.Interaction == null) return "no item script (Interaction) loaded";
+            if (info.UseType == ItemUseType.NotUsable) return "not usable";
+            if (_player.Inventory?.GetItemCount(itemId) is not > 0) return "not in the server's bag";
+            return item.Interaction.OnValidate(_player, _player.CombatEntity) ? null : "the item's OnValidate refused it";
+        }
+    }
 
     /// <summary>Player.TryPickup's "no attacking for 0.3s after picking up an item".</summary>
     public void PickedUp(double at) => _player.Character.AttackCooldown = at + 0.3;
@@ -233,6 +275,8 @@ public sealed class ServerWorld
             _instance.Maps.Add(_map);
 
             _player = DuelSimulator.CreatePlayer(build);
+            foreach (var (itemId, count) in build.Inventory ?? new Dictionary<int, int>()) // the bag the server checks a use against
+                _player.AddItemToInventory(new ItemReference(itemId, count));
             _player.Character.Position = new Position(x, y);
             var entity = _player.Entity;
             _map.AddEntity(ref entity, false);
@@ -669,7 +713,8 @@ public sealed class ServerWorld
         var type = (PacketType)message.ReadByte();
         if (type == PacketType.Skill) _skillPacketHandler.Process(_connection, message);
         else if (type == PacketType.SitStand) _sitStandHandler.Process(_connection, message);
-        else throw new ArgumentException($"not a skill or sit/stand packet: {type}");
+        else if (type == PacketType.UseInventoryItem) _useItemHandler.Process(_connection, message);
+        else throw new ArgumentException($"not a skill, sit/stand or use-item packet: {type}");
     }
 
     /// <summary>Runs server code that may execute <paramref name="skill"/> and books what it observably did.</summary>
@@ -1214,8 +1259,12 @@ public sealed class ServerWorld
         var errors = new List<SkillValidationResult>();
         var queue = (NetQueue<OutboundMessage>)OutboundField.GetValue(null)!;
         while (queue.TryDequeue(out var message))
+        {
             if (message.Length >= 2 && message.Message[0] == (byte)PacketType.SkillError && message.Clients.Contains(_connection))
                 errors.Add((SkillValidationResult)message.Message[1]);
+            if (message.Length >= 1 && message.Message[0] == (byte)PacketType.AddOrRemoveInventoryItem && message.Clients.Contains(_connection))
+                _itemRemoved = true;
+        }
         return errors;
     }
 

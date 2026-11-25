@@ -2,6 +2,7 @@ using RoBotClient.Bot.GameData;
 using RebuildSharedData.ClientTypes;
 using RebuildSharedData.Data;
 using RoBotClient.Simulation;
+using RebuildSharedData.Enum;
 
 namespace RoBotClient.Bot.Behavior;
 
@@ -12,6 +13,72 @@ public static class HuntPolicy
     // ponytail: guessed cap on simulated deaths + timeouts for a fight without potions to count as winnable; the
     // WinMargin damage check bounds the mean, this bounds the tail. Re-fit from On-mode deaths if any appear.
     public const double MaxServerLossRate = 0.05;
+
+    // ---- consumables: BotBehavior.Combat.Recovery's choices, over a bag of item id -> count ----
+
+    /// <summary>MaybeHealAsync's item (FindHealItem): free drops (herbs, Monster's Feed) first, then the configured
+    /// HealingItemIds in order, then anything else that heals HP, cheapest zeny per HP first. 0: nothing to drink.
+    /// Validating against the DB is mandatory: the server disconnects the player if sent an unknown/non-usable item id.</summary>
+    public static int HealItem(GameDatabase data, BotBehaviorConfig cfg, IReadOnlyDictionary<int, int> bag)
+    {
+        foreach (var (id, n) in bag)
+            if (n > 0 && data.HpRecovery(id) > 0 && data.IsUsableItem(id) && data.Consumable(id, cfg.HealingItemIds) == GameDatabase.ConsumableKind.Misc)
+                return id;
+        foreach (var id in cfg.HealingItemIds)
+            if (data.IsUsableItem(id) && bag.GetValueOrDefault(id) > 0) return id;
+        var best = 0;
+        var bestCost = double.MaxValue;
+        foreach (var (id, n) in bag)
+        {
+            var heal = data.HpRecovery(id);
+            if (n <= 0 || heal <= 0 || !data.IsUsableItem(id)) continue;
+            var cost = (double)data.UsableItemPrice(id) / heal;
+            if (cost < bestCost) { bestCost = cost; best = id; }
+        }
+        return best;
+    }
+
+    /// <summary>Buff consumables worth drinking. ponytail: only attack speed is valued (useless to spell killers); add a
+    /// status here once the bot can tell what it's worth.</summary>
+    public static bool BuffWorthIt(BotBehaviorConfig cfg, GameDatabase.BuffItem b, int level, int jobId) =>
+        b.Status == CharacterStatusEffect.IncreasedAttackSpeed && !KillsWithSpells(cfg, jobId) && b.Usable(level, jobId);
+
+    /// <summary>MaybeDrinkBuffAsync's pick: a worthwhile buff not already on, strongest held first, drops before bought ones.</summary>
+    public static GameDatabase.BuffItem? BuffToDrink(GameDatabase data, BotBehaviorConfig cfg, int level, int jobId,
+        IReadOnlyDictionary<int, int> bag, ICollection<CharacterStatusEffect> statuses) =>
+        bag.Where(it => it.Value > 0 && data.IsUsableItem(it.Key)).Select(it => data.Buff(it.Key)).OfType<GameDatabase.BuffItem>()
+            .Where(b => !statuses.Contains(b.Status) && BuffWorthIt(cfg, b, level, jobId))
+            .OrderByDescending(b => b.Power).ThenBy(b => data.Consumable(b.Id, cfg.HealingItemIds) != GameDatabase.ConsumableKind.Misc).FirstOrDefault();
+
+    /// <summary>The forecast's "effective HP buffer" from the potions carried (EstimatePotionHpBuffer). Without an item
+    /// script MaybeHealAsync drinks whatever heals: the biggest heals held, at most 5 uses a fight. With one, only rules
+    /// that fire on low HP (hppct &lt; / &lt;=) count, at most 5 of each. Capped at 1.5 x MaxHp.</summary>
+    public static double PotionHpBuffer(GameDatabase data, BotBehaviorConfig cfg, IReadOnlyList<BotBehavior.ItemRule> itemRules,
+        IReadOnlyDictionary<int, int> bag, int maxHp)
+    {
+        double total = 0;
+        if (string.IsNullOrEmpty(cfg.ItemScript))
+        {
+            if (cfg.HealHpPercent <= 0) return 0;
+            var uses = 0;
+            foreach (var (heal, count) in bag.Where(it => it.Value > 0 && data.HpRecovery(it.Key) > 0 && data.IsUsableItem(it.Key))
+                         .Select(it => (Heal: data.HpRecovery(it.Key), Count: it.Value)).OrderByDescending(h => h.Heal))
+            {
+                var take = Math.Min(count, 5 - uses);
+                total += take * heal;
+                if ((uses += take) >= 5) break;
+            }
+        }
+        else
+            foreach (var r in itemRules)
+            {
+                // Stuck-only / status-only rules (a Fly Wing on stuck >= 8) aren't a survivability factor in a 1v1 forecast.
+                if (!r.Conditions.Any(c => string.Equals(c.Lhs, "hppct", StringComparison.OrdinalIgnoreCase) && c.Op is "<" or "<=")) continue;
+                var heal = data.HpRecovery(r.ItemId);
+                if (heal > 0 && bag.GetValueOrDefault(r.ItemId) is var count and > 0) total += Math.Min(count, 5) * heal;
+            }
+        return Math.Min(total, maxHp * 1.5);
+    }
 
     /// <summary>Solo target score: base exp per second of walking up, killing and sitting off the HP lost.</summary>
     public static double ExpPerSecond(int exp, double secondsToKill, int distance, double secondsPerCell, double restSeconds) =>
