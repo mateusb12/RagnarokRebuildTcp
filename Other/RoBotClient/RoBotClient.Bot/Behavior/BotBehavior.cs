@@ -1884,6 +1884,7 @@ public sealed partial class BotBehavior
         public int SelfMagicAtkMax;
         public double SelfAttackInterval;
         public int SelfWeaponItemId; // item in the weapon (right hand) slot, 0 = none
+        public int SelfAmmoId; // loaded ammunition item id, 0 = none
         public int SelfAttackRange; // server-synced (CharacterStat.Range); 0 when not synced — caller falls back to skill heuristic
         public bool SelfDead;
         public int SelfSp;
@@ -1935,6 +1936,7 @@ public sealed partial class BotBehavior
                 SelfAttackInterval = w.Self.AttackSpeed,
                 SelfAttackRange = w.Self.AttackRange,
                 SelfWeaponItemId = WeaponItemId(w),
+                SelfAmmoId = w.Self.AmmoId,
                 SelfDead = hasSelf && self!.State == CharacterState.Dead,
                 SelfSp = w.Self.Sp,
                 SelfMaxSp = w.Self.MaxSp,

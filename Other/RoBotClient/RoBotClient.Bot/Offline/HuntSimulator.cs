@@ -1179,6 +1179,7 @@ public sealed class HuntSimulator
             SelfSp = _world.Sp, SelfMaxSp = _world.MaxSp, SelfLevel = b.Level, SelfJobId = b.JobId, SelfJobLevel = b.JobLevel,
             SelfVit = b.Vit, SelfInt = b.Int, SelfDex = b.Dex, SelfAgi = b.Agi, SelfLuk = b.Luk,
             SelfAttackInterval = _world.AttackDelay, Map = _o.Map,
+            SelfWeaponItemId = b.Equipment.FirstOrDefault(e => e.Slot == EquipSlot.RightHand).ItemId, SelfAmmoId = b.AmmoItemId,
         };
         foreach (var m in _mobs)
             if (m.Alive && m.ServerId != 0 && Dist(_x, _y, m.X, m.Y) <= ViewDistance && !_world.HiddenFromPlayer(m.ServerId))

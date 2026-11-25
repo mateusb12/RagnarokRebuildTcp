@@ -242,6 +242,14 @@ public sealed partial class BotBehavior
                 skipReasons.Add($"{rule.Skill}: not known by this bot");
                 continue;
             }
+            // DoubleStrafeHandler / ChargeArrowHandler refuse without a bow and arrows loaded: Bot5 sent ~4000
+            // Double Strafes with a Main Gauche. ponytail: other weapon-locked skills (spear, 2H sword) when a bot uses them.
+            if (rule.Skill is CharacterSkill.DoubleStrafe or CharacterSkill.ChargeArrow
+                && (inputs.Data?.Gear.TryGetValue(snap.SelfWeaponItemId, out var wpn) != true || wpn!.Type != "Bow" || snap.SelfAmmoId <= 0))
+            {
+                skipReasons.Add($"{rule.Skill}: needs a bow with arrows loaded");
+                continue;
+            }
             if (FailedCondition(rule.Conditions, snap, target) is { } failed)
             {
                 skipReasons.Add($"{rule.Skill}: {failed}");
@@ -332,8 +340,7 @@ public sealed partial class BotBehavior
             skill => KnowsSkill(skill, out var known) ? known : 0,
             skill => _skillCooldown.TryGetValue(skill, out var nextOk) && DateTime.UtcNow < nextOk,
             (skill, level) =>
-            {
-                var zenyCost = SkillZenyCost(skill, level);
+            {                var zenyCost = SkillZenyCost(skill, level);
                 if (zenyCost <= 0) return null;
                 if (_skillZenyLeft < 0) _skillZenyLeft = ConvenienceBudget(_bot.WithState(w => w.Self.Zeny), ZenyForTripHome(snap));
                 if (zenyCost > _skillZenyLeft)
