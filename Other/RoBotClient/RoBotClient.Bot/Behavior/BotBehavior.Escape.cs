@@ -98,4 +98,21 @@ public sealed partial class BotBehavior
         ResetStuck(snap.SelfPos);
         return true;
     }
+
+    // Dropped inside a wall (bad teleport coordinate): the server can't path out of a blocked cell, so
+    // every walk is silently ignored. A Fly Wing is the only way out.
+    private async Task<bool> TryEscapeWallAsync(Snapshot snap, bool stuck, CancellationToken ct)
+    {
+        if (stuck && snap.SelfPos is not { X: 0, Y: 0 } // (0,0) = position not received yet after a map change
+            && DateTime.UtcNow >= _nextEscapeItem && _data?.GetWalkMap(snap.Map) is { } here
+            && !here.IsWalkable(snap.SelfPos.X, snap.SelfPos.Y)
+            && _bot.WithState(w => w.Self.Inventory.Any(it => it.ItemId == _config.FlyWingItemId && it.Count > 0)))
+        {
+            _nextEscapeItem = DateTime.UtcNow.AddSeconds(3);
+            OnLog?.Invoke($"Standing in a wall at ({snap.SelfPos.X},{snap.SelfPos.Y}) on {snap.Map} — using a Fly Wing to get out.");
+            await _bot.UseInventoryItemAsync(_config.FlyWingItemId, -1, ct);
+            return true;
+        }
+        return false;
+    }
 }

@@ -65,8 +65,7 @@ public sealed partial class BotBehavior
         {
             OnLog?.Invoke($"No safe cell to shoot '{target.Name}' from (other fixed monsters cover them all) — skipping it.");
             _unreachable.Add(_targetId);
-            _targetId = 0;
-            _targetClass = -1;
+            ClearTarget();
             await _bot.StopAsync(ct);
             return true;
         }

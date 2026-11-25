@@ -105,8 +105,7 @@ public sealed partial class BotBehavior
         }
 
         // 3. Shopping for upgrades: one item per trip, only with zeny to spare.
-        var isSquadFollower = !string.IsNullOrEmpty(_config.SquadId) && !_config.IsSquadLeader;
-        if (!_config.AutoShop || isSquadFollower || ShopTripActive || _forceShop || DateTime.UtcNow < _nextGearBuy) return;
+        if (!_config.AutoShop || IsSquadFollower || ShopTripActive || _forceShop || DateTime.UtcNow < _nextGearBuy) return;
         _nextGearBuy = DateTime.UtcNow.AddSeconds(30);
         if (TryBuyJobWeapon(snap, job, inv.Select(i => i.ItemId), arrows, zeny)) return;
         var budget = zeny - GearZenyReserve;

@@ -77,8 +77,8 @@ public sealed partial class BotBehavior
     private bool TryStartSaveTrip(Snapshot snap)
     {
         if (_data == null || !_config.AutoMap || string.IsNullOrEmpty(_config.HomeMap) || string.IsNullOrEmpty(_config.SavePointMap)
-            || string.Equals(snap.Map, _config.HomeMap, StringComparison.OrdinalIgnoreCase)
-            || (!string.IsNullOrEmpty(_config.SquadId) && !_config.IsSquadLeader)
+            || OnHomeMap(snap.Map)
+            || IsSquadFollower
             || DateTime.UtcNow < _nextSaveCheck) return false;
         _nextSaveCheck = DateTime.UtcNow.AddMinutes(2);
         var home = _config.HomeMap;

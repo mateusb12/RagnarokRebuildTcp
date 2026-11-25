@@ -171,8 +171,7 @@ public sealed partial class BotBehavior
                 // private hazard list.
                 if (Mode != BotMode.Fleeing) OnLog?.Invoke("Following !flee — backing away.");
                 Mode = BotMode.Fleeing;
-                _targetId = 0;
-                _targetClass = -1;
+                ClearTarget();
                 // Pick a step away from the squad leader's cell if we can see them — otherwise a random
                 // 6-cell offset; the regular wander/movement code will take over once flee expires.
                 var dx = _rng.Next(-1, 2);
@@ -186,13 +185,11 @@ public sealed partial class BotBehavior
 
             case PartyCommandKind.Hold:
                 Mode = BotMode.Parked;
-                _targetId = 0;
-                _targetClass = -1;
+                ClearTarget();
                 return true;
 
             case PartyCommandKind.Stop:
-                _targetId = 0;
-                _targetClass = -1;
+                ClearTarget();
                 await _bot.StopAsync(ct);
                 _partyCmd = PartyCommandKind.None; // one-shot
                 return true;

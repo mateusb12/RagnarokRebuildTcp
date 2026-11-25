@@ -154,7 +154,7 @@ public sealed partial class BotBehavior
 
     private void NoteStay(Snapshot snap, MonsterInfo? target, double elapsed)
     {
-        if (!string.Equals(_stay.Map, _config.HomeMap, StringComparison.OrdinalIgnoreCase)) _stay = new StayLog { Map = _config.HomeMap };
+        if (!OnHomeMap(_stay.Map)) _stay = new StayLog { Map = _config.HomeMap };
         var kills = _bot.WithState(w => w.Self.Kills);
         if (_stayLastKills >= 0 && kills > _stayLastKills) _stay.Kills += kills - _stayLastKills;
         _stayLastKills = kills;
@@ -279,9 +279,11 @@ public sealed partial class BotBehavior
             Median(splits.Select(s => s.Recover)), Median(splits.Select(s => s.Flee))), splits.Count);
     }
 
+    private bool OnHomeMap(string map) => string.Equals(map, _config.HomeMap, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>On its hunting map and doing hunt work (not passing through, shopping or dead).</summary>
     public bool IsHuntingHere(string map) =>
-        string.Equals(map, _config.HomeMap, StringComparison.OrdinalIgnoreCase)
+        OnHomeMap(map)
         && Mode is BotMode.Hunting or BotMode.Idle or BotMode.Looting or BotMode.Resting or BotMode.Fleeing;
 
     private readonly Dictionary<string, List<DateTime>> _mapDeaths = new(StringComparer.OrdinalIgnoreCase);
@@ -319,7 +321,7 @@ public sealed partial class BotBehavior
         list.Add(DateTime.UtcNow);
         list.RemoveAll(t => DateTime.UtcNow - t > TimeSpan.FromMinutes(10));
         OnMemoryChanged?.Invoke();
-        if (list.Count < 2 || !string.Equals(map, _config.HomeMap, StringComparison.OrdinalIgnoreCase)) return;
+        if (list.Count < 2 || !OnHomeMap(map)) return;
         var ban = BanMap(map);
         list.Clear();
         _nextMapCheck = DateTime.MinValue; // re-pick right away
@@ -333,7 +335,7 @@ public sealed partial class BotBehavior
     private readonly Dictionary<string, List<DateTime>> _mapFlees = new(StringComparer.OrdinalIgnoreCase);
     private void NoteMapFlee(string map)
     {
-        if (!string.Equals(map, _config.HomeMap, StringComparison.OrdinalIgnoreCase)) return;
+        if (!OnHomeMap(map)) return;
         if (!_mapFlees.TryGetValue(map, out var list)) _mapFlees[map] = list = new();
         list.Add(DateTime.UtcNow);
         list.RemoveAll(t => DateTime.UtcNow - t > TimeSpan.FromMinutes(10));
@@ -352,12 +354,12 @@ public sealed partial class BotBehavior
         var now = DateTime.UtcNow;
         if (snap.SelfLevel != _estimatesLevel) RefreshEstimates(snap);
 
-        if (!_config.AutoMap || (!string.IsNullOrEmpty(_config.SquadId) && !_config.IsSquadLeader)) { MapDecision = ""; NextMap = null; return; }
+        if (!_config.AutoMap || IsSquadFollower) { MapDecision = ""; NextMap = null; return; }
         // On the way to the chosen map: keep showing the decision until it arrives, then judge the new map at once.
         if (NextMap != null)
         {
             if (!string.Equals(snap.Map, NextMap, StringComparison.OrdinalIgnoreCase)
-                && string.Equals(NextMap, _config.HomeMap, StringComparison.OrdinalIgnoreCase)) return;
+                && OnHomeMap(NextMap)) return;
             NextMap = null;
             _nextMapCheck = DateTime.MinValue;
         }

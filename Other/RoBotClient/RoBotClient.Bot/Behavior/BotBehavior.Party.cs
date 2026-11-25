@@ -18,6 +18,9 @@ namespace RoBotClient.Bot.Behavior;
 //      again the fallback flag clears and follower mode resumes seamlessly.
 public sealed partial class BotBehavior
 {
+    /// <summary>In a squad but not its leader: the leader drives the schedule (map, shop trips, save point, gear).</summary>
+    private bool IsSquadFollower => !string.IsNullOrEmpty(_config.SquadId) && !_config.IsSquadLeader;
+
     private const int FollowRadius = 4;
 
     private enum LeaderViewState { Unknown, Seen, OffScreen, Lost }
@@ -205,8 +208,7 @@ public sealed partial class BotBehavior
         // Within the (short) grace window: idle in place, don't engage on our own. Defaults to 5 s; bump it
         // via BotBehaviorConfig.FollowerLostFallthroughSeconds if you want more patience.
         Mode = BotMode.Idle;
-        _targetId = 0;
-        _targetClass = -1;
+        ClearTarget();
         return true;
     }
 
@@ -307,8 +309,7 @@ public sealed partial class BotBehavior
     // Followers with a SquadSlot walk to (leader + slot offset) so 6 bots don't pile onto one cell.
     private async Task<bool> CloseGapAsync(Snapshot snap, RebuildSharedData.Data.Position leaderPos, CancellationToken ct)
     {
-        _targetId = 0;
-        _targetClass = -1;
+        ClearTarget();
         var (followX, followY) = ComputeFollowCell(leaderPos);
         var dist = Math.Max(Math.Abs(snap.SelfPos.X - followX), Math.Abs(snap.SelfPos.Y - followY));
         if (dist > FollowRadius)

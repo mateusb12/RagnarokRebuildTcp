@@ -226,4 +226,29 @@ public sealed partial class BotBehavior
     {
         1 => "Swordsman", 2 => "Archer", 3 => "Mage", 4 => "Acolyte", 5 => "Thief", 6 => "Merchant", _ => "",
     };
+
+    /// <summary>Starts a wanted job change (or spends the leftover skill points blocking it). True when it used the tick.</summary>
+    private async Task<bool> TryStartJobChangeAsync(Snapshot snap, bool stuck, CancellationToken ct)
+    {
+        if (WantsJobChange(snap))
+        {
+            if (snap.SelfJobId == 0 && snap.SelfJobLevel >= 10 && snap.SelfSkillPoints > 0)
+            {
+                if (!await SpendOneSkillPointAsync(snap, ct))
+                {
+                    _jobCooldownUntil = DateTime.UtcNow.AddSeconds(60);
+                    OnLog?.Invoke("Job change blocked: leftover skill points with nothing left to spend on.");
+                }
+                return true;
+            }
+            if (snap.SelfJobId != 0 || snap.SelfJobLevel >= 10)
+            {
+                StartJobChange(snap);
+                await TickJobChangeAsync(snap, stuck, ct);
+                return true;
+            }
+            // Novice below job level 10: not eligible yet — fall through and keep hunting.
+        }
+        return false;
+    }
 }

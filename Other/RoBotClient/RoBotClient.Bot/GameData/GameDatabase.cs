@@ -496,7 +496,7 @@ public sealed class GameDatabase
 
     /// <summary>Sum the danger scores of every intermediate map on the BFS shortest path from
     /// <paramref name="from"/> to <paramref name="to"/>. <paramref name="mapDanger"/> is a per-map score
-    /// supplied by the caller (typically <c>BotBehavior.MapDanger</c>) — bot-specific because it depends
+    /// supplied by the caller (typically BotBehavior.GetMapDanger) — bot-specific because it depends
     /// on the bot's level + death history. Excludes the start map (we're already on it) and includes the
     /// destination's danger (we have to land there). Returns -1 if no path exists.</summary>
     public float ChainDanger(string from, string to, Func<string, float> mapDanger)

@@ -594,7 +594,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
 
             case ShopPhase.ReturnTravel:
                 if (string.IsNullOrEmpty(_config.HomeMap) ||
-                    string.Equals(snap.Map, _config.HomeMap, StringComparison.OrdinalIgnoreCase))
+                    OnHomeMap(snap.Map))
                 {
                     EndShopTrip();
                     return;
@@ -1405,6 +1405,8 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     // consumable weight. ponytail: only attack speed is valued (useless to spell killers); add a status here once the
     // bot can tell what it's worth.
     private const double BuffShareOfConsumableWeight = 0.25;
+    private bool KillsWithSpells(Snapshot snap) => HuntPolicy.KillsWithSpells(_config, snap.SelfJobId);
+
     private bool BuffIsWorthIt(Snapshot snap, GameDatabase.BuffItem b) =>
         b.Status == CharacterStatusEffect.IncreasedAttackSpeed && !KillsWithSpells(snap) && b.Usable(snap.SelfLevel, snap.SelfJobId);
     private List<(GameDatabase.BuffItem Buff, int Target)> BuffTargets(Snapshot snap, int maxWeight)
