@@ -259,14 +259,16 @@ public sealed partial class BotBehavior
         }
         if (usable.Count == 0) return null;
 
-        var autoDamage = _config.NoAutoAttack ? 0 : Forecast(snap, target).ExpectedDamagePerSwing; // PolicyInputs
+        var targetForecast = Forecast(snap, target);
+        var autoDamage = _config.NoAutoAttack ? 0 : targetForecast.ExpectedDamagePerSwing; // PolicyInputs
+        var hitDamage = _config.NoAutoAttack ? 0 : targetForecast.ExpectedDamagePerHit;
         var interval = snap.SelfAttackInterval > 0.05 ? snap.SelfAttackInterval : 1.5;
         var probe = snap.Clone();
         var selfInt = snap.SelfInt;
         key = string.Join(";", usable.Select(u => $"{u.Rule.Skill}:{u.Level}:{u.Rule.Level > 0}:{u.Rule.EveryCooldown:R}["
             + string.Join(",", u.Rule.Conditions.Select(c => $"{c.Lhs}{c.Op}{c.Value:R}"
                 + (MomentConditions.Contains(c.Lhs) ? "" : $"={LhsValue(c.Lhs, probe, target):R}"))) + "]"))
-            + $"|auto={autoDamage:R}|interval={interval:R}|int={selfInt}|maxhp={probe.SelfMaxHp}|maxsp={probe.SelfMaxSp}";
+            + $"|auto={autoDamage:R}|hit={hitDamage:R}|interval={interval:R}|int={selfInt}|maxhp={probe.SelfMaxHp}|maxsp={probe.SelfMaxSp}";
         return (in DuelMoment moment) =>
         {
             probe.SelfHp = moment.Hp;
@@ -278,7 +280,7 @@ public sealed partial class BotBehavior
                 if (FailedCondition(rule.Conditions, probe, probeTarget) != null) continue;
                 var chosen = SkillPolicy.ChooseLevel(rule.Skill, level, rule.Level > 0, _data?.SkillInfo(rule.Skill)?.SpCost,
                     moment.MonsterHp, false, autoDamage, moment.Sp, SkillPolicy.SpIsFree(moment.Sp, moment.MaxSp, selfInt),
-                    null, interval);
+                    null, interval, hitDmg: hitDamage);
                 if (chosen > 0) return new PlayerAction(rule.Skill, chosen);
             }
             return PlayerAction.AutoAttack;

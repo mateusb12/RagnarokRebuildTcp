@@ -148,7 +148,8 @@ public sealed partial class BotBehavior
     /// <summary>What a skill-rule choice reads besides the snapshot: the game data, whether the bot auto-attacks, and its
     /// expected damage per auto-attack on a monster (unpoisoned / poisoned). Live: the bot's own forecast; offline: the
     /// server-code one (HuntSimulator).</summary>
-    internal sealed record SkillChoiceInputs(GameDatabase? Data, bool NoAutoAttack, Func<MonsterInfo, bool, double> SwingDamage);
+    internal sealed record SkillChoiceInputs(GameDatabase? Data, bool NoAutoAttack, Func<MonsterInfo, bool, double> SwingDamage,
+        Func<MonsterInfo, double>? HitDamage = null); // one hit without Double Attack (null: same as a swing)
 
     /// <summary>Feed SkillPolicy from the snapshot + the forecast's per-swing damage. 0 = skip this cast.</summary>
     private static int SkillPolicyLevel(Snapshot snap, MonsterInfo target, CharacterSkill skill, int maxLevel, bool pinLevel, SkillChoiceInputs inputs)
@@ -170,8 +171,11 @@ public sealed partial class BotBehavior
         }
         return SkillPolicy.ChooseLevel(skill, maxLevel, pinLevel, data?.SkillInfo(skill)?.SpCost,
             hp, hasDebuff, autoDmg, snap.SelfSp, SkillPolicy.SpIsFree(snap.SelfSp, snap.SelfMaxSp, snap.SelfInt),
-            land, snap.SelfAttackInterval > 0.05 ? snap.SelfAttackInterval : 1.5, poisonedAuto);
+            land, snap.SelfAttackInterval > 0.05 ? snap.SelfAttackInterval : 1.5, poisonedAuto, HitDamage(target, inputs, autoDmg));
     }
+
+    private static double HitDamage(MonsterInfo target, SkillChoiceInputs inputs, double autoDmg) =>
+        inputs.NoAutoAttack || inputs.HitDamage == null ? autoDmg : inputs.HitDamage(target);
 
     /// <summary>Expected damage per auto-attack (0 for NoAutoAttack) and the target's HP (MaxHp 0 = not seen yet: fresh mob).</summary>
     private static (double AutoDmg, int Hp) PolicyInputs(MonsterInfo target, SkillChoiceInputs inputs)
@@ -195,16 +199,17 @@ public sealed partial class BotBehavior
         var saved = SkillPolicy.BuffCastHitsSaved(skill, level, hp, autoDmg, interval, eleMod);
         var cost = SkillPolicy.SpCost(inputs.Data?.SkillInfo(skill)?.SpCost, level);
         return SkillPolicy.AoeWorthIt(skill, level, enemiesInArea, false, saved, cost,
-            BestSingleTargetSwingsPerSp(snap, hp, autoDmg, inputs, rules, knownLevel));
+            BestSingleTargetSwingsPerSp(snap, target, hp, autoDmg, inputs, rules, knownLevel));
     }
 
     /// <summary>Best swings-saved-per-SP among the script's single-target damage rules on this target: the SP a buff
     /// cast competes with. 0 when the script has none (or none would fire).</summary>
-    private static double BestSingleTargetSwingsPerSp(Snapshot snap, int hp, double autoDmg, SkillChoiceInputs inputs,
+    private static double BestSingleTargetSwingsPerSp(Snapshot snap, MonsterInfo target, int hp, double autoDmg, SkillChoiceInputs inputs,
         IReadOnlyList<SkillRule> rules, Func<CharacterSkill, int> knownLevel)
     {
         var best = 0.0;
         var spFree = SkillPolicy.SpIsFree(snap.SelfSp, snap.SelfMaxSp, snap.SelfInt);
+        var hit = autoDmg > 0 ? HitDamage(target, inputs, autoDmg) : 0;
         foreach (var r in rules)
         {
             if (r.Target != SkillCastTarget.Enemy || SkillPolicy.Aoe(r.Skill) != null || SkillPolicy.DamageMultiplier(r.Skill, 1) <= 0) continue;
@@ -212,9 +217,9 @@ public sealed partial class BotBehavior
             if (known <= 0) continue;
             var costs = inputs.Data?.SkillInfo(r.Skill)?.SpCost;
             var lv = SkillPolicy.ChooseLevel(r.Skill, r.Level > 0 ? Math.Min(r.Level, known) : known, r.Level > 0, costs,
-                hp, false, autoDmg, snap.SelfSp, spFree);
+                hp, false, autoDmg, snap.SelfSp, spFree, hitDmg: hit);
             if (lv <= 0) continue;
-            best = Math.Max(best, (double)SkillPolicy.HitsSaved(hp, autoDmg, autoDmg * SkillPolicy.DamageMultiplier(r.Skill, lv)) / SkillPolicy.SpCost(costs, lv));
+            best = Math.Max(best, (double)SkillPolicy.HitsSaved(hp, autoDmg, hit * SkillPolicy.DamageMultiplier(r.Skill, lv)) / SkillPolicy.SpCost(costs, lv));
         }
         return best;
     }
@@ -314,7 +319,8 @@ public sealed partial class BotBehavior
 
         // Collect skip reasons per rule so the user can see WHY their script didn't fire (deduped below).
         var skipReasons = new List<string>();
-        var inputs = new SkillChoiceInputs(_data, _config.NoAutoAttack, (m, poisoned) => Forecast(snap, m, poisoned).ExpectedDamagePerSwing);
+        var inputs = new SkillChoiceInputs(_data, _config.NoAutoAttack, (m, poisoned) => Forecast(snap, m, poisoned).ExpectedDamagePerSwing,
+            m => Forecast(snap, m).ExpectedDamagePerHit);
         var choice = ChooseSkillRule(rules, snap, target, inputs,
             skill => KnowsSkill(skill, out var known) ? known : 0,
             skill => _skillCooldown.TryGetValue(skill, out var nextOk) && DateTime.UtcNow < nextOk,

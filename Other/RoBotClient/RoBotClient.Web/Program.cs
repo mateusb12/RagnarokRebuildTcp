@@ -66,6 +66,8 @@ builder.Services.AddSingleton<BotManager>();
 
 // Simulation tab: offline hunts run as the Host CLI's huntsim in a child process, replays saved under sim-replays/.
 builder.Services.AddSingleton(new RoBotClient.Web.Features.Simulation.SimRunner(string.IsNullOrEmpty(repoRoBot) ? AppContext.BaseDirectory : repoRoBot));
+builder.Services.AddSingleton(sp => new RoBotClient.Web.Features.Simulation.RouteChecks(sp.GetRequiredService<RoBotClient.Web.Features.Simulation.SimRunner>(),
+    string.IsNullOrEmpty(repoRoBot) ? AppContext.BaseDirectory : repoRoBot));
 
 // Auto-formed dynamic squads: every ~8s, scan each bot's visible-players list and cluster bots that can
 // see each other into squads, electing leaders by SquadRanking. Manual squads (SquadId not starting with
@@ -82,6 +84,12 @@ builder.Services.AddMcpServer()
     .WithToolsFromAssembly();
 
 var app = builder.Build();
+// Live bots ask the offline route check before an AutoMap move (BotBehaviorConfig.SimulateRoutes).
+{
+    var routeChecks = app.Services.GetRequiredService<RoBotClient.Web.Features.Simulation.RouteChecks>();
+    app.Services.GetRequiredService<BotManager>().RouteCheck = routeChecks.Check;
+    app.Services.GetRequiredService<BotManager>().LevelScan = routeChecks.Scan;
+}
 
 // Eagerly resolve the SquadAutoFormer so its timer starts at boot (and bots auto-cluster as soon as the
 // dashboard is up). Without this, the singleton is constructed only on the first MCP toggle.

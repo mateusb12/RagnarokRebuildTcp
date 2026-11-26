@@ -7,7 +7,7 @@ namespace RoBotClient.Bot.Offline;
 /// <summary>One offline hunt as recorded while it ran (HuntSimulator.Replay): the map's walk grid, every monster, the
 /// player's steps, HP/SP samples and the events with what each decision saw. A viewer replays it; nothing in it is
 /// recomputed afterwards. Written by "huntsim ... --replay file.json", read by the dashboard's Simulation tab.</summary>
-public sealed class HuntReplay
+public sealed record HuntReplay
 {
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -47,7 +47,12 @@ public sealed class HuntReplay
     /// <summary>The bag the run started with (the build's unequipped items), named for the Inventory tab.</summary>
     public List<ReplayItem>? StartInventory { get; init; }
     public Appearance? Look { get; set; }
+    /// <summary>Subsequent map crossings in one route-survival replay. The first hop is this replay.</summary>
+    public List<RouteReplaySegment>? RouteSegments { get; init; }
 }
+
+/// <summary>A later map in a continuous route replay, recorded by its own map simulation.</summary>
+public sealed record RouteReplaySegment(string Map, string Leaves, HuntReplay Replay);
 
 public sealed record ReplayMob(int Id, int ClassId, string Name, int Level, int Exp, int MaxHp, bool Pinned, int[] Area, string Respawn, string Forecast);
 

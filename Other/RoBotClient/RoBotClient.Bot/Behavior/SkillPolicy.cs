@@ -151,13 +151,16 @@ public static class SkillPolicy
     ///   and DEF drop (&lt;paramref name="landChance"/&gt;: level → chance it sticks), held to the same ≥1 swing / per-SP bar.
     /// - Damage skill: needs to save ≥1 swing. With free SP pick the level saving the most swings, otherwise the best
     ///   swings-per-SP. (A "save SP for fresh mobs" bar was tried: with server multipliers a finishing cast scores about
-    ///   the same per SP as an opener, so the 1-swing rule already does the work.)
+    ///   the same per SP as an opener, so the 1-swing rule already does the work.) The skill's hit is a multiple of
+    ///   &lt;paramref name="hitDmg"/&gt; (one hit, no Double Attack), the swings it replaces are &lt;paramref name="autoDmg"/&gt; (with
+    ///   it): a dagger thief's Envenom on an already-poisoned mob is a 1.35x hit against a ~1.5x swing, so it isn't cast.
     /// - No auto-attack (autoDmg ≤ 0, a pure caster): the skill IS the damage, always cast.</summary>
     public static int ChooseLevel(CharacterSkill skill, int maxLevel, bool pinLevel, int[]? spCosts,
         int targetHp, bool targetHasDebuff, double autoDmg, int sp, bool spFree,
-        Func<int, double>? landChance = null, double attackInterval = 1.5, double poisonedAutoDmg = 0)
+        Func<int, double>? landChance = null, double attackInterval = 1.5, double poisonedAutoDmg = 0, double hitDmg = 0)
     {
         if (maxLevel <= 0) return 0;
+        if (hitDmg <= 0) hitDmg = autoDmg; // no Double Attack: a swing is one hit
         var debuff = AppliedDebuff(skill);
         if (debuff != null && !targetHasDebuff && DamageMultiplier(skill, 1) <= 0) return maxLevel;
         if (DamageMultiplier(skill, 1) <= 0) return debuff != null ? 0 : maxLevel; // debuff already up / not modeled: leave it to the script
@@ -166,8 +169,8 @@ public static class SkillPolicy
         int Cost(int lv) => SpCost(spCosts, lv);
         var land = debuff != null && !targetHasDebuff ? landChance : null;
         int Saved(int hp, int lv) => land != null
-            ? PoisonHitsSaved(hp, autoDmg, autoDmg * DamageMultiplier(skill, lv), land(lv), attackInterval, poisonedAutoDmg)
-            : HitsSaved(hp, autoDmg, autoDmg * DamageMultiplier(skill, lv));
+            ? PoisonHitsSaved(hp, autoDmg, hitDmg * DamageMultiplier(skill, lv), land(lv), attackInterval, poisonedAutoDmg)
+            : HitsSaved(hp, autoDmg, hitDmg * DamageMultiplier(skill, lv));
         double Score(int hp, int lv) => spFree ? Saved(hp, lv) : (double)Saved(hp, lv) / Cost(lv);
 
         var (lo, hi) = pinLevel ? (maxLevel, maxLevel) : (1, maxLevel);

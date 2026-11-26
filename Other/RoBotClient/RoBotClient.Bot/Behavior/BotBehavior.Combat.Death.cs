@@ -15,6 +15,11 @@ public sealed partial class BotBehavior
     // permanently ban a class — particularly important for low-level bots that may die once and then be
     // unable to hunt the most common mob on their map for the rest of the session.
     private readonly Dictionary<int, DateTime> _avoidClasses = new();
+    // Classes that killed us again while still avoided: only these make a whole map unsafe. One death is often bad luck
+    // (no potions, no wings, a pile-on) and the bot is already off the map by then.
+    // ponytail: lazy so a hot-reloaded running bot (field initializers don't run) gets a set instead of null.
+    private HashSet<int>? _repeatKillersSet;
+    private HashSet<int> _repeatKillers => _repeatKillersSet ??= new();
     private static readonly TimeSpan AvoidClassDuration = TimeSpan.FromMinutes(HuntPolicy.AvoidClassMinutes);
     // Dying to the same class again inside the window means it's no fluke: Bot3 died to Elder Willow on three maps in 4 min.
     private static readonly TimeSpan RepeatKillerAvoidDuration = TimeSpan.FromMinutes(HuntPolicy.RepeatKillerAvoidMinutes);
@@ -57,6 +62,7 @@ public sealed partial class BotBehavior
                 var fresh = !(_avoidClasses.TryGetValue(killerClass, out var prevUntil) && prevUntil > DateTime.UtcNow);
                 var expires = DateTime.UtcNow + (fresh ? AvoidClassDuration : RepeatKillerAvoidDuration);
                 _avoidClasses[killerClass] = expires;
+                if (!fresh) _repeatKillers.Add(killerClass);
                 OnMemoryChanged?.Invoke();
                 _mapDangerLastLevel = -1; // re-score maps now that this class has killed us
                 var context = DateTime.UtcNow - _lastFleeAt < TimeSpan.FromSeconds(15)

@@ -82,7 +82,7 @@ public sealed partial class BotBehavior
             _kafraLastSeq = 0;
             OnLog?.Invoke(info.DestOptionIndex < 0
                 ? $"Kafra save: heading to NPC ({npcX},{npcY}) on {snap.Map} to save my respawn point."
-                : $"Kafra warp: heading to NPC ({npcX},{npcY}) on {snap.Map} to teleport to '{info.OptionLabel}' (option {info.DestOptionIndex}).");
+                : $"Kafra warp: heading to NPC ({npcX},{npcY}) on {snap.Map} to teleport to '{info.OptionLabel}' (option {(info.DestOptionIndex < 0 ? info.TopMenuOption : info.DestOptionIndex)}).");
         }
 
         if (DateTime.UtcNow > _kafraDeadline)
@@ -155,7 +155,8 @@ public sealed partial class BotBehavior
                         // First menu — pick "Teleport Service" at _kafraTopMenuOption.
                         _kafraNextAction = DateTime.UtcNow.AddMilliseconds(500);
                         _kafraLastSeq = npc.Seq;
-                        _kafraStep = KafraStep.SelectDestination;
+                        // An NPC link (Santa, the Amatsu captain) teleports straight from its one menu.
+                        _kafraStep = _kafraDestOption == NpcLinks.NoSecondMenu ? KafraStep.AwaitWarp : KafraStep.SelectDestination;
                         await _bot.NpcSelectOptionAsync(_kafraTopMenuOption, ct);
                         return;
                     case NpcPhase.Ended:
@@ -231,6 +232,13 @@ public sealed partial class BotBehavior
                     _kafraBlacklist.Remove((_kafraStartMap, _kafraNpcX, _kafraNpcY));
                     ResetKafraStep();
                     return;
+                }
+                // NPC links talk before the MoveTo ("Alright, I'll start the engine!"): click through it.
+                var talk = _bot.SnapshotNpc();
+                if (talk.Seq != _kafraLastSeq && talk.Phase == NpcPhase.Dialog)
+                {
+                    _kafraLastSeq = talk.Seq;
+                    await _bot.NpcAdvanceAsync(ct);
                 }
                 _kafraNextAction = DateTime.UtcNow.AddMilliseconds(500);
                 return;

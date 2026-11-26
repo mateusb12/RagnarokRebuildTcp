@@ -257,6 +257,7 @@ public sealed class ServerWorld
 
     public ServerWorld(string mapName, PlayerBuild build, int x, int y, int seed)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("server: world setup");
         if (!ServerCombatRuntime.IsInitialized) throw new InvalidOperationException("ServerCombatRuntime.EnsureInitialized must run first.");
         _random = new Random(seed);
         lock (ServerCombatRuntime.Gate)
@@ -447,6 +448,16 @@ public sealed class ServerWorld
         }
     }
 
+    /// <summary>HP and SP carried in from somewhere else (the previous map of a route), clamped to the maxima, at least 1 HP.</summary>
+    public void SetVitals(int hp, int sp)
+    {
+        lock (ServerCombatRuntime.Gate)
+        {
+            _player.CombatEntity.SetStat(CharacterStat.Hp, Math.Clamp(hp, 1, MaxHp));
+            _player.CombatEntity.SetStat(CharacterStat.Sp, Math.Clamp(sp, 0, MaxSp));
+        }
+    }
+
     /// <summary>Death stand-in: Player.Die isn't run, so its status wipe is done here, then full HP/SP.</summary>
     public void Revive()
     {
@@ -483,6 +494,7 @@ public sealed class ServerWorld
     /// that died meanwhile. When the player's HP runs out on the way (PlayerDied), the clock stops at that moment.</summary>
     public IReadOnlyList<int> Advance(double until, bool walking = false)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("server: world advance (AI, regen, statuses)");
         if (until < Clock - 1e-9) throw new InvalidOperationException($"clock going back: {Clock} -> {until}");
         var killed = new List<int>();
         PlayerDied = false;
@@ -543,6 +555,7 @@ public sealed class ServerWorld
     /// <paramref name="maxSeconds"/> pass. <paramref name="decide"/> is asked whenever the player may act.</summary>
     public EncounterResult Fight(int targetId, Func<PlayerChoice> decide, double maxSeconds)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("server: fight engine");
         lock (ServerCombatRuntime.Gate)
         {
             Enter();
@@ -709,6 +722,7 @@ public sealed class ServerWorld
     /// <summary>The packet as the server receives it from a client: its type byte, then the handler for that type.</summary>
     private void Receive(byte[] packet, int length)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("server: packet handlers");
         var message = new InboundMessage(_connection, packet, length);
         var type = (PacketType)message.ReadByte();
         if (type == PacketType.Skill) _skillPacketHandler.Process(_connection, message);
@@ -1256,6 +1270,7 @@ public sealed class ServerWorld
     /// <summary>The SkillError results the server sent this player since the last drain; everything else is dropped.</summary>
     private List<SkillValidationResult> DrainPackets()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("server: packet drain");
         var errors = new List<SkillValidationResult>();
         var queue = (NetQueue<OutboundMessage>)OutboundField.GetValue(null)!;
         while (queue.TryDequeue(out var message))

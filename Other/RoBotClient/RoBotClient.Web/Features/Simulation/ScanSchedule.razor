@@ -1,0 +1,67 @@
+@using RoBotClient.Bot.Behavior
+@using RoBotClient.Bot.Manager
+@using RoBotClient.Web.Components
+@inherits LiveComponent
+@inject BotManager Bots
+@inject RouteChecks Routes
+
+@* When each live bot last ran its level scan and when it will ask again: on a level-up, or at its first map decision
+   (every ~10 min) after the scan is RouteChecks.ScanTtl old. *@
+<div class="small text-secondary mb-2">
+    A bot asks for a level scan on a level-up, or at its first map decision (about every 10 min) once its last scan is
+    @RouteChecks.ScanTtl.TotalHours.ToString("0.#") h old.
+</div>
+@{ var saved = Routes.SavedScans(); /* newest first; a dozen small files, read every 5 s */ }
+<table class="table table-sm small mb-0" style="font-variant-numeric:tabular-nums">
+    <thead><tr><th>Bot</th><th>Last scan</th><th>Next scan</th></tr></thead>
+    <tbody>
+        @foreach (var s in Bots.GetSnapshots().OrderBy(s => s.CharacterName))
+        {
+            var last = saved.FirstOrDefault(x => Same(x.Character, s.CharacterName));
+            <tr>
+                <td class="text-nowrap"><span class="fw-semibold">@s.CharacterName</span> <span class="text-secondary">Lv @s.Level · @Job(s.Id)</span></td>
+                <td>
+                    @if (last == null) { <span class="text-secondary">never</span> }
+                    else
+                    {
+                        <span>@last.AtUtc.ToLocalTime().ToString("MM-dd HH:mm")</span>
+                        <span class="text-secondary"> · @Ago(DateTime.UtcNow - last.AtUtc) ago · Lv @last.Level from @last.From</span>
+                    }
+                </td>
+                <td>@Next(s, last)</td>
+            </tr>
+        }
+    </tbody>
+</table>
+
+@code {
+    protected override int RefreshMs => 5000;
+
+    private string Job(string id)
+    {
+        var job = Bots.GetSession(id)?.WithState(w => w.Self.JobId) ?? 0;
+        return job == 0 ? "Novice" : BotBehavior.JobName(job) is { Length: > 0 } n ? n : $"job {job}";
+    }
+
+    private RenderFragment Next(BotSnapshot s, RoBotClient.Bot.Offline.LevelScan? last)
+    {
+        var cfg = Bots.GetBehaviorConfig(s.Id);
+        if (cfg is { AutoMap: false } || cfg is { SimulateRoutes: false })
+            return @<span class="text-secondary">never (@(cfg.AutoMap ? "route simulation" : "auto map") is off)</span>;
+        if (Routes.Running is { Maps: not null } run && Same(run.Character, s.CharacterName))
+            return @<span class="text-primary fw-semibold">running now</span>;
+        var queued = Routes.Queued.FindIndex(j => j.Maps != null && Same(j.Character, s.CharacterName));
+        if (queued >= 0) return @<span class="text-primary">queued, #@(queued + 1) in line</span>;
+        if (last == null || last.Level != s.Level)
+            return @<span class="text-warning">at its next map decision (no scan for Lv @s.Level yet)</span>;
+        var due = last.AtUtc + RouteChecks.ScanTtl;
+        if (due <= DateTime.UtcNow) return @<span class="text-warning">at its next map decision (scan expired)</span>;
+        return @<span>@due.ToLocalTime().ToString("HH:mm") <span class="text-secondary">(in @Ago(due - DateTime.UtcNow)) or on reaching Lv @(s.Level + 1)</span></span>;
+    }
+
+    // Saved scans carry the short name the Host got (--config-of "Bot1"); live jobs and bots the full "[BOT] Bot1".
+    private static bool Same(string a, string b) => string.Equals(a.Split(' ')[^1], b.Split(' ')[^1], StringComparison.OrdinalIgnoreCase);
+
+    private static string Ago(TimeSpan t) => t.TotalMinutes < 1 ? $"{(int)t.TotalSeconds}s"
+        : t.TotalHours < 1 ? $"{(int)t.TotalMinutes}min" : $"{(int)t.TotalHours}h{t.Minutes:00}";
+}

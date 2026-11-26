@@ -16,7 +16,8 @@ namespace RoBotClient.Bot.Offline;
 /// <param name="Config">The bot's saved BotBehaviorConfig (bot-configs.json); null runs the in-code defaults, and the report says so.</param>
 /// <param name="ConfigSource">Where Config came from, for the report.</param>
 public sealed record HuntSimOptions(string Map, PlayerBuild Build, double DurationSeconds, int Seed, int ForecastTrials = 300,
-    string SkillScript = "", bool NoAutoAttack = false, BotBehaviorConfig? Config = null, string? ConfigSource = null);
+    string SkillScript = "", bool NoAutoAttack = false, BotBehaviorConfig? Config = null, string? ConfigSource = null,
+    (int X, int Y)? StartAt = null, (int X, int Y)? CrossTo = null, int? StartHp = null, int? StartSp = null);
 
 /// <summary>
 /// Offline hunting on one map: an isolated virtual world (the map's walk grid, its monster population with the server's
@@ -193,7 +194,8 @@ public sealed class HuntSimulator
         _rules = BotBehavior.ParseSkillScript(options.SkillScript ?? "", errors);
         if (errors.Count > 0) throw new ArgumentException("skill script: " + string.Join("; ", errors));
         _itemRules = BotBehavior.ParseItemScript(_cfg.ItemScript ?? "", out _); // live skips bad lines too
-        _inputs = new BotBehavior.SkillChoiceInputs(data, options.NoAutoAttack, (m, _) => ForecastOf(m.ClassId).Swing);
+        _inputs = new BotBehavior.SkillChoiceInputs(data, options.NoAutoAttack, (m, _) => ForecastOf(m.ClassId).Swing,
+            m => ForecastOf(m.ClassId) is { P: { } p } f ? f.Swing / (1 + p.DoubleAttackRate) : ForecastOf(m.ClassId).Swing); // a skill hit never doubles
         for (var y = 0; y < _walk.Height; y++)
             for (var x = 0; x < _walk.Width; x++)
                 if (_walk.IsWalkable(x, y)) WalkableCells++;
@@ -203,19 +205,24 @@ public sealed class HuntSimulator
     /// <summary>A trace line, and the same line as a replay event of &lt;paramref name="kind"/&gt; with what the decision saw.</summary>
     private void Log(string s, string kind = "note", int mob = 0, object? detail = null, int x = -1, int y = -1)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: trace/log events");
         var t = Math.Max(_t, _world?.Clock ?? 0);
         Trace.Add($"[{t,8:F2}s] ({_x},{_y}) {s}");
         _events.Add(new ReplayEvent(t, kind, s, mob, x, y, Detail: detail));
     }
 
     /// <summary>A replay event only (no trace line, so the trace and its fingerprint stay as they were).</summary>
-    private void Note(string kind, string text, int mob = 0, object? detail = null, int x = -1, int y = -1) =>
+    private void Note(string kind, string text, int mob = 0, object? detail = null, int x = -1, int y = -1)
+    {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: trace/log events");
         _events.Add(new ReplayEvent(Math.Max(_t, _world?.Clock ?? 0), kind, text, mob, x, y, Detail: detail));
+    }
 
     /// <summary>The server world's events: traced ones as before, and every one (hits, regen ticks, ground effects) for
     /// the replay at its own server time, with the player's HP/SP right after it.</summary>
     private void OnWorld(WorldEvent e)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: trace/log events");
         var mob = _byServerId.TryGetValue(e.Entity, out var m) ? m : null;
         // The server names monsters by entity id; the replay by its own ids.
         if (mob != null && e.Text != null && e.Kind is "ai" or "monster-cast") e = e with { Text = e.Text.Replace($"#{e.Entity}", $"#{mob.Id}") };
@@ -255,6 +262,7 @@ public sealed class HuntSimulator
 
     private void Vitals(double t)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: trace/log events");
         if (_vitals.Count == 0 || _vitals[^1].Hp != _world.Hp || _vitals[^1].Sp != _world.Sp) _vitals.Add(new ReplayVitals(t, _world.Hp, _world.Sp));
     }
     private void Example(string kind, string text) { if (_exampleKinds.Add(kind)) Examples.Add($"{kind}: {text}"); }
@@ -266,6 +274,7 @@ public sealed class HuntSimulator
     /// spawn scripts; the rest roam the map bounds shrunk by 14 (World.RespawnMonster with no spawn area).</summary>
     private void Populate()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: spawns/respawns");
         var pinnedLeft = _data.SpawnAreas(_o.Map).GroupBy(a => a.MonsterCode, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(g => g.Key, g => g.SelectMany(a => Enumerable.Repeat(a, a.Count)).ToList(), StringComparer.OrdinalIgnoreCase);
         foreach (var db in _data.MonstersById.Values.OrderBy(m => m.Id))
@@ -324,6 +333,7 @@ public sealed class HuntSimulator
 
     private void Respawns()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: spawns/respawns");
         foreach (var m in _mobs)
         {
             if (m.Alive || m.RespawnAt > _t) continue;
@@ -343,6 +353,7 @@ public sealed class HuntSimulator
     /// each other: only the destination avoids occupied cells, as FindRandomMoveTargetInArea does.</summary>
     private void Wander()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: out-of-view monster wander");
         foreach (var m in _mobs)
         {
             if (!m.Alive || m.Speed <= 0 || m.Active) continue; // under its own server AI: the server walks it
@@ -372,6 +383,7 @@ public sealed class HuntSimulator
     /// fight, a live ground effect): moving it every step costs more than the rest of the run (Map visibility updates).</summary>
     private void SyncServer()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: view boundary/server sync");
         foreach (var m in _mobs)
             if (m.Alive && m.ServerId != 0 && (m.X, m.Y) != (m.SyncedX, m.SyncedY))
             {
@@ -387,6 +399,7 @@ public sealed class HuntSimulator
     /// boundary. One authority at a time: Wander skips active monsters, and the server only updates active ones.</summary>
     private void Boundary()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: view boundary/server sync");
         _peakActive = Math.Max(_peakActive, _world.ActiveMonsters);
         foreach (var m in _mobs)
         {
@@ -408,6 +421,7 @@ public sealed class HuntSimulator
     /// (consecutive steps at its speed append to one MobMoves entry, flagged as steps the server walked).</summary>
     private void OnMonsterStep(int serverId, int x, int y, double at, double speed)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: replay recording (monster steps)");
         if (!_byServerId.TryGetValue(serverId, out var m)) return;
         var (dx, dy) = (x - m.X, y - m.Y);
         (m.X, m.Y, m.SyncedX, m.SyncedY) = (x, y, x, y);
@@ -490,6 +504,7 @@ public sealed class HuntSimulator
     /// current HP loses to, or the one being fled, is a hazard of HuntPolicy.HazardRadius; remembered for 30 s.</summary>
     private void ComputeHazards()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: hazards");
         _hazards.Clear();
         foreach (var m in _mobs)
         {
@@ -545,6 +560,7 @@ public sealed class HuntSimulator
     /// live never sidesteps there either). A Fly Wing flee is offered when one is held and the escape throttle is off.</summary>
     private (int Index, int Distance, FleeAction Action)? FleeDecision()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: flee decision");
         ComputeHazards();
         var (idx, d) = HuntPolicy.NearestHazardInReach(_hazards, Self, _fleeing);
         if (idx < 0) return null;
@@ -654,6 +670,7 @@ public sealed class HuntSimulator
     {
         Deaths++;
         var killer = _lastAttacker ?? target;
+        Killer = killer != null ? Name(killer) : null;
         if (killer != null) Stats(killer).Deaths++;
         _end = Math.Max(_t, _world.Clock);
         _t = _end;
@@ -680,6 +697,7 @@ public sealed class HuntSimulator
     /// see, solo, with this world's forecasts and A*; returns the walk up to the first cell in attack range.</summary>
     private (Mob Mob, List<(int x, int y)> Path)? Pick(List<Mob> visible)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: target pick");
         PickDecisions++;
         var world = new SimTargets(this);
         var ranking = new List<(Mob M, double Score, bool Ok)>();
@@ -834,6 +852,7 @@ public sealed class HuntSimulator
     /// &lt;paramref name="attempts"/&gt; receives each random draw and why it was refused, for the replay.</summary>
     private (int X, int Y)? WanderDestination(List<string> attempts)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: wander pick");
         for (var attempt = 0; attempt < 6; attempt++)
         {
             int tx = _rng.Next(1, _walk.Width - 1), ty = _rng.Next(1, _walk.Height - 1);
@@ -860,6 +879,7 @@ public sealed class HuntSimulator
     /// monster in view stops a wander (stopOnSighting); the chased target moving stops an approach (re-path).</summary>
     private WalkStop Walk(List<(int x, int y)> path, WalkKind kind, bool stopOnSighting, Mob? chase = null, double maxSeconds = double.PositiveInfinity)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: walking (step loop)");
         var approach = kind == WalkKind.Approach;
         var goal = chase != null ? (chase.X, chase.Y) : default;
         var detour = path.Count - 1 - Dist(path[0].x, path[0].y, path[^1].x, path[^1].y);
@@ -924,6 +944,7 @@ public sealed class HuntSimulator
     /// each action, the server executes it. Returns false when the target wasn't killed.</summary>
     private bool Fight(Mob m, string? why = null)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: fight bookkeeping");
         Stats(m).Picked++;
         if (AdvanceWorld(walking: true)) return false; // statuses, world events and regen ran on while walking
         if (!m.Alive) return false; // a ground effect left behind finished it on the way
@@ -1027,6 +1048,7 @@ public sealed class HuntSimulator
     /// the corpse's cell, then SE, W, N, ...), on the ground for 60 s (GroundItem.Expiration).</summary>
     private void DropItems(Mob m)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: items (drops/loot)");
         var i = 0;
         foreach (var (id, n) in ServerWorld.RollDrops(m.Db.Id, _lootRng))
         {
@@ -1045,6 +1067,7 @@ public sealed class HuntSimulator
     /// 1 cell) and picks it up on arrival. True when it looted (or tried), so the tick ends there as live.</summary>
     private bool LootTick()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: items (drops/loot)");
         _ground.RemoveAll(g => g.Expires <= _t);
         if (!_cfg.AutoLoot) return false;
         var near = _ground.Where(g => !_cfg.LootBlacklist.Contains(g.ItemId) && !_skipDrops.Contains(g.DropId)
@@ -1104,6 +1127,7 @@ public sealed class HuntSimulator
     /// every 1.5 s as live. Returns whether the bot rested.</summary>
     private bool RestIfDue()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: rest");
         var canSit = HuntPolicy.CanSit(_o.Build.JobId, _o.Build.LearnedSkills.GetValueOrDefault(CharacterSkill.BasicMastery));
         if (AdvanceWorld(walking: true)) return false; // the walk up to here
         ComputeHazards();
@@ -1169,6 +1193,7 @@ public sealed class HuntSimulator
     /// BotBehavior.ChooseSkillRule on a snapshot of what the bot would know, then the rule's packet.</summary>
     private PlayerChoice Decide(Mob target)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: fight decisions (skill rules)");
         // The world keeps going around the fight: respawns, the replica's wander, the boundary (a monster walking into
         // view mid-fight comes under its AI and can join). Then the live tick order: AvoidHazardsAsync before the hunt.
         _t = Math.Max(_t, _world.Clock);
@@ -1252,6 +1277,7 @@ public sealed class HuntSimulator
     /// ponytail: only at action slots in a fight; live also drinks while a monster hits it on the walk.</summary>
     private string? UseItems(Mob target)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: items (use)");
         var now = _world.Clock;
         if (_itemRules.Count > 0)
         {
@@ -1340,6 +1366,7 @@ public sealed class HuntSimulator
     /// view with their HP, the target's statuses.</summary>
     private BotBehavior.Snapshot Snapshot(Mob target)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: snapshot");
         var b = _o.Build;
         var s = new BotBehavior.Snapshot
         {
@@ -1367,9 +1394,12 @@ public sealed class HuntSimulator
 
     public void Run()
     {
-        if (!_walk.TryFindWalkableNear(_walk.Width / 2, _walk.Height / 2, 60, out _x, out _y))
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("sim: main loop");
+        var (sx, sy) = _o.StartAt ?? (_walk.Width / 2, _walk.Height / 2);
+        if (!_walk.TryFindWalkableNear(sx, sy, 60, out _x, out _y))
             throw new InvalidOperationException("no walkable start cell");
         _world = new ServerWorld(_o.Map, _o.Build, _x, _y, _rng.Next()) { OnEvent = OnWorld, OnMonsterStep = OnMonsterStep };
+        if (_o.StartHp is { } hp0) _world.SetVitals(hp0, _o.StartSp ?? _world.MaxSp);
         _track.Add(new ReplayStep(0, _x, _y, 0));
         Vitals(0);
         if (_world.MapWidth != _walk.Width || _world.MapHeight != _walk.Height)
@@ -1379,7 +1409,8 @@ public sealed class HuntSimulator
         Boundary();
         var lookNow = true;
         var (stuckAt, stuckTicks) = (-1.0, 0);
-        while (_t < _end)
+        if (_o.CrossTo is { } exit) RunCross(exit);
+        else while (_t < _end)
         {
             OnProgress?.Invoke(_t / _end);
             // A tick that never moves the clock repeats forever: fail with what it keeps doing instead of hanging.
@@ -1465,6 +1496,66 @@ public sealed class HuntSimulator
         Log($"end: {Kills} kills, {Exp} exp", "end");
     }
 
+    // ---- crossing (HuntSimOptions.CrossTo): the live travel tick ----
+
+    /// <summary>Crossing mode reached its exit cell.</summary>
+    public bool Arrived { get; private set; }
+    public double Elapsed => _t;
+    public int Hp => _world.Hp;
+    public int Sp => _world.Sp;
+    public int MaxHp => _world.MaxHp;
+    public IReadOnlyDictionary<int, int> Bag => _bag;
+    public string? Killer { get; private set; }
+    private const int CrossArriveCells = 2; // a portal's footprint warps on any cell of it; the NPC of a Kafra is clicked from 2 cells
+
+    /// <summary>The live travel tick (BotBehavior.Tick while off the hunting map) toward one exit cell: AvoidHazardsAsync,
+    /// TryEmergencyFlyWingAsync, DefendAsync (turn on what's chasing when the pack is too costly to drag), TickRestAsync,
+    /// then TravelAsync's walk. Ends on arrival, death or the duration cap (stuck).</summary>
+    private void RunCross((int X, int Y) exit)
+    {
+        if (!_walk.TryFindWalkableNear(exit.X, exit.Y, 6, out var gx, out var gy)) (gx, gy) = exit;
+        Log($"cross {_o.Map}: from ({_x},{_y}) to the exit at ({gx},{gy})", "start");
+        while (_t < _end)
+        {
+            OnProgress?.Invoke(_t / _end);
+            if (Dist(_x, _y, gx, gy) <= CrossArriveCells) { Arrived = true; _end = _t; break; } // the replay ends at the portal, not at the 5 min cap
+            Respawns();
+            if (FleeIfThreatened()) continue;
+            if (EmergencyWing()) continue;
+            if (Defender() is { } m)
+            {
+                var stop = WalkStop.Arrived;
+                for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && m.Alive && _t < _end && !CanHit(_x, _y, m) && repaths < MaxChaseRepaths; repaths++)
+                {
+                    var path = _walk.FindPath(_x, _y, m.X, m.Y, ReachExpansions);
+                    if (path == null) break;
+                    stop = Walk(path.Take(path.FindIndex(c => CanHit(c.x, c.y, m)) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: m);
+                }
+                if (m.Alive && _t < _end && stop is not (WalkStop.Threat or WalkStop.Died) && CanHit(_x, _y, m)) Fight(m, "defend");
+                else Wait(LiveTickSeconds, flee: false); // couldn't close in: the next tick decides again
+                continue;
+            }
+            if (RestIfDue()) continue;
+            var route = _walk.FindPath(_x, _y, gx, gy, 0, PathCost()); // WalkPathTowardAsync: A* around hazard zones
+            if (route is not { Count: > 1 }) { Log($"no path to the exit at ({gx},{gy})", "idle"); Wait(0.8, flee: false); continue; }
+            Walk(route, WalkKind.Wander, stopOnSighting: false, maxSeconds: 10); // a hit (DefendAsync's turn) or a hazard stops it sooner
+        }
+        Log(Arrived ? $"arrived at the exit after {_t:F0}s, HP {_world.Hp}/{_world.MaxHp}" : Deaths > 0 ? $"died after {_t:F0}s" : $"stuck: no arrival in {_end:F0}s", "end");
+    }
+
+    /// <summary>BotBehavior.DefendAsync: the winnable monsters on the bot (hit it, or aggressive within 2 cells; fixed ones
+    /// don't follow), within DefendRadius. None when dragging the pack costs under DefendDangerShare of the HP; else the
+    /// quickest winnable kill. ponytail: IsHuntable is the forecast win only (no ignore/force lists).</summary>
+    private Mob? Defender()
+    {
+        var chasers = Visible().Where(m => ForecastOf(m).CanWin && Dist(_x, _y, m.X, m.Y) <= BotBehavior.DefendRadius && !HuntPolicy.IsImmobile(_data.Monster(m.Db.Id))
+            && (_hitMe.Contains(m.ServerId) || HuntPolicy.IsAggressive(_data.Monster(m.Db.Id)) && Dist(_x, _y, m.X, m.Y) <= 2)).ToList();
+        if (chasers.Count == 0) return null;
+        var pack = GroupForecast(chasers.Select(m => { var (hp, maxHp) = _world.MonsterHp(m.ServerId); return new BotBehavior.MonsterInfo(m.ServerId, m.Db.Id, m.Db.Name, new Position(m.X, m.Y), hp, maxHp); }).ToList());
+        if (pack.CanWin && pack.Damage < _world.Hp * BotBehavior.DefendDangerShare) return null;
+        return chasers.MinBy(m => ForecastOf(m).Seconds);
+    }
+
     // ---- report ----
 
     /// <summary>SHA-256 of the full event trace: equal for equal inputs and seed.</summary>
@@ -1472,6 +1563,7 @@ public sealed class HuntSimulator
 
     public string Report()
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("output: report");
         var sb = new StringBuilder();
         void L(string s = "") => sb.AppendLine(s);
         var hours = Math.Max(1e-9, _end / 3600);
@@ -1627,6 +1719,7 @@ public sealed class HuntSimulator
     /// the capability list. &lt;paramref name="buildSource"/&gt;: where the build came from, for the viewer.</summary>
     public HuntReplay Replay(string? buildSource = null)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("output: replay build");
         var walk = new StringBuilder(_walk.Width * _walk.Height);
         for (var y = 0; y < _walk.Height; y++)
             for (var x = 0; x < _walk.Width; x++)

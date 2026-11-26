@@ -142,6 +142,7 @@ public static class DuelSimulator
 
     public static DuelPrediction Simulate(DuelRequest request)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("forecast duels (DuelSimulator)", byCaller: true);
         if (!ServerCombatRuntime.IsInitialized)
             throw new InvalidOperationException("ServerCombatRuntime.EnsureInitialized must run first.");
         if (!DataManager.MonsterIdLookup.TryGetValue(request.MonsterClassId, out var monsterInfo))

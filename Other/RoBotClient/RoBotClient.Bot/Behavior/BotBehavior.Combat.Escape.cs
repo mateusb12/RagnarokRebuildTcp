@@ -22,8 +22,10 @@ public sealed partial class BotBehavior
 
     /// <summary>Fly Wing first (same map, cheap); a Butterfly Wing (back to the save point) only when the caller allows it.
     /// 0 when neither is usable.</summary>
+    // Stuck/confined/trapped isn't danger: like travel shortcuts it only spends Fly Wings above the emergency half of the
+    // pool (Bot2 burned every wing unsticking on mjo_dun02, then died cornered at orcsdun02 with none).
     private int PickEscapeWing(bool butterflyOk) =>
-        HasUsableItem(_config.FlyWingItemId) ? _config.FlyWingItemId
+        HasUsableItem(_config.FlyWingItemId) && CountInInventory(_config.FlyWingItemId) > EmergencyFlyWings() ? _config.FlyWingItemId
         : butterflyOk && HasUsableItem(_config.ButterflyWingItemId) ? _config.ButterflyWingItemId : 0;
 
     private string WingName(int itemId) => itemId == _config.FlyWingItemId ? "Fly Wing" : "Butterfly Wing";
@@ -112,6 +114,7 @@ public sealed partial class BotBehavior
         // Find what we have. Fly Wing first; Butterfly Wing only after the longer threshold so we don't
         // throw the bot back to save point on a 5-second trap that Fly Wing alone could solve.
         var pick = PickEscapeWing(trapSecs >= 15.0);
+        if (pick == 0 && trapSecs >= 15.0 && HasUsableItem(_config.FlyWingItemId)) pick = _config.FlyWingItemId; // no walking out: the reserve is all that's left
         if (pick == 0) return;
         OnLog?.Invoke($"Sub-region trap escape: using {WingName(pick)} (trapped {trapSecs:F0}s).");
         await UseEscapeWingAsync(pick, 3, ct);

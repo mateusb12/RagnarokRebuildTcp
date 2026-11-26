@@ -36,9 +36,9 @@ public sealed partial class BotBehavior
     }
 
     // Close enough that it's on us rather than just around: a monster chasing a walking bot stays within a few cells.
-    private const int DefendRadius = 5;
+    internal const int DefendRadius = 5;
     // ponytail: guessed share; re-fit from the "it's chasing me" engagements' HP lost once there are some.
-    private const double DefendDangerShare = 0.3;
+    internal const double DefendDangerShare = 0.3;
 
     /// <summary>Off the hunt (shop trip, or traveling to the hunting map): keep fighting a target that's on us, or
     /// engage the nearest winnable monster that has hit us or is an aggressive one at melee range. False when

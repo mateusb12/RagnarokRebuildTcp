@@ -120,7 +120,7 @@ public sealed class GameDatabase
         if (!string.IsNullOrEmpty(warpScriptDir) && Directory.Exists(warpScriptDir))
         {
             var knownMaps = new HashSet<string>(db.MapsByCode.Keys, StringComparer.OrdinalIgnoreCase);
-            db.World.Build(warpScriptDir, db.GetWalkMap, knownMaps, db.Kafras);
+            db.World.Build(warpScriptDir, db.GetWalkMap, knownMaps, [.. db.Kafras, .. NpcLinks.All]); // links stay out of db.Kafras: they can't save
             // ponytail: gear stats aren't in the client export, so read the server CSVs that sit next to Script/Warps
             db.LoadGear(Path.GetFullPath(Path.Combine(warpScriptDir, "..", "..", "Db")));
         }

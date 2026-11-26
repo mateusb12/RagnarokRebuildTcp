@@ -26,7 +26,8 @@ public readonly record struct CombatModifiers(
     int AttackerDemonBaneLevel = 0, // player's max-learned DemonBane level (+3 per lvl vs Demon/Undead, pre-DEF).
     int AttackerBeastBaneLevel = 0, // player's max-learned BeastBane level (+5 per lvl vs Beast/Insect).
     double ExtraSkillDps = 0,       // magic rotation (bolts): no SkillPolicy model yet, so a DPS add-on
-    double SkillHitMultiplier = 0,  // scripted physical skill (Bash...) as a multiple of one swing: SkillPolicy.DamageMultiplier
+    double SkillHitMultiplier = 0,  // scripted physical skill (Bash...) as a multiple of one hit: SkillPolicy.DamageMultiplier
+    double AttackerDoubleAttackChance = 0, // chance an auto-attack hits twice (Double Attack with a dagger); skills never do
     int SkillCasts = 0,             // casts of it the SP on hand pays for; each replaces a swing (shared attack cooldown)
     double MonsterSkillDps = 0,     // incoming: the monster's TryCast spells/skills, net of the swings it skips while casting. See MonsterSkillDps().
     bool DefenderIsBoss = false,    // bosses get specific resists; flag exposed to callers, not yet used in damage scale.
@@ -55,7 +56,8 @@ public readonly record struct BattleForecast(
     double EffectiveDpsWithSkills = 0,
     double ExpectedDamageTaken = 0,
     int AttacksToKill = 0,
-    double ExpectedDamagePerSwing = 0); // one auto-attack, hit chance and crits blended: SkillPolicy's "autoDmg"
+    double ExpectedDamagePerSwing = 0, // one auto-attack, hit chance, crits and Double Attack blended: SkillPolicy's "autoDmg"
+    double ExpectedDamagePerHit = 0);  // the same without Double Attack: what a skill's multiplier scales
 
 /// <summary>Outcome of fighting a whole pack at once (assist mobs / aggressive swarms).</summary>
 public readonly record struct GroupForecast(
@@ -238,10 +240,13 @@ public static class BattleSimulator
 
         // Blend: expected damage per swing = (1-p)·normal·hitChance + p·crit (crits ignore evasion).
         var critChance = CritChanceFromMods(me, mods);
-        var expectedDmgPerSwing = (1 - critChance) * myDmgNormal * myHitChance
-                                   + critChance     * myDmgCrit;
+        var expectedDmgPerHit = (1 - critChance) * myDmgNormal * myHitChance
+                                 + critChance     * myDmgCrit;
+        var doubleFactor = 1 + mods.AttackerDoubleAttackChance;
+        var expectedDmgPerSwing = expectedDmgPerHit * doubleFactor;
 
-        var (skillBonus, _) = SkillBonusDamage(monster.MaxHp, expectedDmgPerSwing, mods.SkillHitMultiplier, mods.SkillCasts);
+        // A cast replaces a (possibly doubled) swing with one hit x multiplier.
+        var (skillBonus, _) = SkillBonusDamage(monster.MaxHp, expectedDmgPerSwing, mods.SkillHitMultiplier / doubleFactor, mods.SkillCasts);
         var myMeleeDps = expectedDmgPerSwing / myInterval;
         var myDps = myMeleeDps + Math.Max(0, mods.ExtraSkillDps);
         var monDps = monDmg * monHitChance / monInterval;
@@ -300,7 +305,7 @@ public static class BattleSimulator
             winChance,
             elementMod, sizeMod, critChance,
             secsToKillMonster > 0 && !double.IsInfinity(secsToKillMonster) ? monster.MaxHp / secsToKillMonster : myDps,
-            Math.Min(ClampFinite(damageTaken), 999999), hitsToKill, expectedDmgPerSwing);
+            Math.Min(ClampFinite(damageTaken), 999999), hitsToKill, expectedDmgPerSwing, expectedDmgPerHit);
     }
 
     /// <summary>Damage a scripted physical skill adds over the swings its casts replace: it shares the attack cooldown
@@ -383,7 +388,7 @@ public static class BattleSimulator
             if (crit   < 1 && eleMod > 0 && szMod > 0) crit   = 1;
 
             var hitChance = HitChance(me, mon);
-            var myEffDmg = (1 - critChance) * normal * hitChance + critChance * crit;
+            var myEffDmg = ((1 - critChance) * normal * hitChance + critChance * crit) * (1 + playerMods.AttackerDoubleAttackChance);
 
             var monDmg = DamagePerHit(mon, me, PlayerSubDef(me.Vit), monLevelCut, 0) * HitChance(mon, me);
             var monInterval = mon.AttackInterval > 0.05 ? mon.AttackInterval : DefaultMonsterAttackInterval;
@@ -421,7 +426,7 @@ public static class BattleSimulator
             var idx = order[k];
             var t = killTime[idx];
             if (double.IsInfinity(t)) { dmgTaken = double.PositiveInfinity; totalKill = double.PositiveInfinity; break; }
-            var (bonus, used) = SkillBonusDamage(monsters[idx].MaxHp, swing[idx], playerMods.SkillHitMultiplier, castsLeft);
+            var (bonus, used) = SkillBonusDamage(monsters[idx].MaxHp, swing[idx], playerMods.SkillHitMultiplier / (1 + playerMods.AttackerDoubleAttackChance), castsLeft);
             castsLeft -= used;
             t -= bonus / swing[idx] * myInterval; // each swing's worth of bonus saves one attack interval
             dmgTaken += remainingDps * t; // all monsters still alive during this kill keep hitting us

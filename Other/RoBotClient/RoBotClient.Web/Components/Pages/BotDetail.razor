@@ -5,6 +5,7 @@
 @inject GameDatabase Db
 @inject RoBotClient.Web.Mcp.BuildStore Builds
 @inject RoBotClient.Web.MonsterSprites Sprites
+@inject RoBotClient.Web.Features.Simulation.RouteChecks Routes
 @using System.Linq
 @using RebuildSharedData.Enum
 @using RebuildSharedData.Enum.EntityStats
@@ -279,9 +280,14 @@ else
                     <input class="form-check-input" type="checkbox" role="switch" id="show-spawn-areas" @bind="_showSpawnAreas" />
                     <label class="form-check-label" for="show-spawn-areas">Spawn areas</label>
                 </div>
+                <label class="d-flex align-items-center gap-2 small ms-auto" title="Game minimap zoom">
+                    <span>Zoom</span>
+                    <input type="range" min="0" max="10" step="1" value="@_mapZoomLevel" @oninput="ZoomMapChangedAsync" style="width:110px" />
+                    <span class="text-nowrap">@MapZoomLabel</span>
+                </label>
             </div>
             <div class="card-body d-flex flex-wrap gap-3 align-items-start">
-                <WorldMap MapCode="@s.Map" @key="s.Map" ShowSpawnAreas="_showSpawnAreas" />
+                <WorldMap @ref="_worldMap" MapCode="@s.Map" @key="s.Map" ShowSpawnAreas="_showSpawnAreas" ZoomLevel="_mapZoomLevel" />
                 @{ var mapKills = KillsOnMap(s.Map); }
                 @if (mapKills.Count > 0)
                 {
@@ -304,13 +310,14 @@ else
     {
         var s = snapshot!;
         var behavior = Bots.GetBehavior(Id);
+        var scan = Routes.ScanOf(s.CharacterName, s.Level); // this level's offline hunts
         <div class="card mb-3">
             <div class="card-header py-2 fw-semibold">Map choice
                 @if (Bots.GetBehaviorConfig(Id)?.AutoMap == false) { <span class="text-muted fw-normal">· off (fixed hunt map)</span> }
             </div>
             <div class="card-body py-2 small">
                 <div class="mb-2 @(behavior?.MapDecision.StartsWith("Next map") == true ? "text-primary fw-semibold" : "")">
-                    @(string.IsNullOrEmpty(behavior?.MapDecision) ? "No decision yet (first check ~2 min after login, then every 10 min and on level-up)." : behavior!.MapDecision)
+                    @(string.IsNullOrEmpty(behavior?.MapDecision) ? "No decision yet (first check once its stats load after login, ~15 s, then every 10 min and on level-up)." : behavior!.MapDecision)
                 </div>
                 @if (behavior?.CurrentMapOption is not null || behavior?.MapOptions.Count > 0)
                 {
@@ -323,11 +330,11 @@ else
                             <tr class="table-primary">
                                 <td class="fw-semibold text-break" title="@current.Name">@current.Map</td>
                                 <td class="text-end">@MapExpValue(current, isCurrent: true)</td>
-                                <td class="text-break">@(current.Measured ? "measured" : "estimate")</td>
+                                <td class="text-break">@MapSource(current, scan)</td>
                                 <td class="text-end">—</td>
                                 <td class="text-end fw-semibold" title="A new map must reach this exp/h after its travel time (1.25× current)">@behavior.MinToChange.ToString("N0")</td>
-                                <td title="Measured seconds per kill on this map, by activity">@PerKillBadges(current.PerKill)</td>
-                                <td>@MapMonsters(current)</td>
+                                <td title="Measured seconds per kill on this map, by activity">@PerKill(current, scan)</td>
+                                <td>@MapMonsters(current, scan)</td>
                             </tr>
                         }
                         @if (behavior.MapOptions.Count > 0)
@@ -339,11 +346,11 @@ else
                             <tr class="@(firstOption ? "border-top" : "") @(isNext ? "table-warning fw-semibold" : "")">
                                 <td class="text-break" title="@option.Name">@option.Map @if (isNext) { <span class="badge bg-warning text-dark ms-1">next</span> }</td>
                                 <td class="text-end">@MapExpValue(option)</td>
-                                <td class="text-muted text-break">@(option.Measured ? "measured" : "estimate")</td>
-                                <td class="text-end">@option.Hops</td>
+                                <td class="text-muted text-break">@MapSource(option, scan)</td>
+                                <td class="text-end">@(option.Hops < 0 ? "✘" : option.Hops.ToString())</td>
                                 <td class="text-end @(option.VsCurrent >= 1.25 ? "text-success fw-semibold" : "text-muted")">@(option.VsCurrent > 0 ? $"{Math.Floor(option.VsCurrent * 100) / 100:0.00}×" : "—")</td>
-                                <td>@PerKillBadges(option.PerKill)</td>
-                                <td>@MapMonsters(option)</td>
+                                <td>@PerKill(option, scan)</td>
+                                <td>@MapMonsters(option, scan)</td>
                             </tr>
                             firstOption = false;
                         }
@@ -637,8 +644,11 @@ else
                 }
                 else
                 {
+                    @foreach (var (tab, items) in InventoryTabs(deep.Inventory))
+                    {
+                    <div class="px-2 pt-2 small text-muted fw-semibold">@tab <span class="fw-normal">(@items.Count)</span></div>
                     <div class="p-1" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.25rem">
-                        @foreach (var it in deep.Inventory)
+                        @foreach (var it in items)
                         {
                             <div>
                                 <div class="d-flex align-items-center gap-1 border rounded px-1 py-1 h-100 small" title="@it.Name">
@@ -663,10 +673,17 @@ else
                             </div>
                         }
                     </div>
+                    }
                 }
             </div>
         </div>
     };
+
+    // The game's Item / Equip / Etc bag tabs, same rule as the client's PlayerInventoryWindow; empty tabs are skipped.
+    private IEnumerable<(string Tab, List<InvRow> Items)> InventoryTabs(List<InvRow> inventory) =>
+        inventory.GroupBy(i => i.IsUnique ? 1 : Db.Item(i.ItemId)?.UseType is { } u && u != ItemUseType.NotUsable ? 0 : 2)
+            .OrderBy(g => g.Key)
+            .Select(g => (new[] { "Consumables", "Equipment", "Etc" }[g.Key], g.ToList()));
 
     // Alt+Q-style equipment window.
     private RenderFragment EquipmentCard => __builder =>
@@ -892,6 +909,18 @@ else
 
     // ---- State and actions ----
     private bool _showSpawnAreas = true;
+    private int _mapZoomLevel;
+    private WorldMap? _worldMap;
+    private double MapZoomFactor => 1 + 5 * Math.Pow(_mapZoomLevel / 10.0, 2);
+    private string MapZoomLabel => $"{MapZoomFactor:0.0}×";
+
+    private async Task ZoomMapChangedAsync(ChangeEventArgs e)
+    {
+        if (!int.TryParse(e.Value?.ToString(), out var level)) return;
+        _mapZoomLevel = Math.Clamp(level, 0, 10);
+        if (_worldMap != null)
+            await _worldMap.SetZoomAsync(_mapZoomLevel);
+    }
     [Parameter] public string Id { get; set; } = "";
     [SupplyParameterFromQuery] public string? Tab { get; set; }
 
@@ -1252,7 +1281,16 @@ else
         MapRuns.Compute(tele?.Snapshot() ?? new List<TelemetryEvent>(), Bots.Progress?.Get(characterName) ?? Array.Empty<ProgressSample>(), snapshot?.InGame == true);
 
     // Spawn badges styled like "Kills by monster" (portrait, name, count); too-strong ones faded and struck out.
-    private RenderFragment MapMonsters(RoBotClient.Bot.Behavior.MapOption option) => @<div class="d-flex flex-wrap gap-1">
+    private static RoBotClient.Bot.Offline.MapScan? SimOf(RoBotClient.Bot.Offline.LevelScan? scan, string map) =>
+        scan?.Maps.FirstOrDefault(m => string.Equals(m.Map, map, StringComparison.OrdinalIgnoreCase));
+
+    // Measured on the map once it counts (Measured), else the sim's seconds per kill, else the estimate.
+    private static RenderFragment PerKill(RoBotClient.Bot.Behavior.MapOption option, RoBotClient.Bot.Offline.LevelScan? scan) =>
+        !option.Measured && SimOf(scan, option.Map) is { Kills: > 0, FightPerKill: > 0 } sim
+            ? @<div title="Seconds per kill in the 10 min offline hunt">@PerKillBadges(new RoBotClient.Bot.Behavior.ActivityTime(sim.FightPerKill, sim.SearchPerKill, sim.RecoverPerKill, 0))<span class="text-muted">sim</span></div>
+            : PerKillBadges(option.PerKill);
+
+    private RenderFragment MapMonsters(RoBotClient.Bot.Behavior.MapOption option, RoBotClient.Bot.Offline.LevelScan? scan) => @<div class="d-flex flex-wrap gap-1">
         @if (option.Note.Length > 0)
         {
             var noteParts = option.Note.Split(" (", 2, StringSplitOptions.None);
@@ -1261,7 +1299,8 @@ else
         }
         @foreach (var (name, count, huntable, hpLoss) in option.Monsters.Take(5))
         {
-            <span class="badge bg-secondary @(huntable ? "" : "opacity-50 text-decoration-line-through")" title="@((huntable ? "can beat it" : "too strong at this level: skipped") + HpLossText(hpLoss))">@MonsterPortrait(name)@name&nbsp;<span class="badge bg-light text-dark">@count</span></span>
+            var simMob = SimOf(scan, option.Map)?.Monsters is { } simMobs ? simMobs.GetValueOrDefault(name) ?? new(0, 0, 0) : null;
+            <span class="badge bg-secondary @(huntable ? "" : "opacity-50 text-decoration-line-through")" title="@(simMob != null ? $"sim: {simMob.Kills} killed in 10 min{(simMob.Deaths > 0 ? $", killed you {simMob.Deaths}×" : "")}" + (simMob.Kills > 0 ? HpLossText(simMob.HpLossPerFight).Replace("expected", "average") : "") : (huntable ? "can beat it" : "too strong at this level: skipped") + HpLossText(hpLoss))">@MonsterPortrait(name)@name&nbsp;<span class="badge bg-light text-dark">@count</span></span>
         }
     </div>;
 
@@ -1310,6 +1349,27 @@ else
             @if (t.Flee >= 0.05) { <span class="badge bg-warning-subtle text-body fw-normal">Flee <b>@($"{t.Flee:0.0}s")</b></span> }
         }
     </div>;
+
+    // Where the Exp/h comes from, plus this level's offline hunt of the map (BotBehavior uses it when the map isn't measured;
+    // a death or an unsafe route there rules the map out). ▶ opens its replay.
+    private static RenderFragment MapSource(RoBotClient.Bot.Behavior.MapOption option, RoBotClient.Bot.Offline.LevelScan? scan)
+    {
+        var sim = SimOf(scan, option.Map);
+        var text = option.Measured ? "measured" : sim != null ? "simulated" : "estimate";
+        RenderFragment noRoute = @<span>@if (option.Hops < 0) { <span class="badge bg-danger ms-1" title="@option.Note">✘ no route</span> }</span>;
+        if (sim == null) return @<span>@text@noRoute</span>;
+        var bad = sim.Died || sim.Route is { Safe: false } || option.Hops < 0;
+        var why = $"Sim at Lv {scan!.Level}: {sim.ExpPerHour:N0} exp/h over {sim.Minutes:F1} min, {sim.Kills} kills"
+                  + (sim.Died ? $", died{(sim.Killer != null ? " to " + sim.Killer : "")}" : "")
+                  + (sim.Route is { } rt ? $"; route: {rt.Text}" : "");
+        return @<span title="@why">@text
+            @if (sim.Died) { <span class="badge bg-danger ms-1">☠ died</span> }
+            else if (sim.Route is { Safe: false }) { <span class="badge bg-danger ms-1">✘ route</span> }
+            else if (!bad) { <span class="badge bg-success ms-1">✔ sim</span> }
+            @noRoute
+            @if (sim.Replay != null) { <a class="ms-1 text-decoration-none" href="/simulation?run=@Uri.EscapeDataString(sim.Replay)" title="Watch this hunt">▶</a> }
+        </span>;
+    }
 
     private static RenderFragment MapExpValue(RoBotClient.Bot.Behavior.MapOption option, bool isCurrent = false) => @<span class="map-exp-hover" tabindex="0">
         <span class="map-exp-hover__value">@option.ExpPerHour.ToString("N0")</span>

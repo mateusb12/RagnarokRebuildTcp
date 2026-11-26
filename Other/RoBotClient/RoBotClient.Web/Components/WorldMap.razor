@@ -7,9 +7,16 @@
    read from the immutable per-bot snapshots. *@
 @if (ShowSpawnAreas == null) @* a parent that passes ShowSpawnAreas renders its own switch (BotDetail's card header) *@
 {
-    <div class="form-check form-switch mb-2">
-        <input class="form-check-input" type="checkbox" role="switch" id="show-spawn-areas" @bind="_showSpawnAreas" />
-        <label class="form-check-label" for="show-spawn-areas">Spawn areas</label>
+    <div class="d-flex align-items-center gap-3 mb-2">
+        <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" role="switch" id="show-spawn-areas" @bind="_showSpawnAreas" />
+            <label class="form-check-label" for="show-spawn-areas">Spawn areas</label>
+        </div>
+        <label class="d-flex align-items-center gap-2 small" title="Game minimap zoom">
+            <span>Zoom</span>
+            <input type="range" min="0" max="10" step="1" value="@_zoomLevel" @oninput="ZoomChangedAsync" style="width:110px" />
+            <span class="text-nowrap">@ZoomLabel</span>
+        </label>
     </div>
 }
 <canvas @ref="_canvasRef" width="600" height="600"
@@ -65,6 +72,7 @@
 @code {
     [Parameter] public string MapCode { get; set; } = "";
     [Parameter] public bool? ShowSpawnAreas { get; set; }
+    [Parameter] public int ZoomLevel { get; set; }
 
     // "Bash!!" for 3 s after the bot uses a skill, like Unity's ShowSkillCastMessage(skill, 3).
     private string? Shout(string botId)
@@ -83,8 +91,24 @@
     private PeriodicTimer? _timer;
     private bool _terrainSent;
     private bool _showSpawnAreas = true;
+    private int _zoomLevel;
     private bool _disposed;
     private DateTime _nextRowsRender;
+
+    private string ZoomLabel => $"{ZoomFactor(_zoomLevel):0.0}×";
+    private static double ZoomFactor(int level) => 1 + 5 * Math.Pow(Math.Clamp(level, 0, 10) / 10.0, 2);
+
+    private Task ZoomChangedAsync(ChangeEventArgs e) => int.TryParse(e.Value?.ToString(), out var level)
+        ? SetZoomAsync(level)
+        : Task.CompletedTask;
+
+    public async Task SetZoomAsync(int level)
+    {
+        _zoomLevel = Math.Clamp(level, 0, 10);
+        if (_module != null && !_disposed)
+            await _module.InvokeVoidAsync("setZoom", _canvasRef, ZoomFactor(_zoomLevel));
+        await InvokeAsync(StateHasChanged);
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -92,6 +116,11 @@
             return;
 
         _module = await JS.InvokeAsync<IJSObjectReference>("import", $"./js/map.js?v={ScriptVersion}");
+        if (ShowSpawnAreas != null)
+        {
+            _zoomLevel = Math.Clamp(ZoomLevel, 0, 10);
+            await _module.InvokeVoidAsync("setZoom", _canvasRef, ZoomFactor(_zoomLevel));
+        }
         await DrawAsync();
 
         _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100)); // 10 fps: at 500 ms a walking bot jumped ~3 cells per frame

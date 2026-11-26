@@ -39,6 +39,7 @@ function stateOf(canvas) {
         numbers: [],          // flying damage numbers
         payloadAt: 0,         // performance.now() when the latest payload arrived (its atk/hit ages are as of then)
         deadAt: new Map(),    // monster id -> when it was first seen dead (the death animation plays from there)
+        zoom: 1,
     });
     return s;
 }
@@ -59,6 +60,11 @@ export function drawWorld(canvas, payload) {
     s.payload = { ...payload, cells: undefined };
     s.payloadAt = performance.now();
     if (!s.animating) startLoop(canvas, s);
+}
+
+export function setZoom(canvas, zoom) {
+    if (!canvas) return;
+    stateOf(canvas).zoom = Math.max(1, Math.min(6, zoom));
 }
 
 function startLoop(canvas, s) {
@@ -85,7 +91,7 @@ function render(canvas, s, payload, now) {
     const t = s.terrain;
     if (!t || t.map !== payload.map) { message(canvas, "loading map…"); return; }
 
-    const v = makeView(canvas, ctx, t, now);
+    const v = makeView(canvas, ctx, t, s, payload, now);
     const bots = payload.bots || [];
     const mobs = layoutMobs(v, s, payload);
 
@@ -108,18 +114,26 @@ function render(canvas, s, payload, now) {
 }
 
 /** Geometry and drawing context shared by every draw function for one frame. */
-function makeView(canvas, ctx, t, now) {
+function makeView(canvas, ctx, t, s, payload, now) {
     const { pw, ph } = fitCanvas(canvas);
     // Stretch the map to fill the canvas: x and y scale independently (a 400x400 map fills a wide card).
-    const sx = pw / t.w, sy = ph / t.h;
+    const zoom = s.zoom || 1;
+    const sx = pw / t.w * zoom, sy = ph / t.h * zoom;
+    // At zoom, follow the first visible bot and keep it at the viewport center.
+    // The bot page has one bot; on the shared map, the first bot is the camera anchor.
+    const focus = zoom > 1 ? payload.bots?.[0] : null;
+    const ox = focus ? pw / 2 - (focus.x + 0.5) * sx : (pw - t.w * sx) / 2;
+    const oy = focus ? ph / 2 - (t.h - 0.5 - focus.y) * sy : (ph - t.h * sy) / 2;
     const fs = Math.max(11, Math.round(Math.min(pw, ph) * 0.022));
-    const r = Math.max(4, Math.min(sx, sy) * 1.6);
+    const baseCell = Math.min(pw / t.w, ph / t.h);
+    const r = Math.max(4, baseCell * 1.6);
     return {
-        canvas, ctx, t, now, pw, ph, sx, sy, fs, r,
+        canvas, ctx, t, now, pw, ph, sx, sy, ox, oy, fs, r,
+        baseSx: pw / t.w, baseSy: ph / t.h,
         mr: Math.max(3.5, r * 0.8),          // monster dot radius
         spriteHeight: 30 * dpr(),            // monster sprites ~30 css px tall
-        toX: x => (x + 0.5) * sx,
-        toY: y => (t.h - 1 - y + 0.5) * sy,
+        toX: x => ox + (x + 0.5) * sx,
+        toY: y => oy + (t.h - 1 - y + 0.5) * sy,
     };
 }
 
@@ -168,6 +182,57 @@ function image(url) {
     return images.get(url) || null;
 }
 
+// Minimap art upscaled 8x once per map (Scale2x three times, then a light blur), so zooming in shows rounded
+// shapes instead of one block per cell. ponytail: no real detail is added; true detail needs hi-res renders from Unity.
+const smoothed = new Map();
+
+function smoothArt(url) {
+    const img = image(url);
+    if (!img) return null;
+    if (!smoothed.has(url)) {
+        const big = scale2x(scale2x(scale2x(img)));
+        const out = document.createElement("canvas");
+        out.width = big.width;
+        out.height = big.height;
+        const octx = out.getContext("2d");
+        octx.filter = "blur(2px)";
+        octx.drawImage(big, 0, 0);
+        smoothed.set(url, out);
+    }
+    return smoothed.get(url);
+}
+/** Scale2x (EPX) with a colour tolerance, so it also rounds the soft edges of rendered (non pixel-art) minimaps.
+ *  Returns a canvas twice the size of src (an image or canvas). */
+function scale2x(src, tol = 900) {
+    const w = src.width, h = src.height;
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const cx = c.getContext("2d"); cx.drawImage(src, 0, 0);
+    const s = new Uint32Array(cx.getImageData(0, 0, w, h).data.buffer);
+    const out = new ImageData(w * 2, h * 2), o = new Uint32Array(out.data.buffer);
+    const near = (a, b) => {
+        if (a === b) return true;
+        const dr = (a & 255) - (b & 255), dg = (a >> 8 & 255) - (b >> 8 & 255), db = (a >> 16 & 255) - (b >> 16 & 255);
+        return 2 * dr * dr + 4 * dg * dg + 3 * db * db < tol;
+    };
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            const p = s[y * w + x];
+            const a = y > 0 ? s[(y - 1) * w + x] : p, d = y < h - 1 ? s[(y + 1) * w + x] : p;
+            const l = x > 0 ? s[y * w + x - 1] : p, r = x < w - 1 ? s[y * w + x + 1] : p;
+            const i = 4 * y * w + 2 * x;
+            if (!near(a, d) && !near(l, r)) {
+                o[i] = near(l, a) ? a : p;
+                o[i + 1] = near(a, r) ? r : p;
+                o[i + 2 * w] = near(l, d) ? l : p;
+                o[i + 2 * w + 1] = near(d, r) ? d : p;
+            } else o[i] = o[i + 1] = o[i + 2 * w] = o[i + 2 * w + 1] = p;
+        }
+    }
+    const big = document.createElement("canvas"); big.width = w * 2; big.height = h * 2;
+    big.getContext("2d").putImageData(out, 0, 0);
+    return big;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Terrain and spawn areas
 // ---------------------------------------------------------------------------------------------------------------
@@ -199,9 +264,12 @@ function drawTerrain(v, minimapUrl) {
     const { ctx, t } = v;
     ctx.fillStyle = COLORS.bg;
     ctx.fillRect(0, 0, v.pw, v.ph);
-    const art = image(minimapUrl);
+    const art = smoothArt(minimapUrl);
+    // The minimap art is one texel per map cell; smoothArt pre-upscales it so zooming in shows shapes, not blocks.
+    // The walk-grid fallback stays crisp (its cells are the data).
     ctx.imageSmoothingEnabled = !!art;
-    ctx.drawImage(art || t.img, 0, 0, t.w * v.sx, t.h * v.sy);
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(art || t.img, v.ox, v.oy, t.w * v.sx, t.h * v.sy);
 }
 
 function hue(name) {
@@ -214,7 +282,7 @@ function hue(name) {
 function drawSpawnAreas(v, spawns) {
     const { ctx, t, sx, sy } = v;
     return spawns.map(area => {
-        const left = area.minX * sx, top = (t.h - 1 - area.maxY) * sy;
+        const left = v.ox + area.minX * sx, top = v.oy + (t.h - 1 - area.maxY) * sy;
         const width = (area.maxX - area.minX + 1) * sx, height = (area.maxY - area.minY + 1) * sy;
         const h = hue(area.name || "");
         ctx.fillStyle = `hsla(${h}, 85%, 60%, 0.10)`;
@@ -233,6 +301,8 @@ function drawSpawnAreas(v, spawns) {
 /** Screen layout for each monster (nearer the bottom drawn on top): the sprite's layers for the current animation
  *  frame (or a single first-frame rect until the animation JSON loads), HP bar anchor, hover point, and the box it
  *  covers (for fading bot name plates). A red dot until the atlas loads, or with no sprite. */
+const MIN_SPRITE_CELL = 16; // css px per cell the monster sprites are sized for, at least (was 8: tiny)
+
 function layoutMobs(v, s, payload) {
     for (const [id, t] of s.deadAt) if (v.now - t > 5000) s.deadAt.delete(id);
     return [...(payload.mobs || [])].sort((a, b) => b.y - a.y).map(m => {
@@ -246,7 +316,10 @@ function layoutMobs(v, s, payload) {
             // RoSpriteAnimator walks by distance: frame = cells * 4.6 * 0.37 * 4 / (delay / 24); idle loops on its delay.
             const loopMs = m.walk && m.cell > 0 ? v.now / 1000 / m.cell * 6.808 * 24 : v.now;
             const pose = Sim.monsterFrame(a, m.dir & 7, { dead: m.dead ? v.now - s.deadAt.get(m.id) : null, atk: m.atk + since, hit: m.hit + since, walk: m.walk }, loopMs);
-            const r0 = a.rects[0], k = Math.min(1, v.spriteHeight / Math.max(r0[2], r0[3], 1)); // minimap: every monster ~30 css px
+            // Match the simulation's client scale: 50 sprite pixels per tile, scaled 1.5x and by monster Size.
+            // Use the zoomed cell (smaller dimension: non-square maps stretch), so sprites grow with the map; the floor
+            // keeps them readable when a whole map is shown and cells are only a pixel or two wide.
+            const k = Math.max(Math.min(v.sx, v.sy), MIN_SPRITE_CELL * dpr()) * 1.5 / 50 * (a.size || 1);
             const layers = pose ? Sim.place(a, pose.frame, 0, 0, x, y + v.mr, k, pose.alpha) : [];
             if (!layers.length) return null;
             const [left, top, right, bottom] = Sim.box(layers);

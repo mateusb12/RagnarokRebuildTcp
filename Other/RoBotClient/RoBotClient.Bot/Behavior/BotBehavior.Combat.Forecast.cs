@@ -228,6 +228,16 @@ public sealed partial class BotBehavior
 
     /// <summary>Build the player-side attacker modifier for a group forecast (where defender mods are per-
     /// monster and supplied separately). Folds in attacker element + weapon class + crit + skill DPS.</summary>
+    /// <summary>Player.CalculateMeleeAttack: a dagger swing hits twice when Next(0, 100) &lt;= DoubleAttackChance, which
+    /// DoubleAttackHandler raises 5 per level. ponytail: gear that grants Double Attack (DoubleAttackModifiers) isn't read.</summary>
+    private double DoubleAttackChance(Snapshot snap)
+    {
+        if (_data == null || !_data.Gear.TryGetValue(snap.SelfWeaponItemId, out var weapon) || weapon.Type != "Dagger") return 0;
+        var level = 0;
+        foreach (var (skill, lv) in snap.KnownSkills) if (skill == CharacterSkill.DoubleAttack) level = Math.Max(level, lv);
+        return level > 0 ? Math.Min(1, (5 * level + 1) / 100.0) : 0;
+    }
+
     private CombatModifiers BuildPlayerMods(Snapshot snap)
     {
         var (demon, beast) = MasteryLevels(snap);
@@ -237,7 +247,8 @@ public sealed partial class BotBehavior
             AttackerLuk: snap.SelfLuk,
             AttackerAddCrit: snap.SelfAddCrit,
             AttackerDemonBaneLevel: demon,
-            AttackerBeastBaneLevel: beast), snap);
+            AttackerBeastBaneLevel: beast,
+            AttackerDoubleAttackChance: DoubleAttackChance(snap)), snap);
     }
 
     /// <summary>The skill rotation every forecast (duel, pack, exp/h) credits, from the SkillScript only: no script means

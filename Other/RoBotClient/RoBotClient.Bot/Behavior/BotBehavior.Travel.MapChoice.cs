@@ -81,14 +81,19 @@ public readonly record struct ActivityTime(double Fight, double Search, double R
 // must beat the current one by MoveFactor after that cost — otherwise two similar maps would ping-pong.
 public sealed partial class BotBehavior
 {
-    private const double MoveFactor = 1.25;
+    private const double MoveFactor = 1.2;
     // Maps the bot never hunted (no layout factor yet) are ranked this much higher, so an untried map that models even with
     // the current one clears the MoveFactor bar. Tried maps are predicted from their own layout factor, no bonus, so two known
-    // maps still need 1.25x to swap (no ping-pong).
+    // maps still need MoveFactor to swap (no ping-pong).
     private const double ExploreBonus = 1.25;
     private const double MeasureSeconds = 180;        // hunting time on a map before its real exp/h counts
     private const double StayHorizonSeconds = 1800;  // travel time is spread over a ~30 min stay
-    private const double SecondsPerHop = 40;          // ponytail: flat per-map walk estimate; use route cell length if it misleads
+    // Travel time: each leg's straight-line cells at walking speed, plus a map load per portal and a dialog per Kafra/NPC
+    // teleport (same weights as WorldGraph.Plan). A flat 40 s per map made 3 Kafra rides cost as much as 3 fields:
+    // xmas_dun02 (Kafra to Aldebaran, Santa) scored as 11 maps of walking and lost to a map 9% worse.
+    // ponytail: straight line per leg undercounts walls; scale by a detour factor if bots arrive much later than estimated.
+    private const double MapLoadCells = 10, TeleportDialogCells = 60;
+    private string? _mapWingTo; // save town to Butterfly Wing to before travelling to the new hunting map
     private static readonly TimeSpan MapCheckEvery = TimeSpan.FromMinutes(10);
     // Share of a candidate map's modeled exp/h a bot really earns after moving there. The home map's factors are fit on
     // the home map, so they don't capture what a new map adds: a different kill mix, deaths/flees, layout, and picking
@@ -311,7 +316,7 @@ public sealed partial class BotBehavior
         double ExpPerKill, ActivityTime PerKill, double SupplyPerSecond, HuntZone? Zone = null);
     private Dictionary<string, MapEstimate> _mapEstimates = new(StringComparer.OrdinalIgnoreCase);
     private int _estimatesLevel = -1;
-    private DateTime _nextMapCheck = DateTime.UtcNow.AddMinutes(2);
+    private DateTime _nextMapCheck = DateTime.UtcNow.AddSeconds(15);
     private int _lastMapCheckLevel;
     private DateTime _lastMapCheckAt;
 
@@ -348,6 +353,15 @@ public sealed partial class BotBehavior
         OnLog?.Invoke($"Map: fled {FleesToBan} times on {map} in 10 min, re-judging it on its measured exp/h.");
     }
 
+    /// <summary>The offline route check (BotManager.RouteCheck -> the dashboard's RouteChecks): (from map, x, y, to map) ->
+    /// the verdict, or null while the simulation runs in the background.</summary>
+    public Func<string, int, int, string, RoBotClient.Bot.Offline.RouteVerdict?>? RouteCheck;
+
+    /// <summary>The once-per-level scan (BotManager.LevelScan -> the dashboard's RouteChecks.Scan): (from map, x, y,
+    /// candidate maps) -> each map hunted offline for 10 min (exp/h and deaths, no route), or null while it runs.</summary>
+    public Func<string, int, int, IReadOnlyList<string>, RoBotClient.Bot.Offline.LevelScan?>? LevelScan;
+    private const int ScanCandidates = 6; // the best-estimated maps the scan simulates (plus the current one)
+
     private void TickMapChoice(Snapshot snap)
     {
         if (_data == null || snap.SelfLevel <= 0) return;
@@ -363,7 +377,12 @@ public sealed partial class BotBehavior
             NextMap = null;
             _nextMapCheck = DateTime.MinValue;
         }
-        var levelUp = snap.SelfLevel != _lastMapCheckLevel && now - _lastMapCheckAt >= TimeSpan.FromMinutes(1);
+        // Not before the stats arrive: right after login the gear/stats are still loading, and a decision then judged every
+        // map unreachable or unsafe for 10 min (Bot1 at Lv 61 after a dashboard restart). Waits for the server-synced ATK,
+        // and at least 15 s after login (was a flat 2 min).
+        // ponytail: ATK as the "loaded" signal; add an explicit stats-received flag if a decision still lands too early.
+        if (snap.SelfAtkMax <= 0) return;
+        var levelUp = _lastMapCheckLevel > 0 && snap.SelfLevel != _lastMapCheckLevel && now - _lastMapCheckAt >= TimeSpan.FromMinutes(1);
         if (now < _nextMapCheck && !levelUp) return;
         _nextMapCheck = now + MapCheckEvery;
         _lastMapCheckAt = now;
@@ -415,12 +434,36 @@ public sealed partial class BotBehavior
 
         var options = new List<MapOption>();
         var riskyRoute = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var travel = new Dictionary<string, (double Seconds, string? WingTo)>(StringComparer.OrdinalIgnoreCase);
+        // Once per level the offline simulator hunts the best candidates for 10 min each and walks the way there: its exp/h
+        // replaces the estimate of a map not measured yet, and a map it died on, or can't reach alive, is a risky route.
+        // Its rates are scaled by what the current map really earned vs its own simulation (down only, as calibration).
+        RoBotClient.Bot.Offline.LevelScan? scan = null;
+        var scanPending = false;
+        if (_config.SimulateRoutes && LevelScan != null)
+        {
+            // Ranked the way the decision ranks them (per-activity calibration, layout factors), skipping banned maps. The raw
+            // model put cmd_fild06 (simulated 312 exp/h) in Bot3's Lv 58/59 scans and left out mjo_dun02/03, its top candidates.
+            var candidates = _mapEstimates.Where(e => e.Value.Safe && e.Value.Rate > 0 && _mapBannedUntil.GetValueOrDefault(e.Key) <= now)
+                .OrderByDescending(e => split ? PredictRate(e.Key, e.Value) : e.Value.Rate)
+                .Select(e => e.Key).Take(ScanCandidates).ToList();
+            if (_mapEstimates.ContainsKey(home)) candidates.Add(home); // the calibration baseline (a town has nothing to hunt)
+            candidates = candidates.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            scan = LevelScan(snap.Map, snap.SelfPos.X, snap.SelfPos.Y, candidates);
+            scanPending = scan == null;
+        }
+        RoBotClient.Bot.Offline.MapScan? Simulated(string map) => scan?.Maps.FirstOrDefault(m => string.Equals(m.Map, map, StringComparison.OrdinalIgnoreCase));
+        var homeSim = Simulated(home)?.ExpPerHour ?? 0;
+        var simCalibration = homeMeasured && homeSim > 0 ? Math.Clamp(homeRate / homeSim, 0.05, 1) : 1.0;
         foreach (var (map, estimate) in _mapEstimates)
         {
-            if (!estimate.Safe && !string.Equals(map, home, StringComparison.OrdinalIgnoreCase)) continue;
+            // A simulated map always gets a row (its note says why it's out): unsafe ones are listed, never picked.
+            if (!estimate.Safe && !string.Equals(map, home, StringComparison.OrdinalIgnoreCase) && Simulated(map) == null) continue;
             if (estimate.Rate <= 0 && !string.Equals(map, home, StringComparison.OrdinalIgnoreCase)) continue;
             var (hops, riskyStop) = string.Equals(map, snap.Map, StringComparison.OrdinalIgnoreCase) ? (0, null) : HopsTo(snap, map);
-            if (hops < 0) continue;
+            travel[map] = hops > 0 ? TravelTo(snap, map) : (0, null);
+            // No route (hops -1) stays in the table, never picked: hiding Lutie (before NpcLinks taught the graph Aldebaran's
+            // Santa) hid a 370k exp/h map the bot should learn to reach.
             var isHome = string.Equals(map, home, StringComparison.OrdinalIgnoreCase);
             if (riskyStop != null && !isHome) riskyRoute[map] = $"route crosses {riskyStop} ({_mapEstimates[riskyStop].Note})";
             // A map the bot hunted recently is judged on what it really earned there, current map or not; otherwise a map
@@ -431,9 +474,18 @@ public sealed partial class BotBehavior
             if (measured && mapKills >= 5 && mapTime.Search > 0 && estimate.PerKill.Search > 0.1)
                 _mapLayout[map] = Math.Clamp(mapTime.Per(mapKills).Search / estimate.PerKill.Search, 0.2, 5);
             var modeledRate = (split ? PredictRate(map, estimate) : estimate.Rate * calibration) * realization;
-            var rate = isHome && homeMeasured ? homeRate : measured ? exp / seconds * 3600 : modeledRate;
-            var note = _mapBannedUntil.GetValueOrDefault(map) > now ? "avoiding: died or fled too often here"
-                : riskyRoute.TryGetValue(map, out var risk) ? risk : estimate.Note;
+            var simulated = Simulated(map);
+            if (!isHome && simulated is { Died: true })
+                riskyRoute[map] = $"hunt sim: died after {simulated.Minutes:F1} min{(simulated.Killer != null ? $" to {simulated.Killer}" : "")}";
+            else if (!isHome && simulated?.Route is { Safe: false } badRoute) riskyRoute[map] = $"route sim: {badRoute.Text}";
+            var rate = isHome && homeMeasured ? homeRate : measured ? exp / seconds * 3600
+                : simulated != null ? simulated.ExpPerHour * simCalibration * realization : modeledRate;
+            var note = hops < 0 ? $"unreachable: no warp or Kafra route from {snap.Map} (a teleport NPC missing from NpcLinks?)"
+                : !estimate.Safe && !isHome ? $"unsafe, not picked: {estimate.Note}"
+                : _mapBannedUntil.GetValueOrDefault(map) > now ? "avoiding: died or fled too often here"
+                : riskyRoute.TryGetValue(map, out var risk) ? risk
+                : simulated != null && !measured ? $"simulated {simulated.ExpPerHour:N0} exp/h over {simulated.Minutes:F0} min{(simCalibration < 1 ? $" (× {simCalibration:0.00} calibration)" : "")}; {estimate.Note}"
+                : estimate.Note;
             var perKill = isHome ? measuredPerKill : split ? Predict(map, estimate) : estimate.PerKill; // current map: measured only ("—" until then)
             var expectedPerKill = split ? Predict(map, estimate) : estimate.PerKill;
             var modeledSeconds = expectedPerKill.Total;
@@ -449,15 +501,17 @@ public sealed partial class BotBehavior
         var banned = _mapBannedUntil.GetValueOrDefault(home) > now;
         // Away from the hunting map (respawned at the save point, back from shopping): is the way back still safe?
         var homeRiskyStop = string.Equals(snap.Map, home, StringComparison.OrdinalIgnoreCase) ? null : HopsTo(snap, home).RiskyStop;
-        double Effective(MapOption option) => option.ExpPerHour * (_mapLayout.ContainsKey(option.Map) ? 1 : ExploreBonus) * Math.Max(0, StayHorizonSeconds - option.Hops * SecondsPerHop) / StayHorizonSeconds;
+        double Effective(MapOption option) => option.ExpPerHour * (_mapLayout.ContainsKey(option.Map) ? 1 : ExploreBonus) * Math.Max(0, StayHorizonSeconds - travel.GetValueOrDefault(option.Map).Seconds) / StayHorizonSeconds;
         // Trapped: every way out crosses a map it loses on (Bot1 took the one-way Kafra to Yuno; at Lv 31 every exit field
         // but yuno_fild04 is deadly). Dying costs no exp on this server and respawns at the save point, so go anyway:
         // it either gets through or lands outside the trap.
-        var away = options.Where(option => option.Hops > 0 && !string.Equals(option.Map, home, StringComparison.OrdinalIgnoreCase)).ToList();
+        bool Pickable(MapOption option) => option.Hops >= 0 && _mapEstimates.TryGetValue(option.Map, out var e) && e.Safe;
+        var away = options.Where(option => option.Hops > 0 && Pickable(option) && !string.Equals(option.Map, home, StringComparison.OrdinalIgnoreCase)).ToList();
         var trapped = away.Count > 0 && away.All(option => riskyRoute.ContainsKey(option.Map));
-        var best = options.Where(option => !string.Equals(option.Map, home, StringComparison.OrdinalIgnoreCase)
+        MapOption? PickBest() => options.Where(option => Pickable(option) && !string.Equals(option.Map, home, StringComparison.OrdinalIgnoreCase)
                                       && _mapBannedUntil.GetValueOrDefault(option.Map) <= now && (trapped || !riskyRoute.ContainsKey(option.Map)))
                           .OrderByDescending(Effective).FirstOrDefault();
+        var best = PickBest();
         var currentRate = current?.ExpPerHour ?? 0;
         CurrentMapOption = current ?? (_mapEstimates.TryGetValue(home, out var homeEstimate)
             ? new MapOption(home, _data!.MapName(home), 0, false, 0, homeEstimate.Note, homeEstimate.Monsters)
@@ -465,7 +519,8 @@ public sealed partial class BotBehavior
         MinToChange = currentRate * MoveFactor;
         MapOptions = options.Where(option => !string.Equals(option.Map, home, StringComparison.OrdinalIgnoreCase))
             .Select(option => option with { VsCurrent = currentRate > 0 ? Effective(option) / currentRate : 0 })
-            .OrderByDescending(option => option.VsCurrent).ThenByDescending(option => option.ExpPerHour).Take(8).ToList();
+            .OrderByDescending(option => option.VsCurrent).ThenByDescending(option => option.ExpPerHour)
+            .Where((option, i) => i < 8 || Simulated(option.Map) != null).ToList(); // top 8, plus every map this level's scan simulated
         var currentText = current == null ? $"{home}: nothing huntable at Lv {snap.SelfLevel}"
             : $"{home} measured {currentRate:N0} exp/h";
 
@@ -478,8 +533,41 @@ public sealed partial class BotBehavior
             return;
         }
         if (best == null) { MapDecision = $"Staying on {home}. Reason: no other reachable map is safe at Lv {snap.SelfLevel}."; return; }
+        // The route simulated offline (RouteSimulator via the dashboard), asked only when this decision would move: a
+        // destination the build dies (or gets stuck) on the way to is a risky route, like one crossing an unsafe map, and
+        // the next best is weighed. With no urgency to leave, the bot stays until the check is back.
+        var urgent = _retreatReason != null || banned || !currentSafe || homeRiskyStop != null;
+        if (scanPending && !urgent)
+        {
+            MapDecision = $"Staying on {home}. Reason: the offline simulator is scanning the maps for Lv {snap.SelfLevel} (hunting each for 10 min and the way there; queued behind other bots when busy).";
+            _nextMapCheck = now.AddSeconds(30);
+            return;
+        }
+        if (_config.SimulateRoutes && RouteCheck != null && !trapped)
+            // Best map first; an unsafe way there drops it and the next best is checked, until one is safe or none is left.
+            while (best is { Hops: > 0 })
+            {
+                var wouldMove = urgent || (currentRate > 0 ? Effective(best) / currentRate : double.PositiveInfinity) >= MoveFactor;
+                if (!wouldMove) break;
+                // A wing trip starts in the save town: simulate that route, not the walk from here.
+                var (checkMap, checkX, checkY) = travel.GetValueOrDefault(best.Map).WingTo is { } wingStart && FindAnyWalkableCell(wingStart) is { } wingLand
+                    ? (wingStart, wingLand.X, wingLand.Y) : (snap.Map, snap.SelfPos.X, snap.SelfPos.Y);
+                var verdict = RouteCheck(checkMap, checkX, checkY, best.Map);
+                if (verdict == null)
+                {
+                    if (urgent) break;
+                    MapDecision = $"Staying on {home}. Reason: {best.Map} looks better; simulating the route there offline before going (routesim, in the background).";
+                    _nextMapCheck = now.AddSeconds(30);
+                    return;
+                }
+                if (verdict.Safe) break;
+                riskyRoute[best.Map] = $"route sim: {verdict.Text}";
+                OnLog?.Invoke($"Map: not going to {best.Map}: the offline route simulation says {verdict.Text}.");
+                best = PickBest();
+            }
+        if (best == null) { MapDecision = $"Staying on {home}. Reason: no other reachable map is safe at Lv {snap.SelfLevel}."; return; }
         var ratio = currentRate > 0 ? Effective(best) / currentRate : double.PositiveInfinity;
-        var bestText = $"{best.Map} {(best.Measured ? "measured" : _mapLayout.ContainsKey(best.Map) ? "re-estimated" : "estimated")} {best.ExpPerHour:N0} exp/h{(best.Measured || _mapLayout.ContainsKey(best.Map) ? "" : $" (untried, ×{ExploreBonus} to explore)")}, {best.Hops} map(s) away"
+        var bestText = $"{best.Map} {(best.Measured ? "measured" : _mapLayout.ContainsKey(best.Map) ? "re-estimated" : "estimated")} {best.ExpPerHour:N0} exp/h{(best.Measured || _mapLayout.ContainsKey(best.Map) ? "" : $" (untried, ×{ExploreBonus} to explore)")}, {best.Hops} map(s) away, ~{Duration(travel.GetValueOrDefault(best.Map).Seconds)} travel{(travel.GetValueOrDefault(best.Map).WingTo is { } wingTo ? $" (Butterfly Wing to {wingTo} first)" : "")}"
                        + (_mapEstimates.GetValueOrDefault(best.Map)?.Zone != null ? $" ({_mapEstimates[best.Map].Note})" : "")
                        + (trapped && riskyRoute.TryGetValue(best.Map, out var trapNote) ? $"; trapped, every way out is risky ({trapNote}), going anyway: a death only respawns it at the save point, no exp lost" : "");
         if (_retreatReason != null || banned) reason = $"{_retreatReason ?? $"avoiding {home}"}; {bestText}";
@@ -503,7 +591,31 @@ public sealed partial class BotBehavior
         OnMapMove?.Invoke(new MapMoveAudit(now, snap.SelfLevel, home, best.Map, reason, predicted, left, CandidateRealization));
         _config.HomeMap = best.Map;
         NextMap = best.Map;
+        _mapWingTo = travel.GetValueOrDefault(best.Map).WingTo;
         OnHomeMapChanged?.Invoke();
+    }
+
+    // Seconds to the map by the cheapest of: the route from here, or a Butterfly Wing to the save town and the route from there.
+    private (double Seconds, string? WingTo) TravelTo(Snapshot snap, string map)
+    {
+        if (_data!.World.EntryCell(map) is not { } entry) return (double.PositiveInfinity, null);
+        double From(string from, int x, int y) => PlanRoute(from, x, y, map, entry.X, entry.Y) is { } plan ? RouteSeconds(plan, x, y) : double.PositiveInfinity;
+        var walk = From(snap.Map, snap.SelfPos.X, snap.SelfPos.Y);
+        var save = HasUsableItem(_config.ButterflyWingItemId) ? SaveMap() : null;
+        if (save == null || string.Equals(save, snap.Map, StringComparison.OrdinalIgnoreCase) || FindAnyWalkableCell(save) is not { } land) return (walk, null);
+        var wing = WingCostCells * PlayerSecondsPerCell + From(save, land.X, land.Y); // ponytail: town centre as the landing, like the shop trip
+        return wing < walk ? (wing, save) : (walk, null);
+    }
+
+    private static double RouteSeconds(WorldGraph.TravelPlan plan, int x, int y)
+    {
+        double cells = 0;
+        foreach (var e in plan.Edges)
+        {
+            cells += Dist(x, y, e.Sx, e.Sy) + MapLoadCells + (e.Kafra != null ? TeleportDialogCells : 0);
+            (x, y) = (e.Dx, e.Dy);
+        }
+        return cells * PlayerSecondsPerCell;
     }
 
     // 30s, 1min20s, 3min
@@ -524,7 +636,7 @@ public sealed partial class BotBehavior
         if (plan == null) return (-1, null);
         var risky = plan.Edges.Select(e => e.DstMap).SkipLast(1)
             .FirstOrDefault(m => _mapEstimates.TryGetValue(m, out var stop) && !stop.Safe);
-        return (plan.Edges.Count, risky);
+        return (plan.Edges.Count(e => !string.Equals(e.SrcMap, e.DstMap, StringComparison.OrdinalIgnoreCase)), risky); // maze room warps aren't hops
     }
 
     /// <summary>Simulator exp/hour per spawn map at the bot's current stats. Unsafe = an aggressive regular monster
@@ -581,11 +693,11 @@ public sealed partial class BotBehavior
                 hpLoss[monster.Name] = Math.Max(hpLoss.GetValueOrDefault(monster.Name), forecast.ExpectedDamageTaken);
                 // A slow monster is only scenery until it kills us: Bot3 died to Elder Willow (slower than a player) on
                 // pay_fild07, moc_fild03 and pay_fild08 in a row, each map banned in turn while the next one still looked safe.
-                var killedMe = _avoidClasses.TryGetValue(monster.Id, out var avoidUntil) && avoidUntil > DateTime.UtcNow;
+                var killedMe = _repeatKillers.Contains(monster.Id) && _avoidClasses.TryGetValue(monster.Id, out var avoidUntil) && avoidUntil > DateTime.UtcNow;
                 if (!forecast.CanWin || killedMe)
                 {
                     tooStrong.Add(monster.Name);
-                    if (IsAggressive(monster.Id) && (killedMe ? "killed me recently" : InescapableReason(monster)) is { } why) threat ??= $"{monster.Name} ({why})";
+                    if (IsAggressive(monster.Id) && (killedMe ? "killed me twice recently" : InescapableReason(monster)) is { } why) threat ??= $"{monster.Name} ({why})";
                     else if (IsAggressive(monster.Id) && !IsMonsterImmobile(monster)) slowThreats.Add((monster.Name, count));
                     continue;
                 }

@@ -87,6 +87,7 @@ public sealed class WalkMap
     public List<(int x, int y)>? FindPath(int sx, int sy, int gx, int gy,
         int maxExpansions = 0, Func<int, int, float>? extraCost = null)
     {
+        using var _profile = RoBotClient.Simulation.SimProfile.Of("A* pathfinding", byCaller: true);
         if (!InBounds(sx, sy) || !IsWalkable(gx, gy)) return null;
         // 0 = search the whole map. The old 40000 default gave up on cross-field travel (a ~250-cell walk across
         // a 400x400 field like prt_fild08 needs more), stranding bots that were trying to leave the map.

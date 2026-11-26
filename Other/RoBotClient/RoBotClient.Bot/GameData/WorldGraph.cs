@@ -72,7 +72,8 @@ public sealed class WorldGraph
     /// route to it is a route to the map's connected part. Null when no portal leads there.</summary>
     public (int X, int Y)? EntryCell(string map) =>
         _edgesBySrcMap.Values.SelectMany(l => l)
-            .Where(e => string.Equals(e.DstMap, map, StringComparison.OrdinalIgnoreCase) && e.Kafra == null)
+            .Where(e => string.Equals(e.DstMap, map, StringComparison.OrdinalIgnoreCase) && e.Kafra == null
+                        && !string.Equals(e.SrcMap, map, StringComparison.OrdinalIgnoreCase))
             .GroupBy(e => e.DstRegion).OrderByDescending(g => g.Count())
             .Select(g => ((int, int)?)(g.First().Dx, g.First().Dy)).FirstOrDefault();
 
@@ -114,7 +115,6 @@ public sealed class WorldGraph
             {
                 var src = m.Groups["src"].Value;
                 var dst = m.Groups["dst"].Value;
-                if (string.Equals(src, dst, StringComparison.OrdinalIgnoreCase)) continue; // same-map warps are intra-region
                 var sx = int.Parse(m.Groups["sx"].Value);
                 var sy = int.Parse(m.Groups["sy"].Value);
                 var sw = int.Parse(m.Groups["sw"].Value);
@@ -299,6 +299,9 @@ public sealed class WorldGraph
             if (rawWarps.Any(o => string.Equals(o.src, dst, StringComparison.OrdinalIgnoreCase)
                                   && Math.Abs(dx - o.sx) <= o.sw && Math.Abs(dy - o.sy) <= o.sh))
                 continue;
+
+            // Same-map warps link rooms of one map (prt_maze's rooms only connect through them); within one region they add nothing.
+            if (sr == dr && string.Equals(src, dst, StringComparison.OrdinalIgnoreCase)) continue;
 
             var edge = new Edge(src, sr, sx, sy, dst, dr, dx, dy);
             if (!_edgesBySrcMap.TryGetValue(src, out var bucket))

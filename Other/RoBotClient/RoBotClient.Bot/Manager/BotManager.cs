@@ -103,6 +103,13 @@ public sealed class BotManager
     public BotLogStore? LogStore => _logStore;
     public BotProgressStore? Progress => _progress;
     public MapAuditStore? MapAudit { get; }
+
+    /// <summary>The offline route check (the dashboard's RouteChecks): (character, session, from map, x, y, to map) -> the
+    /// verdict, or null while it runs. Unset (CLI, tests): every route counts as unchecked-safe.</summary>
+    public Func<string, BotSession, string, int, int, string, RoBotClient.Bot.Offline.RouteVerdict?>? RouteCheck { get; set; }
+    /// <summary>The once-per-level scan (the dashboard's RouteChecks.Scan): (character, session, from map, x, y, candidate
+    /// maps) -> hunt sims of the maps and the routes there, or null while queued/running. Unset: an empty scan.</summary>
+    public Func<string, BotSession, string, int, int, IReadOnlyList<string>, RoBotClient.Bot.Offline.LevelScan?>? LevelScan { get; set; }
     /// <summary>A duel can end before its shadow forecast (ForecastWorker) is ready: store it once the forecast is
     /// in, so the two stay together. After this long the record is stored without it, saying so.</summary>
     private static readonly TimeSpan ForecastGrace = TimeSpan.FromSeconds(60);
@@ -294,6 +301,10 @@ public sealed class BotManager
             if (_memory.Get(config.CharacterName) is { } memory) brain.ImportMemory(memory);
             brain.OnMemoryChanged += () => _memory.Save(config.CharacterName, brain.ExportMemory());
         }
+        brain.RouteCheck = (from, x, y, to) => RouteCheck is { } check ? check(config.CharacterName, session, from, x, y, to)
+            : RoBotClient.Bot.Offline.RouteVerdict.Unchecked(from, to, "no route checker in this process");
+        brain.LevelScan = (from, x, y, maps) => LevelScan is { } scan ? scan(config.CharacterName, session, from, x, y, maps)
+            : new RoBotClient.Bot.Offline.LevelScan(config.CharacterName, 0, from, new(), DateTime.UtcNow, 0);
         brain.MeasureMaps = () =>
         {
             var result = new Dictionary<string, (double Seconds, double Exp, int Kills, ActivityTime Time, double Other)>(StringComparer.OrdinalIgnoreCase);

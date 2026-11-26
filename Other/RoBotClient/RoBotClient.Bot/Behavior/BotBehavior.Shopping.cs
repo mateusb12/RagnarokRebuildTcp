@@ -249,32 +249,52 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     /// restock items (wings aside) already claim.</summary>
     private int HealingTarget(Snapshot snap, int maxWeight)
     {
-        if (_data == null || _config.RestockItemId <= 0 || maxWeight <= 0) return 0;
-        if (IsConvenienceItem(_config.RestockItemId)) return Math.Max(FlyWingTarget(), _config.RestockBelow); // old configs restock wings here
+        var potion = RestockPotion();
+        if (_data == null || potion <= 0 || maxWeight <= 0) return 0;
+        if (IsConvenienceItem(potion)) return Math.Max(FlyWingTarget(), _config.RestockBelow); // old configs restock wings here
         var budget = maxWeight * _config.ConsumableWeightShare;
         foreach (var (b, n) in BuffTargets(snap, maxWeight)) budget -= n * _data.UsableItemWeight(b.Id);
         lock (_restockLock)
             foreach (var (id, n) in _restockTargets)
-                if (id != _config.RestockItemId && !IsConvenienceItem(id) && _data.IsUsableItem(id)) budget -= n * _data.UsableItemWeight(id);
-        return Math.Max(0, (int)(budget / Math.Max(1, _data.UsableItemWeight(_config.RestockItemId))));
+                if (id != potion && !IsConvenienceItem(id) && _data.IsUsableItem(id)) budget -= n * _data.UsableItemWeight(id);
+        return Math.Max(0, (int)(budget / Math.Max(1, _data.UsableItemWeight(potion))));
     }
 
     private (int weight, int maxWeight, int stacks, int restockHeld, int zeny) ReadShopStateRaw()
         => _bot.WithState(w =>
         {
+            var potion = RestockPotion(w.Self.Zeny);
             var held = 0;
-            var potionHp = _data?.HpRecovery(_config.RestockItemId) ?? 0;
-            var miscHp = 0;
-            if (_config.RestockItemId > 0)
+            var potionHp = _data?.HpRecovery(potion) ?? 0;
+            var otherHp = 0;
+            if (potion > 0)
                 foreach (var it in w.Self.Inventory)
-                    if (it.ItemId == _config.RestockItemId) held += it.Count;
-                    // Dropped heals (100 Yellow Herbs) are farmed for free and drunk first: they count as potions already
-                    // held, in HP, so the bot doesn't buy what it has. Outside the weight budget; they just keep coming.
-                    else if (potionHp > 0 && _data!.Consumable(it.ItemId, _config.HealingItemIds) == GameDatabase.ConsumableKind.Misc)
-                        miscHp += it.Count * _data.HpRecovery(it.ItemId);
-            if (potionHp > 0) held += miscHp / potionHp;
+                    if (it.ItemId == potion) held += it.Count;
+                    // Every other HP heal held (dropped herbs, the weaker potion bought before an upgrade) counts in HP, so the
+                    // bot doesn't buy what it has. Outside the weight budget.
+                    else if (potionHp > 0 && _data!.HpRecovery(it.ItemId) > 0 && _data.IsUsableItem(it.ItemId))
+                        otherHp += it.Count * _data.HpRecovery(it.ItemId);
+            if (potionHp > 0) held += otherHp / potionHp;
             return (w.Self.Weight, w.Self.MaxWeight, w.Self.Inventory.Count, held, w.Self.Zeny);
         });
+
+    /// <summary>The healing potion to restock: the strongest of HealingItemIds whose RestockBelow survival floor costs at most
+    /// HealingZenyShare of the purse (Lv 70 Bot2, 1,759 HP, was drinking 45 HP Red Potions). A RestockItemId outside
+    /// HealingItemIds (a manual pick, a wing in an old config) is kept as is.</summary>
+    private int RestockPotion(int zeny)
+    {
+        var configured = _config.RestockItemId;
+        if (_data == null || configured <= 0 || !_config.HealingItemIds.Contains(configured)) return configured;
+        var best = configured;
+        foreach (var id in _config.HealingItemIds)
+        {
+            var price = _data.UsableItemPrice(id);
+            if (price <= 0 || !_data.IsUsableItem(id) || _data.HpRecovery(id) <= _data.HpRecovery(best)) continue;
+            if ((long)price * _config.RestockBelow <= zeny * _config.HealingZenyShare) best = id;
+        }
+        return best;
+    }
+    private int RestockPotion() => RestockPotion(_bot.WithState(w => w.Self.Zeny));
 
     private bool ShouldStartShopTrip(Snapshot snap)
     {
@@ -300,7 +320,10 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         if (DateTime.UtcNow < _nextWingCheck) return false;
         _nextWingCheck = DateTime.UtcNow.AddSeconds(60); // fares mean route planning; not every tick
         var price = _data.UsableItemPrice(_config.FlyWingItemId);
-        return price > 0 && ConvenienceBudget(zeny, ShopTripFares(snap, _config.FlyWingItemId)) / price >= (target + 1) / 2;
+        if (price <= 0) return false;
+        var fares = ShopTripFares(snap, _config.FlyWingItemId);
+        // The emergency half is worth a trip whenever the purse covers it; the rest waits for income.
+        return Math.Max(0, zeny - fares) >= EmergencyFlyWings() * price || ConvenienceBudget(zeny, fares) / price >= (target + 1) / 2;
     }
 
     /// <summary>Force an immediate shop trip to restock items on the restock-targets list. No-op when
@@ -378,7 +401,7 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         // should opportunistically top them up.
         var needBuyAny = new List<int>();
         if (_config.RestockItemId > 0 && st.restockHeld < _config.RestockBelow)
-            needBuyAny.Add(_config.RestockItemId);
+            needBuyAny.Add(RestockPotion(st.zeny));
         Dictionary<int, int> restockSnapshot;
         lock (_restockLock) restockSnapshot = new Dictionary<int, int>(_restockTargets);
         foreach (var (id, target) in restockSnapshot)
@@ -501,10 +524,12 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
     /// <summary>Held AND usable per the item DB: the server disconnects the player if sent an unknown/non-usable item id.</summary>
     private bool HasUsableItem(int itemId) => HasItem(itemId) && _data?.IsUsableItem(itemId) == true;
 
-    /// <summary>The town we respawn in: where we landed after the last death or Butterfly Wing, from saved telemetry.
-    /// Null until that happened once.</summary>
+    /// <summary>The town we respawn in: the remembered save point, else where we landed after the last death or Butterfly
+    /// Wing this session. Null until one of those happened (the server never tells the client its save point).</summary>
     private string? SaveMap()
     {
+        // Persisted by LearnSavePoint (after a respawn) and by a Kafra save; survives restarts, unlike telemetry.
+        if (!string.IsNullOrEmpty(_config.SavePointMap)) return _config.SavePointMap;
         string? save = null;
         var wingName = _data?.ItemName(_config.ButterflyWingItemId);
         var returning = false;
@@ -709,26 +734,32 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         _skillZenyLeft = -1; // new shop trip: the Mammonite pool refills from the purse on its next cast
         var totalCost = 0;
 
-        if (_config.RestockItemId > 0)
+        var potion = RestockPotion(st.zeny);
+        if (potion > 0)
         {
             var need = HealingTarget(snap, st.maxWeight) - st.restockHeld;
             var defaultPrice = 0;
             foreach (var (id, p) in npc.ShopItems)
-                if (id == _config.RestockItemId) { defaultPrice = p; break; }
+                if (id == potion) { defaultPrice = p; break; }
+            // This dealer doesn't stock it: the strongest weaker one from HealingItemIds that it does.
+            if (defaultPrice == 0 && _data != null && _config.HealingItemIds.Contains(potion)
+                && npc.ShopItems.Where(s => _config.HealingItemIds.Contains(s.Item1) && _data.HpRecovery(s.Item1) < _data.HpRecovery(potion))
+                    .OrderByDescending(s => _data.HpRecovery(s.Item1)).FirstOrDefault() is { Item2: > 0 } alt)
+                (potion, defaultPrice) = alt;
             if (need > 0 && defaultPrice > 0)
             {
                 // Income share, but never below the survival floor of RestockBelow potions.
                 var healLeft = Math.Max((int)(Income(st.zeny, homeFares) * _config.HealingZenyShare), Math.Max(0, _config.RestockBelow - st.restockHeld) * defaultPrice);
-                var affordable = Math.Min(zenyLeft, IsConvenienceItem(_config.RestockItemId) ? convenienceLeft : healLeft) / defaultPrice;
+                var affordable = Math.Min(zenyLeft, IsConvenienceItem(potion) ? convenienceLeft : healLeft) / defaultPrice;
                 var qty = Math.Min(need, affordable);
                 if (qty > 0)
                 {
-                    lines2.Add((_config.RestockItemId, qty));
+                    lines2.Add((potion, qty));
                     zenyLeft -= qty * defaultPrice;
-                    if (IsConvenienceItem(_config.RestockItemId)) convenienceLeft -= qty * defaultPrice;
+                    if (IsConvenienceItem(potion)) convenienceLeft -= qty * defaultPrice;
                     totalCost += qty * defaultPrice;
                     _bot.Telemetry.Record(TelemetryEventType.Bought, snap.SelfLevel,
-                        _data?.ItemName(_config.RestockItemId) ?? "", qty);
+                        _data?.ItemName(potion) ?? "", qty);
                 }
             }
         }
@@ -737,14 +768,16 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
         lock (_restockLock) restockSnap = new Dictionary<int, int>(_restockTargets);
         foreach (var (itemId, target) in restockSnap)
         {
-            if (itemId == _config.RestockItemId) continue; // already handled above
+            if (itemId == potion) continue; // already handled above
             var price = 0;
             foreach (var (id, p) in npc.ShopItems) if (id == itemId) { price = p; break; }
             if (price <= 0) continue; // this NPC doesn't stock it
             var held = CountInInventory(itemId);
             var need = target - held;
             if (need <= 0) continue;
-            var affordable = (IsConvenienceItem(itemId) ? Math.Min(zenyLeft, convenienceLeft) : zenyLeft) / price;
+            // The emergency half of the wing pool is a survival floor, paid from savings like the RestockBelow potions.
+            var floor = itemId == _config.FlyWingItemId ? Math.Max(0, EmergencyFlyWings() - held) * price : 0;
+            var affordable = (IsConvenienceItem(itemId) ? Math.Min(zenyLeft, Math.Max(convenienceLeft, floor)) : zenyLeft) / price;
             var qty = Math.Min(need, affordable);
             if (qty <= 0) continue;
             lines2.Add((itemId, qty));

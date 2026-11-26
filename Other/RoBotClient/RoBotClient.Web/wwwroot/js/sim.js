@@ -59,10 +59,19 @@ export async function mount(root, url, player, skillNames) {
     try { const r = await fetch(url); if (!r.ok) throw new Error(r.status + " " + r.statusText); rp = await r.json(); }
     catch (e) { root.innerHTML = '<div class="alert alert-danger small">Could not load the replay: ' + esc(e.message) + "</div>"; return; }
     rp.bow = player?.weaponClass === 12; // PacketAttack: WeaponClass 12 shoots an arrow per auto-attack
-    current = new Viewer(root, rp);
-    current.skillNames = skillNames;
-    const v = current, P = await Sprites.loadPlayer(player);
-    if (P && v === current) { v.player = P; v.playerMoves = Sprites.indexPlayer(rp, P); }
+    const P = await Sprites.loadPlayer(player);
+    const create = (replay, clock, onEnd, setCurrent) => {
+        replay.bow = player?.weaponClass === 12;
+        const v = new Viewer(root, replay);
+        v.skillNames = skillNames; v.routeClock = clock; v.onRouteEnd = onEnd;
+        if (P) { v.player = P; v.playerMoves = Sprites.indexPlayer(replay, P); }
+        current = v; setCurrent(v);
+        return v;
+    };
+    if (rp.routeSegments?.length) {
+        const route = await import("./sim-route.js" + new URL(import.meta.url).search);
+        current = route.play(root, rp, create);
+    } else current = create(rp, null, null, () => {});
 }
 
 class Viewer {
@@ -252,7 +261,16 @@ class Viewer {
             if (e.target.closest("[data-now]")) { e.preventDefault(); this.selected = null; this.selectedMob = null; this.inspect(); }
         };
         let seeking = false;
-        const seek = e => { const r = this.strip.getBoundingClientRect(); this.setT((e.clientX - r.left) / r.width * this.rp.duration); this.selected = null; this.inspect(); };
+        const seek = e => {
+            const r = this.strip.getBoundingClientRect(), ratio = (e.clientX - r.left) / r.width;
+            if (this.routeClock) {
+                const viewer = this.routeClock.seek(ratio * this.routeClock.total);
+                viewer.selected = null; viewer.inspect();
+                return;
+            }
+            else this.setT(ratio * this.rp.duration);
+            this.selected = null; this.inspect();
+        };
         this.strip.onpointerdown = e => { seeking = true; this.strip.setPointerCapture(e.pointerId); this.pause(); seek(e); };
         this.strip.onpointermove = e => { if (seeking) seek(e); };
         this.strip.onpointerup = () => seeking = false;
@@ -322,9 +340,17 @@ class Viewer {
 
     frame(now) {
         const dt = Math.min(0.1, (now - this.lastFrame) / 1000); this.lastFrame = now;
-        if (this.playing) { this.setT(this.t + dt * this.speed); if (this.t >= this.rp.duration) this.pause(); }
+        if (this.playing) {
+            this.setT(this.t + dt * this.speed);
+            if (this.t >= this.rp.duration) {
+                if (this.onRouteEnd && !this.routeEndFired) { this.routeEndFired = true; this.onRouteEnd(this); }
+                else if (!this.onRouteEnd) this.pause();
+            }
+        }
         this.draw(); this.drawStrip();
-        this.timeLabel.textContent = fmtT(this.t) + " / " + fmtT(this.rp.duration) + "  (" + this.t.toFixed(2) + " s)";
+        const elapsed = this.routeClock ? this.routeClock.offset + this.t : this.t;
+        const total = this.routeClock ? this.routeClock.total : this.rp.duration;
+        this.timeLabel.textContent = fmtT(elapsed) + " / " + fmtT(total) + "  (" + elapsed.toFixed(2) + " s)";
         this.highlight(false);
         if (this.playing && (!this.lastInspect || now - this.lastInspect > 250)) { this.inspect(); this.lastInspect = now; }
     }
@@ -460,7 +486,7 @@ class Viewer {
             g.globalAlpha = Math.max(0, 1 - age); g.fillStyle = col; g.font = font(12, true); g.fillText(txt, x - g.measureText(txt).width / 2, y - 10 - age * 18); g.globalAlpha = 1;
         }
         g.fillStyle = "#000a"; g.fillRect(8, 8, 236, 56);
-        g.fillStyle = COLORS.text; g.font = font(12, true); g.fillText(fmtT(t) + "  " + ACTIVITY[act].label, 16, 24);
+        g.fillStyle = COLORS.text; g.font = font(12, true); g.fillText((this.rp.map || "") + "  " + fmtT((this.routeClock?.offset || 0) + t) + "  " + ACTIVITY[act].label, 16, 24);
         this.bar(g, 16, 32, 150, 8, vit.hp / this.rp.maxHp, "#198754"); g.font = font(10); g.fillStyle = COLORS.text; g.fillText("HP " + vit.hp + "/" + this.rp.maxHp, 172, 40);
         this.bar(g, 16, 46, 150, 6, vit.sp / Math.max(1, this.rp.maxSp), "#3b9dff"); g.fillStyle = COLORS.text; g.fillText("SP " + vit.sp + "/" + this.rp.maxSp, 172, 53);
         // "Jellopy - 1 obtained." for 3 s at the top middle, as map.js drawToast (Unity's ItemObtainedToast)
@@ -490,21 +516,28 @@ class Viewer {
         const cv = this.strip, r = cv.getBoundingClientRect(), k = dpr();
         if (cv.width !== Math.round(r.width * k) || cv.height !== Math.round(r.height * k)) { cv.width = Math.round(r.width * k); cv.height = Math.round(r.height * k); this.stripCache = null; }
         const g = cv.getContext("2d");
-        const W = r.width, H = r.height, D = this.rp.duration, X = t => t / D * W;
+        const W = r.width, H = r.height, D = this.routeClock?.total || this.rp.duration;
+        const offset = this.routeClock?.offset || 0, X = t => (offset + t) / D * W;
         if (!this.stripCache) {
             const c = document.createElement("canvas"); c.width = cv.width; c.height = cv.height;
             const h = c.getContext("2d"); h.setTransform(k, 0, 0, k, 0, 0);
             h.fillStyle = "#1b1f27"; h.fillRect(0, 0, W, H);
-            for (const s of this.segments) if (ACTIVITY[s.act]) { const x0 = Math.floor(X(s.t0)); h.fillStyle = ACTIVITY[s.act].color; h.fillRect(x0, 14, Math.max(1, Math.ceil(X(s.t1)) - x0), 20); }
-            h.strokeStyle = "#73d13d"; h.lineWidth = 1; h.beginPath();
-            const vit = this.rp.vitals, hy = v => 45 - 10 * v.hp / this.rp.maxHp;
-            vit.forEach((v, i) => { if (i) h.lineTo(X(v.t), hy(vit[i - 1])); i ? h.lineTo(X(v.t), hy(v)) : h.moveTo(X(v.t), hy(v)); });
-            h.lineTo(W, hy(vit[vit.length - 1])); h.stroke();
-            for (const e of this.rp.events) {
-                if (e.kind === "kill") { h.fillStyle = "#fff"; h.fillRect(X(e.t), 2, 1, 10); }
-                else if (e.kind === "death") { h.fillStyle = "#ff4d4f"; h.fillRect(X(e.t) - 1, 0, 3, 14); }
-                else if (e.kind === "rejected" || e.kind === "no-effect") { h.fillStyle = "#ffa940"; h.fillRect(X(e.t), 6, 2, 2); }
-                else if (e.kind === "failed") { h.fillStyle = "#ff4d4f"; h.font = font(10, true); h.fillText("✖", X(e.t) - 3, 11); }
+            const parts = [...(this.routeClock?.timeline || []), {
+                offset, segments: this.segments, events: this.rp.events, vitals: this.rp.vitals, maxHp: this.rp.maxHp,
+            }];
+            for (const part of parts) {
+                const at = t => X(part.offset + t);
+                for (const s of part.segments) if (ACTIVITY[s.act]) { const x0 = Math.floor(at(s.t0)); h.fillStyle = ACTIVITY[s.act].color; h.fillRect(x0, 14, Math.max(1, Math.ceil(at(s.t1)) - x0), 20); }
+                h.strokeStyle = "#73d13d"; h.lineWidth = 1; h.beginPath();
+                const vit = part.vitals, hy = v => 45 - 10 * v.hp / part.maxHp;
+                vit.forEach((v, i) => { if (i) h.lineTo(at(v.t), hy(vit[i - 1])); i ? h.lineTo(at(v.t), hy(v)) : h.moveTo(at(v.t), hy(v)); });
+                h.stroke();
+                for (const e of part.events) {
+                    if (e.kind === "kill") { h.fillStyle = "#fff"; h.fillRect(at(e.t), 2, 1, 10); }
+                    else if (e.kind === "death") { h.fillStyle = "#ff4d4f"; h.fillRect(at(e.t) - 1, 0, 3, 14); }
+                    else if (e.kind === "rejected" || e.kind === "no-effect") { h.fillStyle = "#ffa940"; h.fillRect(at(e.t), 6, 2, 2); }
+                    else if (e.kind === "failed") { h.fillStyle = "#ff4d4f"; h.font = font(10, true); h.fillText("✖", at(e.t) - 3, 11); }
+                }
             }
             this.stripCache = c;
         }

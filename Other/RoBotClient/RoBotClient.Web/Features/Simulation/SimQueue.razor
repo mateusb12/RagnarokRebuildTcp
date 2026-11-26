@@ -1,0 +1,80 @@
+@using RoBotClient.Web.Components
+@inherits LiveComponent
+@inject SimRunner Runner
+@inject RouteChecks Routes
+
+@* Every offline job in one place: the leveling run (its own lane) and the route-check / level-scan worker (one job at a
+   time, the rest wait in order). Polled each second, so it needs no event wiring. *@
+@{
+    var level = Runner.Current;
+    var job = Routes.Running;
+    var queued = Routes.Queued;
+    var running = (level.Running ? 1 : 0) + (job != null ? 1 : 0);
+}
+<div class="card mb-3">
+    <div class="card-body py-2">
+        <div class="d-flex align-items-center gap-2">
+            <span class="fw-semibold">Simulation queue</span>
+            <span class="badge @(running > 0 ? "bg-primary" : "bg-secondary")">@running running</span>
+            <span class="badge bg-secondary">@queued.Count waiting</span>
+            @if (running == 0 && queued.Count == 0) { <span class="small text-secondary">Idle.</span> }
+        </div>
+        @if (running > 0 || queued.Count > 0)
+        {
+            <table class="table table-sm small mb-0 mt-1" style="font-variant-numeric:tabular-nums">
+                <thead><tr><th>State</th><th>Kind</th><th>Bot</th><th>Job</th><th style="width:14rem">Progress</th><th class="text-end">Time</th></tr></thead>
+                <tbody>
+                    @if (level.Running && level.Request is { } r)
+                    {
+                        <tr>
+                            <td><span class="spinner-border spinner-border-sm me-1"></span>running</td>
+                            <td>Leveling run</td><td>@r.Bot</td>
+                            <td>@r.Map, @r.Minutes min, seed @r.Seed</td>
+                            <td>@Progress(Runner.Percent, Runner.Percent >= 100 ? "writing the replay…" : null)</td>
+                            <td class="text-end">@Ago(level.StartedUtc)</td>
+                        </tr>
+                    }
+                    @if (job != null)
+                    {
+                        <tr>
+                            <td><span class="spinner-border spinner-border-sm me-1"></span>running</td>
+                            <td>@Kind(job)</td><td>@job.Character</td><td>@Describe(job)</td>
+                            <td>@Progress(Routes.Percent, null)</td>
+                            <td class="text-end" title="since it was queued">@Ago(job.QueuedUtc)</td>
+                        </tr>
+                    }
+                    @for (var i = 0; i < queued.Count; i++)
+                    {
+                        var q = queued[i];
+                        <tr class="text-secondary">
+                            <td>#@(i + 1) waiting</td><td>@Kind(q)</td><td>@q.Character</td><td>@Describe(q)</td><td></td>
+                            <td class="text-end" title="waiting since">@Ago(q.QueuedUtc)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        @if (Routes.LastError != null) { <div class="small text-danger mt-1">Last route check / scan failed: @Routes.LastError</div> }
+    </div>
+</div>
+
+@code {
+    protected override int RefreshMs => 1000;
+
+    private static string Kind(RouteChecks.Job j) => j.Maps != null ? "Level scan" : "Route check";
+
+    private static string Describe(RouteChecks.Job j) => j.Maps != null
+        ? $"Lv {j.Level} from {j.From}: {string.Join(", ", j.Maps)}"
+        : $"{j.From} → {j.To}, {j.Seeds} seeds" + (j.Live ? ", asked by the live bot" : "");
+
+    private static string Ago(DateTime utc)
+    {
+        var s = (int)(DateTime.UtcNow - utc).TotalSeconds;
+        return s < 60 ? $"{s}s" : $"{s / 60}min{s % 60:00}s";
+    }
+
+    private static RenderFragment Progress(int percent, string? note) => @<div>
+        <div class="progress" style="height: 8px;"><div class="progress-bar" style="width: @(Math.Max(0, percent))%"></div></div>
+        <span class="text-secondary">@(note ?? (percent >= 0 ? $"{percent}%" : "loading the game data…"))</span>
+    </div>;
+}

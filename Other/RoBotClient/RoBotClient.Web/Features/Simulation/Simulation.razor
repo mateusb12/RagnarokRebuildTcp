@@ -13,6 +13,7 @@
 @inject IJSRuntime JS
 @inject NavigationManager Nav
 @inject SimSprites Sprites
+@inject RouteChecks Routes
 
 <PageTitle>Simulation - RagBot Control</PageTitle>
 
@@ -27,14 +28,23 @@
 
 <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
     <div class="d-flex align-items-center gap-2">
-        <h1 class="h3 mb-0">Offline simulation</h1>
-        <span class="badge bg-secondary rounded-pill fs-6">@_runs.Count runs</span>
+        <h1 class="h3 mb-0">Simulation</h1>
+        <span class="badge bg-secondary rounded-pill fs-6">@_runs.Count saved leveling runs</span>
     </div>
-    <span class="small text-secondary">Runs the CLI's <code>huntsim</code> in its own process. No live bot is started or touched.</span>
+    <span class="small text-secondary">Leveling and survival simulations run offline. No live bot is started or touched.</span>
 </div>
+
+<SimQueue />
 
 <div class="card mb-3">
     <div class="card-body">
+        <ul class="nav nav-tabs mb-3">
+            <li class="nav-item"><button type="button" class="nav-link @(_activeTab == "leveling" ? "active" : "")" @onclick='() => _activeTab = "leveling"'>Leveling simulation</button></li>
+            <li class="nav-item"><button type="button" class="nav-link @(_activeTab == "survival" ? "active" : "")" @onclick='() => _activeTab = "survival"'>Survival simulation</button></li>
+            <li class="nav-item"><button type="button" class="nav-link @(_activeTab == "schedule" ? "active" : "")" @onclick='() => _activeTab = "schedule"'>Scan schedule</button></li>
+        </ul>
+        @if (_activeTab == "leveling")
+        {
         <div class="row g-2 align-items-end">
             <div class="col-md-3">
                 <label class="form-label small mb-1">Character build</label>
@@ -85,32 +95,156 @@
         {
             <textarea class="form-control form-control-sm mt-2 font-monospace" rows="3" placeholder="one rule per line, e.g. use Bash 0 if self.sp >= 15" @bind="_script"></textarea>
         }
-        @{ var st = Runner.Current; }
-        @if (st.Running)
-        {
-            <div class="mt-2 small">
-                <span class="spinner-border spinner-border-sm me-2"></span>Simulating @st.Request!.Bot on @st.Request.Map, @st.Request.Minutes min, seed @st.Request.Seed… @((DateTime.UtcNow - st.StartedUtc).TotalSeconds.ToString("0"))s
-                @(Runner.Percent >= 100 ? " · writing the replay…" : Runner.Percent >= 0 ? $" · {Runner.Percent}%" : " · loading the game data…")
-                <div class="progress mt-1" style="height: 8px; max-width: 32rem;">
-                    <div class="progress-bar" style="width: @(Math.Max(0, Runner.Percent))%"></div>
-                </div>
-            </div>
-        }
-        else if (st.Error != null)
+        var st = Runner.Current;
+        @if (!st.Running && st.Error != null)
         {
             <div class="alert alert-danger mt-2 mb-0 small">
                 <div class="fw-semibold">Run failed: @st.Error</div>
                 @if (st.Output.Length > 0) { <pre class="sim-pre mt-2 mb-0">@Tail(st.Output)</pre> }
             </div>
         }
-        @if (_runs.Count > 0)
+        @if (_scansSaved.Count > 0)
         {
-            <div class="d-flex align-items-center gap-2 mt-3">
-                <label class="small text-secondary text-nowrap">Replay</label>
-                <select class="form-select form-select-sm" style="max-width:32rem" value="@_selected" @onchange="e => Select((string)e.Value!)">
-                    @foreach (var r in _runs) { <option value="@r">@r</option> }
+            <div class="fw-semibold mt-3">Bots' leveling predictions <span class="badge bg-secondary">@_scansSaved.Count</span></div>
+            <div class="small text-secondary">Once per level a live bot asks: "where should I level now?" Each candidate map is hunted offline for @RouteChecks.ScanMinutes min (and the way there checked). Maps where it died, or whose route fails, are ruled out; the rest are ranked by exp/h, which the bot then corrects with what it really earned on maps it has hunted. ▶ plays the hunt (only the last @RouteChecks.KeepReplays scans keep replays).</div>
+            <div style="max-height:24rem;overflow:auto">
+                <table class="table table-sm small mt-1 mb-0" style="font-variant-numeric:tabular-nums">
+                    <thead><tr><th>When</th><th>Bot</th><th class="text-end">Lv</th><th>From</th><th>Best by sim</th><th>Candidates (exp/h, best first)</th></tr></thead>
+                    <tbody>
+                        @foreach (var sc in _scansSaved)
+                        {
+                            var ranked = sc.Maps.OrderByDescending(m => m.ExpPerHour).ToList();
+                            var best = ranked.FirstOrDefault(m => !m.Died && m.Route is not { Safe: false });
+                            <tr>
+                                <td class="text-nowrap">@sc.AtUtc.ToLocalTime().ToString("MM-dd HH:mm")</td><td class="text-nowrap">@sc.Character</td><td class="text-end">@sc.Level</td><td>@sc.From</td>
+                                <td class="text-nowrap fw-semibold text-success">@(best == null ? "none safe" : $"{best.Map} {best.ExpPerHour:N0}/h")</td>
+                                <td>@foreach (var m in ranked)
+                                {
+                                    var bad = m.Died || m.Route is { Safe: false };
+                                    var why = m.Died ? $"died at {m.Minutes:F1} min to {m.Killer}" : m.Route is { Safe: false } r ? $"route: {r.Text}" : $"{m.Kills} kills in {m.Minutes:F0} min" + (m.Route != null ? $"; route: {m.Route.Text}" : "");
+                                    var scanReplay = m.Replay != null && Runner.PathOf(m.Replay) != null ? m.Replay : null;
+                                    <span class="badge me-1 mb-1 @(bad ? "text-bg-danger" : "text-bg-secondary")" title="@why" role="@(scanReplay != null ? "button" : null)" @onclick="() => { if (scanReplay != null) Load(scanReplay); }">@m.Map @m.ExpPerHour.ToString("N0")@(m.Died ? " ☠" : m.Route is { Safe: false } ? " ✘route" : "")@(scanReplay != null ? " ▶" : "")</span>
+                                }</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+        }
+        else if (_activeTab == "schedule")
+        {
+            <ScanSchedule />
+        }
+        else
+        {
+        <div class="d-flex align-items-center justify-content-between mb-2">
+            <div class="fw-semibold">Route survival</div>
+            <span class="small text-secondary">Would @(_bot ?? "the bot") survive walking there? Each map on the live route is crossed by the live travel behavior (hazards, flee, Fly Wings, potions, defending), HP and bag carried over, over several seeds (<code>routesim</code>).</span>
+        </div>
+        <div class="row g-2 align-items-end">
+            <div class="col-md-3">
+                <label class="form-label small mb-1">From</label>
+                <select class="form-select form-select-sm" @bind="_routeFrom">
+                    @foreach (var m in _allMaps) { <option value="@m">@m @MapName(m)</option> }
                 </select>
-                <button class="btn btn-sm btn-outline-danger text-nowrap" title="Delete every saved run" disabled="@Runner.Current.Running" @onclick="DeleteAll">🗑 Delete all</button>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label small mb-1">To</label>
+                <select class="form-select form-select-sm" @bind="_routeTo">
+                    @foreach (var m in _allMaps) { <option value="@m">@m @MapName(m)</option> }
+                </select>
+            </div>
+            <div class="col-md-1">
+                <label class="form-label small mb-1">Seeds</label>
+                <input type="number" min="1" max="50" class="form-control form-control-sm" @bind="_routeSeeds" />
+            </div>
+            <div class="col-md-5 text-end">
+                <button class="btn btn-outline-primary" disabled="@(_bot == null || _routeFrom == null || _routeTo == null)" @onclick="CheckRoute">Check route</button>
+            </div>
+        </div>
+        @if (_route is { } rr)
+        {
+            <div class="mt-2 fw-semibold @(rr.FailsAt == null ? "text-success" : "text-danger")">@rr.Verdict</div>
+            <div class="small text-secondary">@rr.Character Lv @rr.Level · @rr.Seeds seeds · @rr.WallSeconds.ToString("0.0")s to simulate</div>
+            <table class="table table-sm small mt-2 mb-0" style="font-variant-numeric:tabular-nums">
+                <thead><tr><th>#</th><th>Map</th><th>Leaves by</th><th class="text-end">Entered</th><th class="text-end">Crossed</th><th class="text-end">Died</th><th class="text-end" title="not across in 5 min: fleeing back and forth">Blocked</th><th class="text-end">Mean s</th><th class="text-end">HP left</th><th class="text-end">Fly Wings</th><th>Killers</th><th>Replays</th></tr></thead>
+                <tbody>
+                    @for (var i = 0; i < rr.Hops.Count; i++)
+                    {
+                        var hop = rr.Hops[i];
+                        var idx = i;
+                        <tr class="@(hop.Map == rr.FailsAt ? "table-danger" : "")">
+                            <td>@(i + 1)</td><td>@hop.Map @MapName(hop.Map)</td><td>@hop.Leaves</td>
+                            <td class="text-end">@hop.Entered</td><td class="text-end">@hop.Arrived</td><td class="text-end">@hop.Died</td><td class="text-end">@hop.Stuck</td>
+                            <td class="text-end">@hop.MeanSeconds.ToString("0")</td><td class="text-end">@(hop.Arrived > 0 ? hop.MeanHpLeftPct.ToString("0") + "%" : "—")</td>
+                            <td class="text-end">@hop.MeanFlyWings.ToString("0.0")</td><td>@string.Join(", ", hop.Killers)</td>
+                            <td>@foreach (var run in rr.Runs.Where(r => r.Count > idx && r[idx].Replay != null)) { var o = run[idx]; var replayName = o.Replay ?? ""; var fullRoute = replayName.EndsWith("_continuous", StringComparison.Ordinal); <a class="me-1" title="@(fullRoute ? "Play the full route" : "Play this map crossing")" href="simulation?run=@replayName" @onclick="() => SelectRouteReplay(replayName)" @onclick:preventDefault>@(fullRoute ? "⇢" : o.Died ? "☠" : o.Arrived ? "✓" : "⧗")</a> }</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        @if (_verdicts.Count > 0)
+        {
+            <div class="fw-semibold mt-3">Saved verdicts <span class="badge bg-secondary">@_verdicts.Count</span></div>
+            <div class="small text-secondary">Every route check ever run, kept forever: the bots' "would I survive this route at this level?" answers. Click a row for its per-map table; ▶ means it still has a replay.</div>
+            <div style="max-height:22rem;overflow:auto">
+                <table class="table table-sm table-hover small mt-1 mb-0" style="font-variant-numeric:tabular-nums">
+                    <thead><tr><th>When</th><th>Bot</th><th class="text-end">Lv</th><th>Route</th><th>Verdict</th><th class="text-end">Survived</th><th>Asked by</th><th></th></tr></thead>
+                    <tbody>
+                        @foreach (var (name, r) in _verdicts)
+                        {
+                            <tr role="button" class="@(_playbackSelection == "route:" + name ? "table-active" : "")" @onclick="() => LoadRoute(name)">
+                                <td class="text-nowrap">@Stamp(name)</td><td>@r.Character</td><td class="text-end">@r.Level</td>
+                                <td class="text-nowrap">@r.From → @r.To</td>
+                                <td class="@(r.FailsAt == null ? "text-success" : "text-danger")">@(r.FailsAt == null ? "✔ survives" : $"✘ dies/blocked on {r.FailsAt}")</td>
+                                <td class="text-end">@r.Survived/@r.Seeds</td>
+                                <td>@(name.EndsWith("_live", StringComparison.Ordinal) ? "live bot" : "this page")</td>
+                                <td>@(HasReplay(r) ? "▶" : "")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+        @if (Routes.LiveVerdicts.Count > 0)
+        {
+            <details class="mt-2"><summary class="small">Live bots' route verdicts (@Routes.LiveVerdicts.Count, kept @RouteChecks.VerdictTtl.TotalHours h per level)</summary>
+                <ul class="small mb-0">@foreach (var v in Routes.LiveVerdicts) { <li><span class="@(v.Safe ? "text-success" : "text-danger")">@v.From → @v.To</span> Lv @v.Level, @v.AtUtc.ToLocalTime().ToString("HH:mm"): @v.Text</li> }</ul>
+            </details>
+        }
+        }
+
+        @if (PlaybackOptions() > 0)
+        {
+            <div class="d-flex flex-wrap align-items-center gap-2 mt-3">
+                <label class="small text-secondary text-nowrap" for="simulation-playback">Simulation to play</label>
+                <select id="simulation-playback" class="form-select form-select-sm" style="max-width:36rem" value="@_playbackSelection" @onchange="e => SelectPlayback((string?)e.Value)">
+                    @if (_runs.Count > 0)
+                    {
+                        <optgroup label="Leveling simulations">
+                            @foreach (var r in _runs) { <option value="run:@r">@r</option> }
+                        </optgroup>
+                    }
+                    @if (_routeResults.Count > 0)
+                    {
+                        <optgroup label="Survival simulations">
+                            @foreach (var r in _routeResults) { <option value="route:@r">@r</option> }
+                        </optgroup>
+                    }
+                    @if (_route != null && RouteReplayNames().Count > 0)
+                    {
+                        <optgroup label="Crossing replays for selected route">
+                            @foreach (var r in RouteReplayNames()) { <option value="segment:@r">@r</option> }
+                        </optgroup>
+                    }
+                </select>
+                @if (_runs.Count > 0)
+                {
+                    <button class="btn btn-sm btn-outline-danger text-nowrap" title="Delete every saved leveling run" disabled="@Runner.Current.Running" @onclick="DeleteAll">🗑 Delete all</button>
+                }
+                @if (_routeReplayUnavailable) { <span class="small text-secondary">This route result has no saved replay (only the last @RouteChecks.KeepReplays survival checks keep theirs).</span> }
             </div>
         }
     </div>
@@ -252,6 +386,14 @@
     private IJSObjectReference? _module;
     private bool _mount;
     private string? _lastFinished;
+    private List<string> _allMaps = new(), _routeResults = new();
+    private string? _routeFrom, _routeTo;
+    private int _routeSeeds = 5;
+    private RouteResult? _route;
+    private int _routeSeen;
+    private bool _routeReplayUnavailable;
+    private string _activeTab = "leveling";
+    private string? _playbackSelection;
 
     private static readonly (string, string, string)[] Levels =
     {
@@ -273,7 +415,64 @@
         var run = q.TryGetValue("run", out var v) ? v.ToString() : _runs.FirstOrDefault();
         if (run != null) Load(run);
         Runner.Changed += OnRunnerChanged;
+        _allMaps = Bots.Data.MapsByCode.Keys.Where(m => Bots.Data.GetWalkMap(m) != null).OrderBy(m => m).ToList();
+        _routeFrom = _allMaps.FirstOrDefault(m => m == "prontera") ?? _allMaps.FirstOrDefault();
+        _routeTo = _cfg?.HomeMap is { } home && _allMaps.Contains(home) ? home : _allMaps.FirstOrDefault();
+        _routeSeen = Routes.Results().Count;
+        _scansSaved = Routes.SavedScans();
+        _scanSeen = Routes.LiveScans.Count;
+        _routeResults = ReplayableRoutes();
+        if (run == null && LatestPageRoute() is { } page) LoadRoute(page); // a saved leveling run wins; live bots' checks have no replay
+        Routes.Changed += OnRoutesChanged;
     }
+
+    private void CheckRoute()
+    {
+        if (_bot == null || _routeFrom == null || _routeTo == null) return;
+        Routes.Request(_bot, _routeFrom, -1, -1, _routeTo, _routeSeeds);
+    }
+
+    private void LoadRoute(string name)
+    {
+        var route = Routes.Load(name);
+        _route = route;
+        _activeTab = "survival";
+        _playbackSelection = "route:" + name;
+        _routeReplayUnavailable = false;
+        string? replay = null;
+        if (route != null)
+            foreach (var outcome in route.Runs.SelectMany(run => run))
+                if (outcome.Replay is { } candidate && Runner.PathOf(candidate) != null && (replay == null || candidate.EndsWith("_continuous", StringComparison.Ordinal)))
+                    replay = candidate;
+        if (replay != null)
+        {
+            Load(replay);
+            _activeTab = "survival";
+            _playbackSelection = "route:" + name;
+        }
+        else
+        {
+            _replay = null;
+            _selected = null;
+            _mount = false;
+            _loadError = null;
+            _routeReplayUnavailable = route != null;
+        }
+    }
+
+    private void OnRoutesChanged() => _ = InvokeAsync(() =>
+    {
+        var results = Routes.Results();
+        if (results.Count != _routeSeen)
+        {
+            _routeResults = ReplayableRoutes();
+            if (results.Count > 0 && !results[0].EndsWith("_live")) LoadRoute(results[0]); // a page check just finished
+        }
+        _routeSeen = results.Count;
+        if (Routes.LiveScans.Count != _scanSeen) { _scanSeen = Routes.LiveScans.Count; _scansSaved = Routes.SavedScans(); }
+        _runs = Runner.Runs();
+        StateHasChanged();
+    });
 
     private void PickBot(string bot)
     {
@@ -303,7 +502,47 @@
         StateHasChanged();
     });
 
-    private void Select(string name) { Load(name); }
+    private void SelectPlayback(string? selection)
+    {
+        if (string.IsNullOrEmpty(selection)) return;
+        _playbackSelection = selection;
+        if (selection.StartsWith("route:", StringComparison.Ordinal)) LoadRoute(selection[6..]);
+        else if (selection.StartsWith("segment:", StringComparison.Ordinal)) SelectRouteReplay(selection[8..]);
+        else if (selection.StartsWith("run:", StringComparison.Ordinal))
+        {
+            _activeTab = "leveling";
+            Load(selection[4..]);
+        }
+    }
+
+    private void SelectRouteReplay(string name)
+    {
+        _activeTab = "survival";
+        _playbackSelection = "segment:" + name;
+        Load(name);
+        _playbackSelection = "segment:" + name;
+    }
+
+    private List<string> RouteReplayNames() => _route is not { } route ? new() : route.Runs.SelectMany(r => r)
+        .Select(o => o.Replay).Where(n => n != null).Cast<string>().Distinct(StringComparer.Ordinal).ToList();
+
+    // Results whose replay is still on disk (verdicts are kept forever, replays only for the last RouteChecks.KeepReplays checks).
+    // ponytail: reads every saved result on each new one; index replays by result name if route-checks/ grows to thousands.
+    private List<string> ReplayableRoutes()
+    {
+        _verdicts = Routes.Results().Select(n => (n, r: Routes.Load(n))).Where(x => x.r != null).Select(x => (x.n, x.r!)).ToList();
+        return _verdicts.Where(v => HasReplay(v.Result)).Select(v => v.Name).ToList();
+    }
+
+    private bool HasReplay(RouteResult r) => r.Runs.SelectMany(run => run).Any(o => o.Replay != null && Runner.PathOf(o.Replay) != null);
+    private List<(string Name, RouteResult Result)> _verdicts = new();
+    private List<LevelScan> _scansSaved = new();
+    private int _scanSeen;
+    private static string Stamp(string name) => DateTime.TryParseExact(name.Split('_')[0], "yyyyMMdd-HHmmss", null, System.Globalization.DateTimeStyles.None, out var t) ? t.ToString("MM-dd HH:mm") : "";
+
+    private string? LatestPageRoute() => _routeResults.FirstOrDefault(r => !r.EndsWith("_live", StringComparison.Ordinal));
+
+    private int PlaybackOptions() => _runs.Count + _routeResults.Count + RouteReplayNames().Count;
 
     private async Task DeleteAll()
     {
@@ -311,10 +550,16 @@
         Runner.DeleteAll();
         _runs = Runner.Runs();
         _replay = null; _selected = null; _loadError = null;
+        _playbackSelection = null;
+        if (LatestPageRoute() is { } page) LoadRoute(page);
+        else _activeTab = "leveling";
     }
 
     private void Load(string name)
     {
+        _routeReplayUnavailable = false;
+        _activeTab = "leveling";
+        _playbackSelection = "run:" + name;
         try
         {
             _replay = Runner.Load(name);
@@ -351,6 +596,7 @@
     public async ValueTask DisposeAsync()
     {
         Runner.Changed -= OnRunnerChanged;
+        Routes.Changed -= OnRoutesChanged;
         base.Dispose();
         if (_module != null) { try { await _module.DisposeAsync(); } catch (JSDisconnectedException) { } }
     }

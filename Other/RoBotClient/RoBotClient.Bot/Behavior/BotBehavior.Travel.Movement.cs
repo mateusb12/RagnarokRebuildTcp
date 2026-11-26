@@ -69,6 +69,18 @@ public sealed partial class BotBehavior
         if (DateTime.UtcNow < _nextWander) return; // reuse the move throttle
         _nextWander = DateTime.UtcNow.AddSeconds(1.0); // pick a new wander target faster — wander cells are cheap
         if (_data == null || (snap.SelfPos.X == 0 && snap.SelfPos.Y == 0)) return;
+        // Map choice priced this trip with a Butterfly Wing to the save town first (one try; if it fails we just walk).
+        if (_mapWingTo is { } wingTo)
+        {
+            _mapWingTo = null;
+            if (!string.Equals(snap.Map, wingTo, StringComparison.OrdinalIgnoreCase) && HasUsableItem(_config.ButterflyWingItemId))
+            {
+                OnLog?.Invoke($"Travel: Butterfly Wing to {_data.MapName(wingTo)} ({wingTo}), quicker to {_config.HomeMap} from there.");
+                _nextWander = DateTime.UtcNow.AddSeconds(3);
+                await _bot.UseInventoryItemAsync(_config.ButterflyWingItemId, -1, ct);
+                return;
+            }
+        }
         await StepTowardMapAsync(snap, _config.HomeMap, ct);
     }
 

@@ -29,6 +29,29 @@ public sealed class KafraWarp
     public int OptionIndex { get; set; }
 }
 
+/// <summary>Script NPCs that teleport (MoveTo) after one menu pick, so the world graph can route through them. They ride
+/// the Kafra edge and dialog plumbing with <see cref="NoSecondMenu"/> as the destination option. Hand-copied from
+/// RoRebuildServer/GameConfig/ServerData/Script/Npcs; update here when those scripts move an NPC or change a fare.</summary>
+public static class NpcLinks
+{
+    public const int NoSecondMenu = -2;
+
+    // ponytail: only the links hunting maps need; the Izlude/Alberta boats (Byalan, Turtle Island, Sunken Ship) can join when wanted.
+    public static readonly KafraEntry[] All =
+    [
+        Link("alberta", "Sea Captain", 245, 93, 0, "amatsu", 197, 83, 3000),      // Npcs/Alberta.txt "Overseas Captain"
+        Link("ama_in02", "Jyuichiro", 115, 177, 1, "ama_dun01", 229, 10, 0),     // Npcs/Amatsu.txt "Enter the gate"
+        Link("ama_dun01", "Jyuichiro", 229, 7, 0, "ama_in02", 119, 181, 0),      // Npcs/Amatsu.txt "Return"
+        Link("aldebaran", "Christmas Link", 223, 222, 0, "xmas_fild01", 83, 72, 0), // Npcs/Aldebaran.txt Santa to Lutie
+    ];
+
+    private static KafraEntry Link(string map, string name, int x, int y, int option, string dest, int dx, int dy, int zeny) => new()
+    {
+        Map = map, Name = name, X = x, Y = y, TopMenuOption = option,
+        Warps = [new KafraWarp { DestMap = dest, DestX = dx, DestY = dy, Zeny = zeny, OptionLabel = $"{name} to {dest}", OptionIndex = NoSecondMenu }],
+    };
+}
+
 public sealed class KafraDbFile
 {
     public List<KafraEntry> Items { get; set; } = new();

@@ -26,16 +26,18 @@ public sealed class SimRunner(string repoRoBot)
     public int Percent => _percent;
     private volatile int _percent = -1;
 
-    /// <summary>Saved runs, newest first.</summary>
+    /// <summary>Saved leveling runs, newest first. The live checks' replays (RouteChecks: "{stamp}_route_...", "{stamp}_scan_...") share the folder but aren't runs.</summary>
     public List<string> Runs() => System.IO.Directory.Exists(Directory)
-        ? new DirectoryInfo(Directory).GetFiles("*.json").OrderByDescending(f => f.LastWriteTimeUtc).Select(f => Path.GetFileNameWithoutExtension(f.Name)).ToList()
+        ? new DirectoryInfo(Directory).GetFiles("*.json").Where(f => !IsRouteReplay(f.Name)).OrderByDescending(f => f.LastWriteTimeUtc).Select(f => Path.GetFileNameWithoutExtension(f.Name)).ToList()
         : new();
+
+    private static bool IsRouteReplay(string name) => name.Contains("_route_", StringComparison.Ordinal) || name.Contains("_scan_", StringComparison.Ordinal);
 
     /// <summary>Deletes every saved run (sim-replays/*.json); returns how many. Nothing while a run is writing one.</summary>
     public int DeleteAll()
     {
         lock (_lock) if (_status.Running) return 0;
-        var files = System.IO.Directory.Exists(Directory) ? System.IO.Directory.GetFiles(Directory, "*.json") : [];
+        var files = System.IO.Directory.Exists(Directory) ? System.IO.Directory.GetFiles(Directory, "*.json").Where(f => !IsRouteReplay(Path.GetFileName(f))).ToArray() : [];
         foreach (var f in files) File.Delete(f);
         return files.Length;
     }

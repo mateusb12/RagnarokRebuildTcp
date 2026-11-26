@@ -52,6 +52,10 @@ public sealed class BotBehaviorConfig
     /// <summary>Let the bot move HomeMap on its own to the map with the best exp/hour (see BotBehavior.MapChoice).</summary>
     public bool AutoMap = true;
 
+    /// <summary>Before an AutoMap move, ask the dashboard to simulate the route offline (routesim: the live travel tick on
+    /// each map on the way, several seeds) and skip a destination the build wouldn't survive getting to.</summary>
+    public bool SimulateRoutes = true;
+
     public bool Enabled = true;
 
     /// <summary>If the bot makes no progress (no movement AND no target-HP drop) for this many seconds,
@@ -115,7 +119,7 @@ public sealed class BotBehaviorConfig
 
     /// <summary>Zeny budgets, as shares of the INCOME since the last shop trip (after the fares home), so whatever is
     /// left accumulates for gear upgrades: the bot never spends its savings on potions. Healing items may always top up
-    /// to <see cref="RestockBelow"/> from savings (survival floor); buffs (Concentration Potion) and wings never do.</summary>
+    /// to <see cref="RestockBelow"/> from savings (survival floor), and so may the emergency half of the Fly Wing pool; buffs never do.</summary>
     public float HealingZenyShare = 0.30f;
     public float BuffZenyShare = 0.10f;
     public float FlyWingZenyShare = 0.15f;
@@ -323,6 +327,7 @@ public sealed class BotBehaviorConfig
         SavePointX = other.SavePointX;
         SavePointY = other.SavePointY;
         AutoMap = other.AutoMap;
+        SimulateRoutes = other.SimulateRoutes;
         Enabled = other.Enabled;
         StuckSeconds = other.StuckSeconds;
         Verbose = other.Verbose;
@@ -334,7 +339,9 @@ public sealed class BotBehaviorConfig
         AutoShop = other.AutoShop;
         SellWeightPercent = other.SellWeightPercent;
         JunkSellCount = other.JunkSellCount;
-        RestockItemId = other.RestockItemId;
+        // Old configs restocked Fly Wings in the potion slot; wings have their own pool now (FlyWingWeightShare), and a
+        // wing there meant the bot never bought a potion (Bot2, Lv 70, died at orcsdun02 with no HP heal in the bag).
+        RestockItemId = other.RestockItemId == other.FlyWingItemId ? 501 : other.RestockItemId;
         ConsumableWeightShare = other.ConsumableWeightShare;
         HealingZenyShare = other.HealingZenyShare;
         BuffZenyShare = other.BuffZenyShare;
