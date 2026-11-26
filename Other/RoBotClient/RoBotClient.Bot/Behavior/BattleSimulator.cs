@@ -245,7 +245,6 @@ public static class BattleSimulator
         var doubleFactor = 1 + mods.AttackerDoubleAttackChance;
         var expectedDmgPerSwing = expectedDmgPerHit * doubleFactor;
 
-        // A cast replaces a (possibly doubled) swing with one hit x multiplier.
         var (skillBonus, _) = SkillBonusDamage(monster.MaxHp, expectedDmgPerSwing, mods.SkillHitMultiplier / doubleFactor, mods.SkillCasts);
         var myMeleeDps = expectedDmgPerSwing / myInterval;
         var myDps = myMeleeDps + Math.Max(0, mods.ExtraSkillDps);

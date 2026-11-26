@@ -149,7 +149,7 @@ public sealed partial class BotBehavior
     /// expected damage per auto-attack on a monster (unpoisoned / poisoned). Live: the bot's own forecast; offline: the
     /// server-code one (HuntSimulator).</summary>
     internal sealed record SkillChoiceInputs(GameDatabase? Data, bool NoAutoAttack, Func<MonsterInfo, bool, double> SwingDamage,
-        Func<MonsterInfo, double>? HitDamage = null); // one hit without Double Attack (null: same as a swing)
+        Func<MonsterInfo, double> HitDamage); // one hit without Double Attack: what a skill's multiplier scales
 
     /// <summary>Feed SkillPolicy from the snapshot + the forecast's per-swing damage. 0 = skip this cast.</summary>
     private static int SkillPolicyLevel(Snapshot snap, MonsterInfo target, CharacterSkill skill, int maxLevel, bool pinLevel, SkillChoiceInputs inputs)
@@ -175,7 +175,7 @@ public sealed partial class BotBehavior
     }
 
     private static double HitDamage(MonsterInfo target, SkillChoiceInputs inputs, double autoDmg) =>
-        inputs.NoAutoAttack || inputs.HitDamage == null ? autoDmg : inputs.HitDamage(target);
+        inputs.NoAutoAttack ? autoDmg : inputs.HitDamage(target);
 
     /// <summary>Expected damage per auto-attack (0 for NoAutoAttack) and the target's HP (MaxHp 0 = not seen yet: fresh mob).</summary>
     private static (double AutoDmg, int Hp) PolicyInputs(MonsterInfo target, SkillChoiceInputs inputs)

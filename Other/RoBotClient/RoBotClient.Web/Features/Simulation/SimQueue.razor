@@ -61,9 +61,9 @@
 @code {
     protected override int RefreshMs => 1000;
 
-    private static string Kind(RouteChecks.Job j) => j.Maps != null ? "Level scan" : "Route check";
+    private static string Kind(RouteChecks.Job j) => j.IsScan ? "Level scan" : "Route check";
 
-    private static string Describe(RouteChecks.Job j) => j.Maps != null
+    private static string Describe(RouteChecks.Job j) => j.IsScan
         ? $"Lv {j.Level} from {j.From}: {string.Join(", ", j.Maps)}"
         : $"{j.From} → {j.To}, {j.Seeds} seeds" + (j.Live ? ", asked by the live bot" : "");
 

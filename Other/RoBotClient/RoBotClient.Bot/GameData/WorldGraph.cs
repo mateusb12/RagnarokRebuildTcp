@@ -41,7 +41,13 @@ public sealed class WorldGraph
     /// <summary>Per-edge data for kafra teleport edges: which menu option to pick in the kafra's first
     /// menu (e.g. 2 for "Teleport Service" on @Kafra NPCs), which option in the destination menu, and
     /// the zeny cost (priced into Plan, and the bot skips teleports it can't afford).</summary>
-    public sealed record KafraEdgeInfo(int TopMenuOption, int DestOptionIndex, int Zeny, string OptionLabel);
+    public sealed record KafraEdgeInfo(int TopMenuOption, int DestOptionIndex, int Zeny, string OptionLabel)
+    {
+        /// <summary>DestOptionIndex of a Kafra save: no destination, the reply is the "saved" dialog.</summary>
+        public const int Save = -1;
+        /// <summary>DestOptionIndex of an NPC link (NpcLinks): it teleports straight from its one menu.</summary>
+        public const int NoSecondMenu = -2;
+    }
 
     /// <summary>Cached query result — the ordered list of portal edges from a (map,cell) to a (map,cell).</summary>
     public sealed record TravelPlan(IReadOnlyList<Edge> Edges, float Cost);

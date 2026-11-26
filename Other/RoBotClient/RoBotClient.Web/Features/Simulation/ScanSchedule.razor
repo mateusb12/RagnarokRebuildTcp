@@ -6,9 +6,9 @@
 @inject RouteChecks Routes
 
 @* When each live bot last ran its level scan and when it will ask again: on a level-up, or at its first map decision
-   (every ~10 min) after the scan is RouteChecks.ScanTtl old. *@
+   (every BotBehavior.MapCheckEvery) after the scan is RouteChecks.ScanTtl old. *@
 <div class="small text-secondary mb-2">
-    A bot asks for a level scan on a level-up, or at its first map decision (about every 10 min) once its last scan is
+    A bot asks for a level scan on a level-up, or at its first map decision (about every @BotBehavior.MapCheckEvery.TotalMinutes min) once its last scan is
     @RouteChecks.ScanTtl.TotalHours.ToString("0.#") h old.
 </div>
 @{ var saved = Routes.SavedScans(); /* newest first; a dozen small files, read every 5 s */ }
@@ -48,9 +48,9 @@
         var cfg = Bots.GetBehaviorConfig(s.Id);
         if (cfg is { AutoMap: false } || cfg is { SimulateRoutes: false })
             return @<span class="text-secondary">never (@(cfg.AutoMap ? "route simulation" : "auto map") is off)</span>;
-        if (Routes.Running is { Maps: not null } run && Same(run.Character, s.CharacterName))
+        if (Routes.Running is { IsScan: true } run && Same(run.Character, s.CharacterName))
             return @<span class="text-primary fw-semibold">running now</span>;
-        var queued = Routes.Queued.FindIndex(j => j.Maps != null && Same(j.Character, s.CharacterName));
+        var queued = Routes.Queued.FindIndex(j => j.IsScan && Same(j.Character, s.CharacterName));
         if (queued >= 0) return @<span class="text-primary">queued, #@(queued + 1) in line</span>;
         if (last == null || last.Level != s.Level)
             return @<span class="text-warning">at its next map decision (no scan for Lv @s.Level yet)</span>;
@@ -59,8 +59,7 @@
         return @<span>@due.ToLocalTime().ToString("HH:mm") <span class="text-secondary">(in @Ago(due - DateTime.UtcNow)) or on reaching Lv @(s.Level + 1)</span></span>;
     }
 
-    // Saved scans carry the short name the Host got (--config-of "Bot1"); live jobs and bots the full "[BOT] Bot1".
-    private static bool Same(string a, string b) => string.Equals(a.Split(' ')[^1], b.Split(' ')[^1], StringComparison.OrdinalIgnoreCase);
+    private static bool Same(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
 
     private static string Ago(TimeSpan t) => t.TotalMinutes < 1 ? $"{(int)t.TotalSeconds}s"
         : t.TotalHours < 1 ? $"{(int)t.TotalMinutes}min" : $"{(int)t.TotalHours}h{t.Minutes:00}";

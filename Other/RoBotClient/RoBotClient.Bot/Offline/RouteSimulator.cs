@@ -19,9 +19,8 @@ public sealed record RouteHop(string Map, int FromX, int FromY, int ToX, int ToY
 /// <summary>How one seed's bot did on one hop.</summary>
 public sealed record HopOutcome(string Map, bool Arrived, bool Died, double Seconds, int HpLeft, int MaxHp, int FlyWings, int Potions, string? Killer, string? Replay, bool Skipped = false, int SpLeft = 0);
 
-/// <summary>One candidate hunting map of a level scan: a hunt sim on it (exp/h, did it die) and the route there from
-/// where the bot stood (null when it is already there).</summary>
-public sealed record MapScan(string Map, double ExpPerHour, double Minutes, int Kills, bool Died, string? Killer, RouteVerdict? Route)
+/// <summary>One candidate hunting map of a level scan: a hunt sim on it (exp/h, did it die).</summary>
+public sealed record MapScan(string Map, double ExpPerHour, double Minutes, int Kills, bool Died, string? Killer)
 {
     /// <summary>The hunt's replay in sim-replays (pruned to the last few scans), or null.</summary>
     public string? Replay { get; init; }
@@ -38,8 +37,6 @@ public sealed record MonsterScan(int Kills, int Deaths, double HpLossPerFight);
 /// <summary>What the offline simulator found for one character at one level: run once per level (RouteSimulator.Scan).</summary>
 public sealed record LevelScan(string Character, int Level, string From, List<MapScan> Maps, DateTime AtUtc, double WallSeconds)
 {
-    /// <summary>Maps the scan's routes got across alive in every seed (RouteResult.Crossed).</summary>
-    public List<string> Crossed { get; init; } = new();
     public static readonly JsonSerializerOptions Json = RouteResult.Json;
 }
 
@@ -65,6 +62,10 @@ public sealed record RouteResult(string Character, int Level, string From, strin
 public static class RouteSimulator
 {
     public const double HopSeconds = 300; // a big dungeon is ~2 min across; past 5 min it is blocked (fleeing back and forth)
+    /// <summary>How long a level scan hunts each candidate map.</summary>
+    public const double ScanMinutes = 10;
+    /// <summary>Name suffix of a seed's whole-route replay (Continuous), as the CLI saves it.</summary>
+    public const string ContinuousSuffix = "_continuous";
 
     /// <summary>The live route (WorldGraph.Plan from the bot's cell to the destination's entry cell) as hops. Kafra
     /// teleports are allowed unless noKafra (the live bot only takes the ones it can afford). Null when unreachable.</summary>
@@ -92,6 +93,7 @@ public static class RouteSimulator
     {
         var started = System.Diagnostics.Stopwatch.StartNew();
         var runs = new List<List<HopOutcome>>();
+        var wingId = (config ?? new BotBehaviorConfig()).FlyWingItemId;
         for (var s = 0; s < seeds; s++)
         {
             var seed = firstSeed + s;
@@ -112,8 +114,8 @@ public static class RouteSimulator
                 var sim = new HuntSimulator(options, data);
                 sim.Run();
                 int Used(int id) => bag.GetValueOrDefault(id) - sim.Bag.GetValueOrDefault(id);
-                var wings = Used(config?.FlyWingItemId ?? 601);
-                var potions = bag.Keys.Where(id => id != (config?.FlyWingItemId ?? 601)).Sum(Used);
+                var wings = Used(wingId);
+                var potions = bag.Keys.Where(id => id != wingId).Sum(Used);
                 var died = sim.Deaths > 0;
                 run.Add(new HopOutcome(hop.Map, sim.Arrived, died, sim.Elapsed, died ? 0 : sim.Hp, sim.MaxHp, wings, potions, sim.Killer, replay?.Invoke(seed, i, sim), SpLeft: died ? 0 : sim.Sp));
                 progress?.Invoke((s + (i + 1.0) / route.Count) / seeds);
@@ -159,7 +161,7 @@ public static class RouteSimulator
                 NoAutoAttack: config?.NoAutoAttack ?? false, Config: config), data);
             sim.Run();
             var died = sim.Deaths > 0;
-            scans.Add(new MapScan(map, sim.Exp / Math.Max(1e-9, sim.Elapsed / 3600), sim.Elapsed / 60, sim.Kills, died, sim.Killer, null)
+            scans.Add(new MapScan(map, sim.Exp / Math.Max(1e-9, sim.Elapsed / 3600), sim.Elapsed / 60, sim.Kills, died, sim.Killer)
             {
                 Replay = replay?.Invoke(map, sim),
                 FightPerKill = sim.Kills > 0 ? sim.FightSeconds / sim.Kills : 0,
@@ -178,8 +180,27 @@ public static class RouteSimulator
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"== Level scan: {s.Character} Lv {s.Level} from {s.From}, {s.Maps.Count} maps, {s.WallSeconds:F1}s wall ==");
         foreach (var m in s.Maps)
-            sb.AppendLine($"{m.Map,-14} {m.ExpPerHour,10:N0} exp/h  {m.Kills,4} kills in {m.Minutes:F1} min{(m.Died ? $"  DIED to {m.Killer}" : "")}{(m.Route != null ? $"  route: {m.Route.Text}" : "")}");
+            sb.AppendLine($"{m.Map,-14} {m.ExpPerHour,10:N0} exp/h  {m.Kills,4} kills in {m.Minutes:F1} min{(m.Died ? $"  DIED to {m.Killer}" : "")}");
         return sb.ToString();
+    }
+
+    /// <summary>One seed's crossings as a single replay: the first recorded hop with the later ones as RouteSegments, plus
+    /// the destination map on arrival when the seed got all the way. Null when there is nothing to join.</summary>
+    /// <param name="hops">the seed's recorded crossings, by hop index, in route order.</param>
+    public static HuntReplay? Continuous(GameDatabase data, PlayerBuild build, BotBehaviorConfig? config, string toMap, List<RouteHop> route,
+        List<HopOutcome> run, int seed, IReadOnlyList<(int Hop, HuntReplay Replay)> hops, string? buildSource)
+    {
+        if (hops.Count == 0) return null;
+        var segments = hops.Skip(1).Select(h => new RouteReplaySegment(route[h.Hop].Map, route[h.Hop].Leaves, h.Replay)).ToList();
+        if (run.Count == route.Count && run.All(o => o.Arrived) && data.World.EntryCell(toMap) is { } entry)
+        {
+            var last = run[^1];
+            var arrival = new HuntSimulator(new HuntSimOptions(toMap, build, 0.001, seed, SkillScript: config?.SkillScript ?? "",
+                NoAutoAttack: config?.NoAutoAttack ?? false, Config: config, StartAt: (entry.X, entry.Y), StartHp: last.HpLeft, StartSp: last.SpLeft), data);
+            arrival.Run();
+            segments.Add(new RouteReplaySegment(toMap, "arrived", arrival.Replay(buildSource)));
+        }
+        return segments.Count == 0 ? null : hops[0].Replay with { RouteSegments = segments };
     }
 
     public static string Report(RouteResult r)

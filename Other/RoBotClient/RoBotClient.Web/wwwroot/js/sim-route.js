@@ -16,7 +16,7 @@ export function play(root, first, createViewer) {
             routeClock.timeline.push({ index, offset, segments: completed.segments, events: completed.rp.events, vitals: completed.rp.vitals, maxHp: completed.rp.maxHp });
             if (index + 1 < hops.length) start(index + 1);
             else active.pause();
-        }, () => {});
+        });
         active.setT(at);
         if (autoplay) active.play();
         return active;

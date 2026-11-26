@@ -76,12 +76,9 @@ static (PlayerBuild build, string buildSource, Appearance? look, RoBotClient.Bot
     return (build, buildSource, look, botConfig, configSource);
 }
 
-// routesim <build.json | bot[@map]> <fromMap> <x> <y> <toMap> <seeds> [--config-of bot] [--json file] [--replays dir] [--no-kafra] [--progress]
-// Would this build survive walking the live route from (fromMap x,y) to toMap? Each map crossed by the live travel tick.
-if (mode == "routesim")
+// The server code the offline sims run on, and the game data next to it.
+static (string repo, GameDatabase data) LoadSimWorld()
 {
-    if (args.Length < 7) { Console.WriteLine("usage: routesim <build.json | bot[@map]> <fromMap> <x> <y> <toMap> <seeds> [--config-of bot] [--json file] [--replays dir] [--no-kafra] [--progress]"); return; }
-    string? Arg(string name) => Array.IndexOf(args, name) is var i and > 0 && i + 1 < args.Length ? args[i + 1] : null;
     var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
                           ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
     ServerCombatRuntime.EnsureInitialized(serverDirectory);
@@ -89,61 +86,57 @@ if (mode == "routesim")
     var data = GameDatabase.Load(Path.Combine(repo, "RebuildClient", "Assets", "StreamingAssets", "ClientConfigGenerated"),
         Path.Combine(repo, "RebuildClient", "Assets", "Maps", "exportdata"),
         Path.Combine(repo, "RoRebuildServer", "GameConfig", "ServerData", "Script", "Warps"));
+    return (repo, data);
+}
+
+string? Arg(string name) => Array.IndexOf(args, name) is var i and > 0 && i + 1 < args.Length ? args[i + 1] : null;
+
+// --progress: "progress N" on stderr per whole percent, for the dashboard's progress bars (SimRunner).
+Action<double>? Progress()
+{
+    if (!args.Contains("--progress")) return null;
+    var last = -1;
+    return f => { if ((int)(f * 100) is var p && p != last) Console.Error.WriteLine($"progress {last = p}"); };
+}
+
+// routesim <build.json | bot[@map]> <fromMap> <x> <y> <toMap> <seeds> [--config-of bot] [--character name] [--safe-maps a,b] [--json file] [--replays dir] [--no-kafra] [--progress] [--profile]
+// Would this build survive walking the live route from (fromMap x,y) to toMap? Each map crossed by the live travel tick.
+if (mode == "routesim")
+{
+    if (args.Length < 7) { Console.WriteLine("usage: routesim <build.json | bot[@map]> <fromMap> <x> <y> <toMap> <seeds> [--config-of bot] [--character name] [--safe-maps a,b] [--json file] [--replays dir] [--no-kafra] [--progress] [--profile]"); return; }
     RoBotClient.Simulation.SimProfile.Enabled = args.Contains("--profile");
     var wall = System.Diagnostics.Stopwatch.StartNew();
+    var (repo, data) = LoadSimWorld();
     var (build, buildSource, _, botConfig, _) = LoadSimBuild(args[1], repo, args, Arg("--config-of"));
     var (fromMap, toMap) = (args[2], args[5]);
     var plan = RouteSimulator.Plan(data, fromMap, int.Parse(args[3]), int.Parse(args[4]), toMap, args.Contains("--no-kafra"))
                ?? throw new ArgumentException($"no route from {fromMap} to {toMap}");
     var replays = Arg("--replays");
-    var character = Arg("--config-of") ?? args[1].Split('@')[0];
-    var safeName = new string(character.Where(c => char.IsLetterOrDigit(c) || c is '_' or '-').ToArray());
-    var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
-    var lastPct = -1;
+    var character = Arg("--character") ?? Arg("--config-of") ?? args[1].Split('@')[0];
+    var prefix = $"{DateTime.Now:yyyyMMdd-HHmmss}_route_";
+    var recorded = new Dictionary<string, HuntReplay>();
     var result = RouteSimulator.Run(data, build, botConfig, character, toMap, plan, int.Parse(args[6]),
         replay: replays == null ? null : (seed, i, sim) =>
         {
-            Directory.CreateDirectory(replays);
-            var name = $"{stamp}_route_{plan[i].Map}_{safeName}_{i + 1}of{plan.Count}_s{seed}";
-            File.WriteAllText(Path.Combine(replays, name + ".json"), System.Text.Json.JsonSerializer.Serialize(sim.Replay(buildSource), HuntReplay.Json));
-            return name;
+            var name = $"{prefix}{plan[i].Map}_{SafeName(character)}_{i + 1}of{plan.Count}_s{seed}";
+            return SaveReplay(replays, name, recorded[name] = sim.Replay(buildSource));
         },
-        progress: args.Contains("--progress") ? f => { if ((int)(f * 100) is var p && p != lastPct) Console.Error.WriteLine($"progress {lastPct = p}"); } : null,
-        safeMaps: SafeMaps(Arg("--safe-maps")));
+        progress: Progress(), safeMaps: SafeMaps(Arg("--safe-maps")));
     if (replays != null)
-    {
         for (var seedIndex = 0; seedIndex < result.Runs.Count; seedIndex++)
         {
             var run = result.Runs[seedIndex];
-            if (seedIndex > 0 && run.All(outcome => outcome.Arrived))
+            if (seedIndex > 0 && run.All(outcome => outcome.Arrived)) // only the first seed and the failing ones keep replays
             {
                 foreach (var outcome in run.Where(outcome => outcome.Replay != null))
                     File.Delete(Path.Combine(replays, outcome.Replay + ".json"));
                 for (var i = 0; i < run.Count; i++) run[i] = run[i] with { Replay = null };
                 continue;
             }
-            var parts = run.Select((outcome, hop) => (outcome, hop))
-                .Where(x => x.outcome.Replay != null)
-                .Select(x => (x.outcome, x.hop, replay: System.Text.Json.JsonSerializer.Deserialize<HuntReplay>(
-                    File.ReadAllText(Path.Combine(replays, x.outcome.Replay + ".json")), HuntReplay.Json)!))
-                .ToList();
-            var segments = parts.Skip(1).Select(x => new RouteReplaySegment(plan[x.hop].Map, plan[x.hop].Leaves, x.replay)).ToList();
-            if (run.Count == plan.Count && run.All(outcome => outcome.Arrived) && data.World.EntryCell(toMap) is { } entry)
-            {
-                var last = run[^1];
-                var arrival = new HuntSimulator(new HuntSimOptions(toMap, build, 0.001, seedIndex + 1,
-                    SkillScript: botConfig?.SkillScript ?? "", NoAutoAttack: botConfig?.NoAutoAttack ?? false, Config: botConfig,
-                    StartAt: (entry.X, entry.Y), StartHp: last.HpLeft, StartSp: last.SpLeft), data);
-                arrival.Run();
-                segments.Add(new RouteReplaySegment(toMap, "arrived", arrival.Replay(buildSource)));
-            }
-            if (segments.Count == 0) continue;
-            var combined = parts[0].replay with { RouteSegments = segments };
-            var name = $"{stamp}_route_{fromMap}_to_{toMap}_{safeName}_s{seedIndex + 1}_continuous";
-            File.WriteAllText(Path.Combine(replays, name + ".json"), System.Text.Json.JsonSerializer.Serialize(combined, HuntReplay.Json));
-            run[parts[0].hop] = run[parts[0].hop] with { Replay = name };
+            var hops = run.Select((outcome, hop) => (outcome, hop)).Where(x => x.outcome.Replay != null).Select(x => (x.hop, recorded[x.outcome.Replay!])).ToList();
+            if (RouteSimulator.Continuous(data, build, botConfig, toMap, plan, run, seedIndex + 1, hops, buildSource) is not { } combined) continue;
+            run[hops[0].hop] = run[hops[0].hop] with { Replay = SaveReplay(replays, $"{prefix}{fromMap}_to_{toMap}_{SafeName(character)}_s{seedIndex + 1}{RouteSimulator.ContinuousSuffix}", combined) };
         }
-    }
     Console.WriteLine($"Build source: {buildSource}.");
     Console.WriteLine(RouteSimulator.Report(result));
     if (Arg("--json") is { } json) File.WriteAllText(json, System.Text.Json.JsonSerializer.Serialize(result, RouteResult.Json));
@@ -151,35 +144,20 @@ if (mode == "routesim")
     return;
 }
 
-// levelscan <build.json | bot[@map]> <fromMap> <x> <y> <map,map,...> [--config-of bot] [--minutes 10] [--json file] [--replays dir] [--progress]
-// The once-per-level scan a live bot asks for: each candidate map hunted (exp/h, death) and the route to it (RouteSimulator.Scan).
+// levelscan <build.json | bot[@map]> <fromMap> <x> <y> <map,map,...> [--config-of bot] [--character name] [--minutes N] [--json file] [--replays dir] [--progress]
+// The once-per-level scan a live bot asks for: each candidate map hunted (exp/h, death) (RouteSimulator.Scan).
 if (mode == "levelscan")
 {
-    if (args.Length < 6) { Console.WriteLine("usage: levelscan <build.json | bot[@map]> <fromMap> <x> <y> <map,map,...> [--config-of bot] [--minutes 10] [--json file] [--progress]"); return; }
-    string? Arg(string name) => Array.IndexOf(args, name) is var i and > 0 && i + 1 < args.Length ? args[i + 1] : null;
-    var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
-                          ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
-    ServerCombatRuntime.EnsureInitialized(serverDirectory);
-    var repo = Path.GetDirectoryName(Path.GetDirectoryName(serverDirectory))!;
-    var data = GameDatabase.Load(Path.Combine(repo, "RebuildClient", "Assets", "StreamingAssets", "ClientConfigGenerated"),
-        Path.Combine(repo, "RebuildClient", "Assets", "Maps", "exportdata"),
-        Path.Combine(repo, "RoRebuildServer", "GameConfig", "ServerData", "Script", "Warps"));
+    if (args.Length < 6) { Console.WriteLine("usage: levelscan <build.json | bot[@map]> <fromMap> <x> <y> <map,map,...> [--config-of bot] [--character name] [--minutes N] [--json file] [--replays dir] [--progress]"); return; }
+    var (repo, data) = LoadSimWorld();
     var (build, buildSource, _, botConfig, _) = LoadSimBuild(args[1], repo, args, Arg("--config-of"));
-    var character = Arg("--config-of") ?? args[1].Split('@')[0];
-    var lastPct = -1;
+    var character = Arg("--character") ?? Arg("--config-of") ?? args[1].Split('@')[0];
     var replays = Arg("--replays");
-    var safeName = new string(character.Where(c => char.IsLetterOrDigit(c) || c is '_' or '-').ToArray());
     var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+    var minutes = Arg("--minutes") is { } m ? double.Parse(m, System.Globalization.CultureInfo.InvariantCulture) : RouteSimulator.ScanMinutes;
     var scan = RouteSimulator.Scan(data, build, botConfig, character, args[2], int.Parse(args[3]), int.Parse(args[4]),
-        args[5].Split(',', StringSplitOptions.RemoveEmptyEntries), double.Parse(Arg("--minutes") ?? "10", System.Globalization.CultureInfo.InvariantCulture),
-        args.Contains("--progress") ? f => { if ((int)(f * 100) is var p && p != lastPct) Console.Error.WriteLine($"progress {lastPct = p}"); } : null,
-        replays == null ? null : (map, sim) =>
-        {
-            Directory.CreateDirectory(replays);
-            var name = $"{stamp}_scan_{map}_{safeName}_L{build.Level}";
-            File.WriteAllText(Path.Combine(replays, name + ".json"), System.Text.Json.JsonSerializer.Serialize(sim.Replay(buildSource), HuntReplay.Json));
-            return name;
-        });
+        args[5].Split(',', StringSplitOptions.RemoveEmptyEntries), minutes, Progress(),
+        replays == null ? null : (map, sim) => SaveReplay(replays, $"{stamp}_scan_{map}_{SafeName(character)}_L{build.Level}", sim.Replay(buildSource)));
     Console.WriteLine($"Build source: {buildSource}.");
     Console.WriteLine(RouteSimulator.Report(scan));
     if (Arg("--json") is { } json) File.WriteAllText(json, System.Text.Json.JsonSerializer.Serialize(scan, LevelScan.Json));
@@ -191,15 +169,9 @@ if (mode == "huntsim")
     if (args.Length < 5) { Console.WriteLine("usage: huntsim <map> <build.json | bot[@map]> <minutes> <seed> [--script \"rule; rule\"] [--configs file] [--trace file] [--replay file.json] [--check] [--profile]"); return; }
     RoBotClient.Simulation.SimProfile.Enabled = args.Contains("--profile");
     var wall = System.Diagnostics.Stopwatch.StartNew();
-    var startupScope = RoBotClient.Simulation.SimProfile.Of("startup: server runtime + game database");
-    var serverDirectory = ServerCombatRuntime.FindServerProjectDirectory(AppContext.BaseDirectory)
-                          ?? throw new DirectoryNotFoundException("RoRebuildServer project not found above " + AppContext.BaseDirectory);
-    ServerCombatRuntime.EnsureInitialized(serverDirectory);
-    var repo = Path.GetDirectoryName(Path.GetDirectoryName(serverDirectory))!;
-    var data = GameDatabase.Load(Path.Combine(repo, "RebuildClient", "Assets", "StreamingAssets", "ClientConfigGenerated"),
-        Path.Combine(repo, "RebuildClient", "Assets", "Maps", "exportdata"),
-        Path.Combine(repo, "RoRebuildServer", "GameConfig", "ServerData", "Script", "Warps"));
-    startupScope.Dispose();
+    GameDatabase data;
+    string repo;
+    using (RoBotClient.Simulation.SimProfile.Of("startup: server runtime + game database")) (repo, data) = LoadSimWorld();
     var (build, buildSource, look, botConfig, configSource) = LoadSimBuild(args[2], repo, args);
     var script = botConfig?.SkillScript ?? "";
     var scriptAt = Array.IndexOf(args, "--script");
@@ -209,11 +181,7 @@ if (mode == "huntsim")
     var started = System.Diagnostics.Stopwatch.StartNew();
     HuntSimulator sim;
     using (RoBotClient.Simulation.SimProfile.Of("sim: constructor")) sim = new HuntSimulator(options, data);
-    if (args.Contains("--progress")) // for the dashboard's progress bar (SimRunner): "progress N" on stderr per whole percent
-    {
-        var last = -1;
-        sim.OnProgress = f => { if ((int)(f * 100) is var p && p != last) Console.Error.WriteLine($"progress {last = p}"); };
-    }
+    if (Progress() is { } progress) sim.OnProgress = progress;
     sim.Run();
     Console.WriteLine($"Build source: {buildSource}. Wall time {started.Elapsed.TotalSeconds:F1}s.");
     Console.WriteLine(sim.Report());
@@ -374,6 +342,15 @@ void PrintState(BotBehavior? b)
 }
 
 // --safe-maps a,b,c: maps this character already got across alive at its level or lower (RouteChecks keeps them).
+static string SaveReplay(string dir, string name, HuntReplay replay)
+{
+    Directory.CreateDirectory(dir);
+    File.WriteAllText(Path.Combine(dir, name + ".json"), System.Text.Json.JsonSerializer.Serialize(replay, HuntReplay.Json));
+    return name;
+}
+
+static string SafeName(string s) => new(s.Where(c => char.IsLetterOrDigit(c) || c is '_' or '-').ToArray());
+
 static HashSet<string>? SafeMaps(string? list) => list == null ? null : new(list.Split(',', StringSplitOptions.RemoveEmptyEntries), StringComparer.OrdinalIgnoreCase);
 
 static string ResolveRepoSubdir(string relative)

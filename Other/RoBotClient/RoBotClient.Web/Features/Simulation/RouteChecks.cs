@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text.Json;
 using RoBotClient.Bot.Offline;
 using RoBotClient.Bot.Session;
@@ -12,16 +11,16 @@ namespace RoBotClient.Web.Features.Simulation;
 /// (BotManager.RouteCheck). A live bot's check uses its build right now (inventory included) and its saved config; its
 /// verdict is kept per character, level and route for VerdictTtl. Results are saved as route-checks/*.json.
 /// </summary>
-public sealed class RouteChecks(SimRunner runner, string repoRoBot)
+public sealed class RouteChecks
 {
     /// <summary>A route check, or with Maps a level scan (To then only describes it).</summary>
     public sealed record Job(string Character, string Who, string? ConfigOf, string From, int X, int Y, string To, int Seeds, bool Live, int Level, DateTime QueuedUtc,
         IReadOnlyList<string>? Maps = null)
     {
-        public string Key => Maps != null ? ScanKey(Character, Level) : RouteChecks.Key(Character, Level, From, To);
+        public bool IsScan => Maps != null;
+        public string Key => IsScan ? ScanKey(Character, Level) : RouteChecks.Key(Character, Level, From, To);
     }
 
-    public const double ScanMinutes = 10;
     /// <summary>A level scan is redone after this even without a level-up: a slow leveler (Bot4 at Lv 45) otherwise kept a
     /// day-old scan from another map and older gear. The rescan overwrites the level's file.</summary>
     // ponytail: a property, not a static readonly field: hot reload adds new fields without running their initializer (it was 0).
@@ -29,8 +28,9 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
 
     public const int LiveSeeds = 5;
     public static readonly TimeSpan VerdictTtl = TimeSpan.FromHours(2);
-    public string Directory { get; } = Path.Combine(repoRoBot, "route-checks");
+    public string Directory { get; }
 
+    private readonly SimRunner _runner;
     private readonly object _lock = new();
     private readonly Queue<Job> _queue = new();
     private readonly Dictionary<string, RouteVerdict> _verdicts = new();
@@ -42,9 +42,30 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     public string? LastError { get; private set; }
     public event Action? Changed;
 
+    public RouteChecks(SimRunner runner, string repoRoBot)
+    {
+        _runner = runner;
+        Directory = Path.Combine(repoRoBot, "route-checks");
+        // ponytail: one-time move of check replays saved next to the leveling runs before they had their own folder.
+        if (System.IO.Directory.Exists(runner.Directory))
+            foreach (var f in ReplayPatterns.SelectMany(p => new DirectoryInfo(runner.Directory).GetFiles(p)))
+            {
+                System.IO.Directory.CreateDirectory(runner.ChecksDirectory);
+                try { f.MoveTo(Path.Combine(runner.ChecksDirectory, f.Name), overwrite: true); } catch (IOException) { }
+            }
+    }
+
+    /// <summary>The replays a check's CLI run writes ("{stamp}_route_...", "{stamp}_scan_...": one stamp per check).</summary>
+    private static readonly string[] ReplayPatterns = ["*_route_*.json", "*_scan_*.json"];
     private static string Key(string character, int level, string from, string to) => $"{character}|{level}|{from}|{to}".ToLowerInvariant();
     private static string ScanKey(string character, int level) => $"{character}|{level}".ToLowerInvariant();
-    private string ScanFile(string character, int level) => Path.Combine(Directory, "scans", $"{Safe(character)}_L{level}.json");
+    private string ScanFile(string character, int level) => Path.Combine(Directory, "scans", $"{SimRunner.SafeName(character)}_L{level}.json");
+    private static LevelScan? ReadScan(string file)
+    {
+        try { return File.Exists(file) ? JsonSerializer.Deserialize<LevelScan>(File.ReadAllText(file), LevelScan.Json) : null; }
+        catch (Exception) { return null; } // unreadable: as if never scanned
+    }
+
     /// <summary>Maps this character got across alive at <paramref name="level"/> or lower, for --safe-maps: a crossing
     /// survived once stays survived as it levels (kept forever, route-checks/survived).</summary>
     private string? SafeMaps(string character, int level)
@@ -57,7 +78,7 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     {
         var key = character.ToLowerInvariant();
         if (_survived.TryGetValue(key, out var known)) return known;
-        var file = Path.Combine(Directory, "survived", $"{Safe(character)}.json");
+        var file = Path.Combine(Directory, "survived", $"{SimRunner.SafeName(character)}.json");
         try { known = File.Exists(file) ? JsonSerializer.Deserialize<Dictionary<string, int>>(File.ReadAllText(file)) : null; }
         catch (Exception) { known = null; }
         return _survived[key] = new Dictionary<string, int>(known ?? new(), StringComparer.OrdinalIgnoreCase);
@@ -73,11 +94,9 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
                 if (!known.TryGetValue(map, out var at) || level < at) { known[map] = level; changed = true; }
             if (!changed) return;
             System.IO.Directory.CreateDirectory(Path.Combine(Directory, "survived"));
-            File.WriteAllText(Path.Combine(Directory, "survived", $"{Safe(character)}.json"), JsonSerializer.Serialize(known, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(Path.Combine(Directory, "survived", $"{SimRunner.SafeName(character)}.json"), JsonSerializer.Serialize(known, new JsonSerializerOptions { WriteIndented = true }));
         }
     }
-
-    private static string Safe(string s) => new(s.Where(c => char.IsLetterOrDigit(c) || c is '_' or '-').ToArray());
 
     public List<Job> Queued { get { lock (_lock) return _queue.ToList(); } }
     public List<RouteVerdict> LiveVerdicts { get { lock (_lock) return _verdicts.Values.OrderByDescending(v => v.AtUtc).ToList(); } }
@@ -93,23 +112,10 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
         lock (_lock)
         {
             if (_scans.TryGetValue(key, out var scan) && DateTime.UtcNow - scan.AtUtc < ScanTtl) return scan;
-            var saved = ScanFile(character, build.Level);
-            if (File.Exists(saved))
-                try
-                {
-                    var loaded = JsonSerializer.Deserialize<LevelScan>(File.ReadAllText(saved), LevelScan.Json)!;
-                    if (DateTime.UtcNow - loaded.AtUtc < ScanTtl) return _scans[key] = loaded;
-                }
-                catch (Exception) { /* unreadable: scan again */ }
-            if (Running?.Key == key || _queue.Any(j => j.Key == key)) return null;
-            System.IO.Directory.CreateDirectory(Path.Combine(Directory, "builds"));
-            var file = Path.Combine(Directory, "builds", $"{Safe(character)}_scan.json");
-            File.WriteAllText(file, JsonSerializer.Serialize(build, DuelStore.JsonOptions));
-            _queue.Enqueue(new Job(character, file, character.Split(' ')[^1], from, x, y, $"{maps.Count} maps (level scan)", LiveSeeds, true, build.Level,
-                DateTime.UtcNow, maps.ToList()));
-            Kick();
+            if (ReadScan(ScanFile(character, build.Level)) is { } saved && DateTime.UtcNow - saved.AtUtc < ScanTtl) return _scans[key] = saved;
         }
-        Changed?.Invoke();
+        EnqueueLive(new Job(character, "", SimRunner.ShortName(character), from, x, y, $"{maps.Count} maps (level scan)", Seeds: 1, Live: true, Level: build.Level,
+            QueuedUtc: DateTime.UtcNow, Maps: maps.ToList()), build, "scan");
         return null;
     }
 
@@ -120,9 +126,7 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
         {
             var key = ScanKey(character, level);
             if (_scans.TryGetValue(key, out var scan)) return scan.Maps.Count > 0 ? scan : null;
-            var saved = ScanFile(character, level);
-            try { return File.Exists(saved) ? _scans[key] = JsonSerializer.Deserialize<LevelScan>(File.ReadAllText(saved), LevelScan.Json)! : null; }
-            catch (Exception) { return null; }
+            return ReadScan(ScanFile(character, level)) is { } saved ? _scans[key] = saved : null;
         }
     }
 
@@ -130,19 +134,26 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     public RouteVerdict? Check(string character, BotSession session, string from, int x, int y, string to)
     {
         var (build, _) = session.CaptureCombatState();
-        var key = Key(character, build.Level, from, to);
+        lock (_lock)
+            if (_verdicts.TryGetValue(Key(character, build.Level, from, to), out var v) && DateTime.UtcNow - v.AtUtc < VerdictTtl) return v;
+        EnqueueLive(new Job(character, "", SimRunner.ShortName(character), from, x, y, to, LiveSeeds, Live: true, Level: build.Level, QueuedUtc: DateTime.UtcNow), build, SimRunner.SafeName(to));
+        return null;
+    }
+
+    /// <summary>Queues a live bot's job on its build right now (saved as route-checks/builds/{character}_{tag}.json), unless
+    /// the same job is already queued or running.</summary>
+    private void EnqueueLive(Job job, PlayerBuild build, string tag)
+    {
         lock (_lock)
         {
-            if (_verdicts.TryGetValue(key, out var v) && DateTime.UtcNow - v.AtUtc < VerdictTtl) return v;
-            if (Running?.Key == key || _queue.Any(j => j.Key == key)) return null;
+            if (Running?.Key == job.Key || _queue.Any(j => j.Key == job.Key)) return;
             System.IO.Directory.CreateDirectory(Path.Combine(Directory, "builds"));
-            var file = Path.Combine(Directory, "builds", $"{Safe(character)}_{Safe(to)}.json");
+            var file = Path.Combine(Directory, "builds", $"{SimRunner.SafeName(job.Character)}_{tag}.json");
             File.WriteAllText(file, JsonSerializer.Serialize(build, DuelStore.JsonOptions));
-            _queue.Enqueue(new Job(character, file, character.Split(' ')[^1], from, x, y, to, LiveSeeds, true, build.Level, DateTime.UtcNow));
+            _queue.Enqueue(job with { Who = file });
             Kick();
         }
         Changed?.Invoke();
-        return null;
     }
 
     /// <summary>A check from the Simulation page: the bot's latest recorded build (bot-duels), with replays of each map.</summary>
@@ -156,20 +167,19 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     /// (route-checks/*.json, route-checks/scans) are kept forever. Leveling runs are never pruned.</summary>
     public const int KeepReplays = 10;
 
-    /// <summary>Deletes the route replays ("{stamp}_route_...", one stamp per check) of all but the newest KeepReplays checks.</summary>
+    /// <summary>Deletes the replays of all but the newest KeepReplays checks of each kind.</summary>
     private void PruneReplays()
     {
-        if (!System.IO.Directory.Exists(runner.Directory)) return;
-        foreach (var kind in new[] { "*_route_*.json", "*_scan_*.json" })
-            foreach (var f in new DirectoryInfo(runner.Directory).GetFiles(kind).GroupBy(f => f.Name.Split('_')[0]).OrderByDescending(g => g.Key).Skip(KeepReplays).SelectMany(g => g))
+        if (!System.IO.Directory.Exists(_runner.ChecksDirectory)) return;
+        foreach (var kind in ReplayPatterns)
+            foreach (var f in new DirectoryInfo(_runner.ChecksDirectory).GetFiles(kind).GroupBy(f => f.Name.Split('_')[0]).OrderByDescending(g => g.Key).Skip(KeepReplays).SelectMany(g => g))
                 try { f.Delete(); } catch (IOException) { /* being read: next check prunes it */ }
     }
 
     /// <summary>Every level scan ever saved (route-checks/scans), newest first.</summary>
     public List<LevelScan> SavedScans() => System.IO.Directory.Exists(Path.Combine(Directory, "scans"))
         ? new DirectoryInfo(Path.Combine(Directory, "scans")).GetFiles("*.json").OrderByDescending(f => f.LastWriteTimeUtc)
-            .Select(f => { try { return JsonSerializer.Deserialize<LevelScan>(File.ReadAllText(f.FullName), LevelScan.Json); } catch (Exception) { return null; } })
-            .Where(s => s is { Maps.Count: > 0 }).Cast<LevelScan>().ToList()
+            .Select(f => ReadScan(f.FullName)).Where(s => s is { Maps.Count: > 0 }).Cast<LevelScan>().ToList()
         : new();
 
     /// <summary>Saved results, newest first.</summary>
@@ -177,8 +187,12 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
         ? new DirectoryInfo(Directory).GetFiles("*.json").OrderByDescending(f => f.LastWriteTimeUtc).Select(f => Path.GetFileNameWithoutExtension(f.Name)).ToList()
         : new();
 
+    private const string LiveSuffix = "_live";
+    /// <summary>A saved result a live bot asked for (not this page).</summary>
+    public static bool IsLive(string resultName) => resultName.EndsWith(LiveSuffix, StringComparison.Ordinal);
+
     public RouteResult? Load(string name) =>
-        System.Text.RegularExpressions.Regex.IsMatch(name, @"^[A-Za-z0-9_.@-]+$") && File.Exists(Path.Combine(Directory, name + ".json"))
+        SimRunner.IsSafeName(name) && File.Exists(Path.Combine(Directory, name + ".json"))
             ? JsonSerializer.Deserialize<RouteResult>(File.ReadAllText(Path.Combine(Directory, name + ".json")), RouteResult.Json) : null;
 
     private void Kick()
@@ -199,7 +213,7 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
                 Percent = -1;
             }
             Changed?.Invoke();
-            if (job.Maps != null)
+            if (job.IsScan)
             {
                 LevelScan scan;
                 try { scan = await RunScanAsync(job); LastError = null; }
@@ -208,13 +222,7 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
                     LastError = $"{job.Character} level scan: {e.Message}";
                     scan = new LevelScan(job.Character, job.Level, job.From, new(), DateTime.UtcNow, 0);
                 }
-                RecordCrossed(job.Character, job.Level, scan.Crossed);
-                lock (_lock)
-                {
-                    _scans[job.Key] = scan;
-                    foreach (var m in scan.Maps) // the scan's routes answer the move gate's RouteCheck from the same spot
-                        if (m.Route != null) _verdicts[Key(job.Character, job.Level, job.From, m.Map)] = m.Route with { Level = job.Level };
-                }
+                lock (_lock) _scans[job.Key] = scan;
                 Changed?.Invoke();
                 continue;
             }
@@ -241,9 +249,8 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     {
         var json = ScanFile(job.Character, job.Level);
         System.IO.Directory.CreateDirectory(Path.GetDirectoryName(json)!);
-        await RunHostAsync(new[] { "levelscan", job.Who, job.From, job.X.ToString(), job.Y.ToString(), string.Join(",", job.Maps!),
-            "--minutes", ScanMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture), "--json", json, "--config-of", job.ConfigOf! }
-            .Concat(new[] { "--replays", runner.Directory }), json, TimeSpan.FromMinutes(30));
+        await RunHostAsync(["levelscan", job.Who, job.From, job.X.ToString(), job.Y.ToString(), string.Join(",", job.Maps!),
+            "--json", json, "--config-of", job.ConfigOf!, "--character", job.Character, "--replays", _runner.ChecksDirectory], json, TimeSpan.FromMinutes(30));
         PruneReplays();
         return JsonSerializer.Deserialize<LevelScan>(File.ReadAllText(json), LevelScan.Json)!;
     }
@@ -251,42 +258,21 @@ public sealed class RouteChecks(SimRunner runner, string repoRoBot)
     private async Task<RouteResult> RunAsync(Job job)
     {
         System.IO.Directory.CreateDirectory(Directory);
-        var name = $"{DateTime.Now:yyyyMMdd-HHmmss}_{Safe(job.Character)}_{Safe(job.From)}-{Safe(job.To)}{(job.Live ? "_live" : "")}";
+        var name = $"{DateTime.Now:yyyyMMdd-HHmmss}_{SimRunner.SafeName(job.Character)}_{SimRunner.SafeName(job.From)}-{SimRunner.SafeName(job.To)}{(job.Live ? LiveSuffix : "")}";
         var json = Path.Combine(Directory, name + ".json");
-        var args = new List<string> { "routesim", job.Who, job.From, job.X.ToString(), job.Y.ToString(), job.To, job.Seeds.ToString(), "--json", json };
-        if (job.ConfigOf != null) args.AddRange(new[] { "--config-of", job.ConfigOf });
-        if (job.Live && SafeMaps(job.Character, job.Level) is { } safe) args.AddRange(new[] { "--safe-maps", safe });
-        args.AddRange(new[] { "--replays", runner.Directory }); // each map viewable in the replay viewer; recording costs no measurable time
+        var args = new List<string> { "routesim", job.Who, job.From, job.X.ToString(), job.Y.ToString(), job.To, job.Seeds.ToString(), "--json", json, "--character", job.Character };
+        if (job.ConfigOf != null) args.AddRange(["--config-of", job.ConfigOf]);
+        if (job.Live && SafeMaps(job.Character, job.Level) is { } safe) args.AddRange(["--safe-maps", safe]);
+        args.AddRange(["--replays", _runner.ChecksDirectory]); // each map viewable in the replay viewer; recording costs no measurable time
         await RunHostAsync(args, json, TimeSpan.FromMinutes(10));
         PruneReplays();
         return JsonSerializer.Deserialize<RouteResult>(File.ReadAllText(json), RouteResult.Json)!;
     }
 
-    /// <summary>Runs the CLI (one child process: the server code's statics can't share this one), reporting its progress.</summary>
-    private async Task RunHostAsync(IEnumerable<string> args, string json, TimeSpan timeout)
+    private async Task RunHostAsync(List<string> args, string json, TimeSpan timeout)
     {
-        if (!File.Exists(runner.HostDll)) throw new FileNotFoundException($"{runner.HostDll} is missing: build it once with 'dotnet build RoBotClient.Host'.");
-        var psi = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") is { Length: > 0 } dotnet && File.Exists(dotnet) ? dotnet : "dotnet")
-        {
-            RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false,
-            WorkingDirectory = Path.GetDirectoryName(runner.HostDll)!,
-        };
-        foreach (var a in args.Prepend(runner.HostDll).Append("--progress")) psi.ArgumentList.Add(a);
-        using var p = Process.Start(psi)!;
-        var stdout = p.StandardOutput.ReadToEndAsync();
-        var stderr = Task.Run(async () =>
-        {
-            var rest = new System.Text.StringBuilder();
-            while (await p.StandardError.ReadLineAsync() is { } line)
-                if (line.StartsWith("progress ") && int.TryParse(line[9..], out var pct)) { Percent = pct; Changed?.Invoke(); }
-                else rest.AppendLine(line);
-            return rest.ToString();
-        });
-        using var cts = new CancellationTokenSource(timeout);
-        try { await p.WaitForExitAsync(cts.Token); }
-        catch (OperationCanceledException) { p.Kill(true); throw new TimeoutException($"it took over {timeout.TotalMinutes:F0} minutes and was stopped"); }
-        var output = (await stdout) + (await stderr);
-        if (p.ExitCode != 0 || !File.Exists(json))
-            throw new InvalidOperationException($"{psi.ArgumentList[1]} exited with code {p.ExitCode}: " + string.Join(" ", output.Split('\n').Where(l => l.Contains("Exception") || l.Contains("no route")).Take(2)));
+        var (exitCode, output) = await _runner.RunHostAsync(args, timeout, pct => { Percent = pct; Changed?.Invoke(); });
+        if (exitCode != 0 || !File.Exists(json))
+            throw new InvalidOperationException($"{args[0]} exited with code {exitCode}: " + string.Join(" ", output.Split('\n').Where(l => l.Contains("Exception") || l.Contains("no route")).Take(2)));
     }
 }

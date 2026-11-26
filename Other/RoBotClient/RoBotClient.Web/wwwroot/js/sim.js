@@ -60,18 +60,18 @@ export async function mount(root, url, player, skillNames) {
     catch (e) { root.innerHTML = '<div class="alert alert-danger small">Could not load the replay: ' + esc(e.message) + "</div>"; return; }
     rp.bow = player?.weaponClass === 12; // PacketAttack: WeaponClass 12 shoots an arrow per auto-attack
     const P = await Sprites.loadPlayer(player);
-    const create = (replay, clock, onEnd, setCurrent) => {
+    const create = (replay, clock, onEnd) => {
         replay.bow = player?.weaponClass === 12;
         const v = new Viewer(root, replay);
         v.skillNames = skillNames; v.routeClock = clock; v.onRouteEnd = onEnd;
         if (P) { v.player = P; v.playerMoves = Sprites.indexPlayer(replay, P); }
-        current = v; setCurrent(v);
+        current = v;
         return v;
     };
     if (rp.routeSegments?.length) {
         const route = await import("./sim-route.js" + new URL(import.meta.url).search);
         current = route.play(root, rp, create);
-    } else current = create(rp, null, null, () => {});
+    } else current = create(rp, null, null);
 }
 
 class Viewer {

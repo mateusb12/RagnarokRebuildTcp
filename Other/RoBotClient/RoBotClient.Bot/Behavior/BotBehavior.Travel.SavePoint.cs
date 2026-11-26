@@ -69,7 +69,7 @@ public sealed partial class BotBehavior
         if (!string.Equals(snap.Map, k.Map, StringComparison.OrdinalIgnoreCase))
             await StepTowardMapAsync(snap, k.Map, ct, (k.X, k.Y));
         else
-            await StepKafraInteractionAsync(snap, k.X, k.Y, new WorldGraph.KafraEdgeInfo(0, -1, 0, "Save"), ct);
+            await StepKafraInteractionAsync(snap, k.X, k.Y, new WorldGraph.KafraEdgeInfo(0, WorldGraph.KafraEdgeInfo.Save, 0, "Save"), ct);
         return true;
     }
 

@@ -80,9 +80,9 @@ public sealed partial class BotBehavior
             _kafraDeadline = DateTime.UtcNow.AddSeconds(45);
             _kafraNextAction = DateTime.MinValue;
             _kafraLastSeq = 0;
-            OnLog?.Invoke(info.DestOptionIndex < 0
+            OnLog?.Invoke(info.DestOptionIndex == WorldGraph.KafraEdgeInfo.Save
                 ? $"Kafra save: heading to NPC ({npcX},{npcY}) on {snap.Map} to save my respawn point."
-                : $"Kafra warp: heading to NPC ({npcX},{npcY}) on {snap.Map} to teleport to '{info.OptionLabel}' (option {(info.DestOptionIndex < 0 ? info.TopMenuOption : info.DestOptionIndex)}).");
+                : $"Kafra warp: heading to NPC ({npcX},{npcY}) on {snap.Map} to teleport to '{info.OptionLabel}' (option {(info.DestOptionIndex == WorldGraph.KafraEdgeInfo.NoSecondMenu ? info.TopMenuOption : info.DestOptionIndex)}).");
         }
 
         if (DateTime.UtcNow > _kafraDeadline)
@@ -156,7 +156,7 @@ public sealed partial class BotBehavior
                         _kafraNextAction = DateTime.UtcNow.AddMilliseconds(500);
                         _kafraLastSeq = npc.Seq;
                         // An NPC link (Santa, the Amatsu captain) teleports straight from its one menu.
-                        _kafraStep = _kafraDestOption == NpcLinks.NoSecondMenu ? KafraStep.AwaitWarp : KafraStep.SelectDestination;
+                        _kafraStep = _kafraDestOption == WorldGraph.KafraEdgeInfo.NoSecondMenu ? KafraStep.AwaitWarp : KafraStep.SelectDestination;
                         await _bot.NpcSelectOptionAsync(_kafraTopMenuOption, ct);
                         return;
                     case NpcPhase.Ended:
@@ -181,7 +181,7 @@ public sealed partial class BotBehavior
                     return;
                 }
                 // Save (dest -1): the reply after "Save" is the "Your Respawn Point has been saved" dialog.
-                if (_kafraDestOption < 0 && npc.Phase == NpcPhase.Dialog)
+                if (_kafraDestOption == WorldGraph.KafraEdgeInfo.Save && npc.Phase == NpcPhase.Dialog)
                 {
                     _kafraLastSeq = npc.Seq;
                     await _bot.NpcAdvanceAsync(ct);

@@ -129,7 +129,6 @@ function makeView(canvas, ctx, t, s, payload, now) {
     const r = Math.max(4, baseCell * 1.6);
     return {
         canvas, ctx, t, now, pw, ph, sx, sy, ox, oy, fs, r,
-        baseSx: pw / t.w, baseSy: ph / t.h,
         mr: Math.max(3.5, r * 0.8),          // monster dot radius
         spriteHeight: 30 * dpr(),            // monster sprites ~30 css px tall
         toX: x => ox + (x + 0.5) * sx,
@@ -265,7 +264,6 @@ function drawTerrain(v, minimapUrl) {
     ctx.fillStyle = COLORS.bg;
     ctx.fillRect(0, 0, v.pw, v.ph);
     const art = smoothArt(minimapUrl);
-    // The minimap art is one texel per map cell; smoothArt pre-upscales it so zooming in shows shapes, not blocks.
     // The walk-grid fallback stays crisp (its cells are the data).
     ctx.imageSmoothingEnabled = !!art;
     ctx.imageSmoothingQuality = "high";

@@ -195,7 +195,7 @@ public sealed class HuntSimulator
         if (errors.Count > 0) throw new ArgumentException("skill script: " + string.Join("; ", errors));
         _itemRules = BotBehavior.ParseItemScript(_cfg.ItemScript ?? "", out _); // live skips bad lines too
         _inputs = new BotBehavior.SkillChoiceInputs(data, options.NoAutoAttack, (m, _) => ForecastOf(m.ClassId).Swing,
-            m => ForecastOf(m.ClassId) is { P: { } p } f ? f.Swing / (1 + p.DoubleAttackRate) : ForecastOf(m.ClassId).Swing); // a skill hit never doubles
+            m => ForecastOf(m.ClassId) is var f && f.P is { } p ? f.Swing / (1 + p.DoubleAttackRate) : f.Swing); // a skill hit never doubles
         for (var y = 0; y < _walk.Height; y++)
             for (var x = 0; x < _walk.Width; x++)
                 if (_walk.IsWalkable(x, y)) WalkableCells++;
@@ -1437,14 +1437,7 @@ public sealed class HuntSimulator
                     Log($"target {Name(mob)} #{mob.Id} at ({mob.X},{mob.Y}), {path.Count - 1} steps (of {visible.Count} in view)", "pick", mob.Id, _pickDetail);
                     // The target keeps moving until hit (its own AI: wandering, or coming for the bot): follow it, re-pathing
                     // each time it moves, as the server's attack move does.
-                    var stop = path.Count > 1 ? Walk(path, WalkKind.Approach, stopOnSighting: false, chase: mob) : WalkStop.Arrived;
-                    for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && mob.Alive && _t < _end
-                                          && !CanHit(_x, _y, mob) && repaths < MaxChaseRepaths; repaths++)
-                    {
-                        var again = _walk.FindPath(_x, _y, mob.X, mob.Y, ReachExpansions);
-                        if (again == null) break;
-                        stop = Walk(again.Take(again.FindIndex(c => CanHit(c.x, c.y, mob)) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: mob);
-                    }
+                    var stop = Chase(mob, path.Count > 1 ? Walk(path, WalkKind.Approach, stopOnSighting: false, chase: mob) : WalkStop.Arrived);
                     if (_t >= _end) break;
                     if (stop is WalkStop.Threat or WalkStop.Died || !mob.Alive) { _wanderDest = null; lookNow = true; continue; }
                     if (!CanHit(_x, _y, mob))
@@ -1524,13 +1517,7 @@ public sealed class HuntSimulator
             if (EmergencyWing()) continue;
             if (Defender() is { } m)
             {
-                var stop = WalkStop.Arrived;
-                for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && m.Alive && _t < _end && !CanHit(_x, _y, m) && repaths < MaxChaseRepaths; repaths++)
-                {
-                    var path = _walk.FindPath(_x, _y, m.X, m.Y, ReachExpansions);
-                    if (path == null) break;
-                    stop = Walk(path.Take(path.FindIndex(c => CanHit(c.x, c.y, m)) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: m);
-                }
+                var stop = Chase(m, WalkStop.Arrived);
                 if (m.Alive && _t < _end && stop is not (WalkStop.Threat or WalkStop.Died) && CanHit(_x, _y, m)) Fight(m, "defend");
                 else Wait(LiveTickSeconds, flee: false); // couldn't close in: the next tick decides again
                 continue;
@@ -1541,6 +1528,19 @@ public sealed class HuntSimulator
             Walk(route, WalkKind.Wander, stopOnSighting: false, maxSeconds: 10); // a hit (DefendAsync's turn) or a hazard stops it sooner
         }
         Log(Arrived ? $"arrived at the exit after {_t:F0}s, HP {_world.Hp}/{_world.MaxHp}" : Deaths > 0 ? $"died after {_t:F0}s" : $"stuck: no arrival in {_end:F0}s", "end");
+    }
+
+    /// <summary>Walks up to a moving target, re-pathing each time it moves, until it is in reach, dies, the walk stops on a
+    /// threat or a death (<paramref name="stop"/>: how the walk so far ended), or MaxChaseRepaths.</summary>
+    private WalkStop Chase(Mob m, WalkStop stop)
+    {
+        for (var repaths = 0; stop is not (WalkStop.Threat or WalkStop.Died) && m.Alive && _t < _end && !CanHit(_x, _y, m) && repaths < MaxChaseRepaths; repaths++)
+        {
+            var path = _walk.FindPath(_x, _y, m.X, m.Y, ReachExpansions);
+            if (path == null) break;
+            stop = Walk(path.Take(path.FindIndex(c => CanHit(c.x, c.y, m)) + 1).ToList(), WalkKind.Approach, stopOnSighting: false, chase: m);
+        }
+        return stop;
     }
 
     /// <summary>BotBehavior.DefendAsync: the winnable monsters on the bot (hit it, or aggressive within 2 cells; fixed ones

@@ -81,7 +81,7 @@ public readonly record struct ActivityTime(double Fight, double Search, double R
 // must beat the current one by MoveFactor after that cost — otherwise two similar maps would ping-pong.
 public sealed partial class BotBehavior
 {
-    private const double MoveFactor = 1.2;
+    public const double MoveFactor = 1.2;
     // Maps the bot never hunted (no layout factor yet) are ranked this much higher, so an untried map that models even with
     // the current one clears the MoveFactor bar. Tried maps are predicted from their own layout factor, no bonus, so two known
     // maps still need MoveFactor to swap (no ping-pong).
@@ -94,7 +94,7 @@ public sealed partial class BotBehavior
     // ponytail: straight line per leg undercounts walls; scale by a detour factor if bots arrive much later than estimated.
     private const double MapLoadCells = 10, TeleportDialogCells = 60;
     private string? _mapWingTo; // save town to Butterfly Wing to before travelling to the new hunting map
-    private static readonly TimeSpan MapCheckEvery = TimeSpan.FromMinutes(10);
+    public static readonly TimeSpan MapCheckEvery = TimeSpan.FromMinutes(10);
     // Share of a candidate map's modeled exp/h a bot really earns after moving there. The home map's factors are fit on
     // the home map, so they don't capture what a new map adds: a different kill mix, deaths/flees, layout, and picking
     // the most optimistic estimate of ~40 (winner's curse). Logs from 11-15..11-16 (5 bots, 65 moves): median 0.37
@@ -358,7 +358,7 @@ public sealed partial class BotBehavior
     public Func<string, int, int, string, RoBotClient.Bot.Offline.RouteVerdict?>? RouteCheck;
 
     /// <summary>The once-per-level scan (BotManager.LevelScan -> the dashboard's RouteChecks.Scan): (from map, x, y,
-    /// candidate maps) -> each map hunted offline for 10 min (exp/h and deaths, no route), or null while it runs.</summary>
+    /// candidate maps) -> each map hunted offline for RouteSimulator.ScanMinutes (exp/h and deaths, no route), or null while it runs.</summary>
     public Func<string, int, int, IReadOnlyList<string>, RoBotClient.Bot.Offline.LevelScan?>? LevelScan;
     private const int ScanCandidates = 6; // the best-estimated maps the scan simulates (plus the current one)
 
@@ -434,9 +434,9 @@ public sealed partial class BotBehavior
 
         var options = new List<MapOption>();
         var riskyRoute = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var travel = new Dictionary<string, (double Seconds, string? WingTo)>(StringComparer.OrdinalIgnoreCase);
-        // Once per level the offline simulator hunts the best candidates for 10 min each and walks the way there: its exp/h
-        // replaces the estimate of a map not measured yet, and a map it died on, or can't reach alive, is a risky route.
+        var travel = new Dictionary<string, (double Seconds, string? WingTo, (string Map, int X, int Y)? Start)>(StringComparer.OrdinalIgnoreCase);
+        // Once per level the offline simulator hunts the best candidates: its exp/h replaces the estimate of a map not
+        // measured yet, and a map it died on is a risky route.
         // Its rates are scaled by what the current map really earned vs its own simulation (down only, as calibration).
         RoBotClient.Bot.Offline.LevelScan? scan = null;
         var scanPending = false;
@@ -461,7 +461,7 @@ public sealed partial class BotBehavior
             if (!estimate.Safe && !string.Equals(map, home, StringComparison.OrdinalIgnoreCase) && Simulated(map) == null) continue;
             if (estimate.Rate <= 0 && !string.Equals(map, home, StringComparison.OrdinalIgnoreCase)) continue;
             var (hops, riskyStop) = string.Equals(map, snap.Map, StringComparison.OrdinalIgnoreCase) ? (0, null) : HopsTo(snap, map);
-            travel[map] = hops > 0 ? TravelTo(snap, map) : (0, null);
+            travel[map] = hops > 0 ? TravelTo(snap, map) : (0, null, null);
             // No route (hops -1) stays in the table, never picked: hiding Lutie (before NpcLinks taught the graph Aldebaran's
             // Santa) hid a 370k exp/h map the bot should learn to reach.
             var isHome = string.Equals(map, home, StringComparison.OrdinalIgnoreCase);
@@ -477,7 +477,6 @@ public sealed partial class BotBehavior
             var simulated = Simulated(map);
             if (!isHome && simulated is { Died: true })
                 riskyRoute[map] = $"hunt sim: died after {simulated.Minutes:F1} min{(simulated.Killer != null ? $" to {simulated.Killer}" : "")}";
-            else if (!isHome && simulated?.Route is { Safe: false } badRoute) riskyRoute[map] = $"route sim: {badRoute.Text}";
             var rate = isHome && homeMeasured ? homeRate : measured ? exp / seconds * 3600
                 : simulated != null ? simulated.ExpPerHour * simCalibration * realization : modeledRate;
             var note = hops < 0 ? $"unreachable: no warp or Kafra route from {snap.Map} (a teleport NPC missing from NpcLinks?)"
@@ -539,19 +538,16 @@ public sealed partial class BotBehavior
         var urgent = _retreatReason != null || banned || !currentSafe || homeRiskyStop != null;
         if (scanPending && !urgent)
         {
-            MapDecision = $"Staying on {home}. Reason: the offline simulator is scanning the maps for Lv {snap.SelfLevel} (hunting each for 10 min and the way there; queued behind other bots when busy).";
+            MapDecision = $"Staying on {home}. Reason: the offline simulator is scanning the maps for Lv {snap.SelfLevel} (hunting each for {RoBotClient.Bot.Offline.RouteSimulator.ScanMinutes:0} min; queued behind other bots when busy).";
             _nextMapCheck = now.AddSeconds(30);
             return;
         }
         if (_config.SimulateRoutes && RouteCheck != null && !trapped)
-            // Best map first; an unsafe way there drops it and the next best is checked, until one is safe or none is left.
             while (best is { Hops: > 0 })
             {
                 var wouldMove = urgent || (currentRate > 0 ? Effective(best) / currentRate : double.PositiveInfinity) >= MoveFactor;
                 if (!wouldMove) break;
-                // A wing trip starts in the save town: simulate that route, not the walk from here.
-                var (checkMap, checkX, checkY) = travel.GetValueOrDefault(best.Map).WingTo is { } wingStart && FindAnyWalkableCell(wingStart) is { } wingLand
-                    ? (wingStart, wingLand.X, wingLand.Y) : (snap.Map, snap.SelfPos.X, snap.SelfPos.Y);
+                var (checkMap, checkX, checkY) = travel.GetValueOrDefault(best.Map).Start ?? (snap.Map, snap.SelfPos.X, snap.SelfPos.Y);
                 var verdict = RouteCheck(checkMap, checkX, checkY, best.Map);
                 if (verdict == null)
                 {
@@ -595,16 +591,17 @@ public sealed partial class BotBehavior
         OnHomeMapChanged?.Invoke();
     }
 
-    // Seconds to the map by the cheapest of: the route from here, or a Butterfly Wing to the save town and the route from there.
-    private (double Seconds, string? WingTo) TravelTo(Snapshot snap, string map)
+    // Seconds to the map by the cheapest of: the route from here, or a Butterfly Wing to the save town and the route from
+    // there (Start: where that route begins; null when it begins here).
+    private (double Seconds, string? WingTo, (string Map, int X, int Y)? Start) TravelTo(Snapshot snap, string map)
     {
-        if (_data!.World.EntryCell(map) is not { } entry) return (double.PositiveInfinity, null);
+        if (_data!.World.EntryCell(map) is not { } entry) return (double.PositiveInfinity, null, null);
         double From(string from, int x, int y) => PlanRoute(from, x, y, map, entry.X, entry.Y) is { } plan ? RouteSeconds(plan, x, y) : double.PositiveInfinity;
         var walk = From(snap.Map, snap.SelfPos.X, snap.SelfPos.Y);
         var save = HasUsableItem(_config.ButterflyWingItemId) ? SaveMap() : null;
-        if (save == null || string.Equals(save, snap.Map, StringComparison.OrdinalIgnoreCase) || FindAnyWalkableCell(save) is not { } land) return (walk, null);
+        if (save == null || string.Equals(save, snap.Map, StringComparison.OrdinalIgnoreCase) || FindAnyWalkableCell(save) is not { } land) return (walk, null, null);
         var wing = WingCostCells * PlayerSecondsPerCell + From(save, land.X, land.Y); // ponytail: town centre as the landing, like the shop trip
-        return wing < walk ? (wing, save) : (walk, null);
+        return wing < walk ? (wing, save, (save, land.X, land.Y)) : (walk, null, null);
     }
 
     private static double RouteSeconds(WorldGraph.TravelPlan plan, int x, int y)

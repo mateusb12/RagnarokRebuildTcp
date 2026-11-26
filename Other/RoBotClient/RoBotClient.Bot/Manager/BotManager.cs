@@ -108,7 +108,7 @@ public sealed class BotManager
     /// verdict, or null while it runs. Unset (CLI, tests): every route counts as unchecked-safe.</summary>
     public Func<string, BotSession, string, int, int, string, RoBotClient.Bot.Offline.RouteVerdict?>? RouteCheck { get; set; }
     /// <summary>The once-per-level scan (the dashboard's RouteChecks.Scan): (character, session, from map, x, y, candidate
-    /// maps) -> hunt sims of the maps and the routes there, or null while queued/running. Unset: an empty scan.</summary>
+    /// maps) -> hunt sims of the maps, or null while queued/running. Unset: an empty scan.</summary>
     public Func<string, BotSession, string, int, int, IReadOnlyList<string>, RoBotClient.Bot.Offline.LevelScan?>? LevelScan { get; set; }
     /// <summary>A duel can end before its shadow forecast (ForecastWorker) is ready: store it once the forecast is
     /// in, so the two stay together. After this long the record is stored without it, saying so.</summary>

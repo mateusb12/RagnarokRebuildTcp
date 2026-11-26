@@ -15,7 +15,7 @@
         <label class="d-flex align-items-center gap-2 small" title="Game minimap zoom">
             <span>Zoom</span>
             <input type="range" min="0" max="10" step="1" value="@_zoomLevel" @oninput="ZoomChangedAsync" style="width:110px" />
-            <span class="text-nowrap">@ZoomLabel</span>
+            <span class="text-nowrap">@ZoomLabel(_zoomLevel)</span>
         </label>
     </div>
 }
@@ -72,6 +72,7 @@
 @code {
     [Parameter] public string MapCode { get; set; } = "";
     [Parameter] public bool? ShowSpawnAreas { get; set; }
+    /// <summary>0..10, read when the parent passes ShowSpawnAreas (it then renders the zoom slider too).</summary>
     [Parameter] public int ZoomLevel { get; set; }
 
     // "Bash!!" for 3 s after the bot uses a skill, like Unity's ShowSkillCastMessage(skill, 3).
@@ -95,14 +96,19 @@
     private bool _disposed;
     private DateTime _nextRowsRender;
 
-    private string ZoomLabel => $"{ZoomFactor(_zoomLevel):0.0}×";
+    public static string ZoomLabel(int level) => $"{ZoomFactor(level):0.0}×";
     private static double ZoomFactor(int level) => 1 + 5 * Math.Pow(Math.Clamp(level, 0, 10) / 10.0, 2);
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (ShowSpawnAreas != null && ZoomLevel != _zoomLevel) await SetZoomAsync(ZoomLevel);
+    }
 
     private Task ZoomChangedAsync(ChangeEventArgs e) => int.TryParse(e.Value?.ToString(), out var level)
         ? SetZoomAsync(level)
         : Task.CompletedTask;
 
-    public async Task SetZoomAsync(int level)
+    private async Task SetZoomAsync(int level)
     {
         _zoomLevel = Math.Clamp(level, 0, 10);
         if (_module != null && !_disposed)
@@ -116,11 +122,7 @@
             return;
 
         _module = await JS.InvokeAsync<IJSObjectReference>("import", $"./js/map.js?v={ScriptVersion}");
-        if (ShowSpawnAreas != null)
-        {
-            _zoomLevel = Math.Clamp(ZoomLevel, 0, 10);
-            await _module.InvokeVoidAsync("setZoom", _canvasRef, ZoomFactor(_zoomLevel));
-        }
+        await _module.InvokeVoidAsync("setZoom", _canvasRef, ZoomFactor(_zoomLevel));
         await DrawAsync();
 
         _timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100)); // 10 fps: at 500 ms a walking bot jumped ~3 cells per frame

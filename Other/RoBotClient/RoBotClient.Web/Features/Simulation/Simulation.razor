@@ -106,7 +106,7 @@
         @if (_scansSaved.Count > 0)
         {
             <div class="fw-semibold mt-3">Bots' leveling predictions <span class="badge bg-secondary">@_scansSaved.Count</span></div>
-            <div class="small text-secondary">Once per level a live bot asks: "where should I level now?" Each candidate map is hunted offline for @RouteChecks.ScanMinutes min (and the way there checked). Maps where it died, or whose route fails, are ruled out; the rest are ranked by exp/h, which the bot then corrects with what it really earned on maps it has hunted. ▶ plays the hunt (only the last @RouteChecks.KeepReplays scans keep replays).</div>
+            <div class="small text-secondary">Once per level a live bot asks: "where should I level now?" Each candidate map is hunted offline for @RouteSimulator.ScanMinutes min. Maps where it died are ruled out (the route to the one it picks is checked before it moves); the rest are ranked by exp/h, which the bot then corrects with what it really earned on maps it has hunted. ▶ plays the hunt (only the last @RouteChecks.KeepReplays scans keep replays).</div>
             <div style="max-height:24rem;overflow:auto">
                 <table class="table table-sm small mt-1 mb-0" style="font-variant-numeric:tabular-nums">
                     <thead><tr><th>When</th><th>Bot</th><th class="text-end">Lv</th><th>From</th><th>Best by sim</th><th>Candidates (exp/h, best first)</th></tr></thead>
@@ -114,16 +114,15 @@
                         @foreach (var sc in _scansSaved)
                         {
                             var ranked = sc.Maps.OrderByDescending(m => m.ExpPerHour).ToList();
-                            var best = ranked.FirstOrDefault(m => !m.Died && m.Route is not { Safe: false });
+                            var best = ranked.FirstOrDefault(m => !m.Died);
                             <tr>
                                 <td class="text-nowrap">@sc.AtUtc.ToLocalTime().ToString("MM-dd HH:mm")</td><td class="text-nowrap">@sc.Character</td><td class="text-end">@sc.Level</td><td>@sc.From</td>
                                 <td class="text-nowrap fw-semibold text-success">@(best == null ? "none safe" : $"{best.Map} {best.ExpPerHour:N0}/h")</td>
                                 <td>@foreach (var m in ranked)
                                 {
-                                    var bad = m.Died || m.Route is { Safe: false };
-                                    var why = m.Died ? $"died at {m.Minutes:F1} min to {m.Killer}" : m.Route is { Safe: false } r ? $"route: {r.Text}" : $"{m.Kills} kills in {m.Minutes:F0} min" + (m.Route != null ? $"; route: {m.Route.Text}" : "");
+                                    var why = m.Died ? $"died at {m.Minutes:F1} min to {m.Killer}" : $"{m.Kills} kills in {m.Minutes:F0} min";
                                     var scanReplay = m.Replay != null && Runner.PathOf(m.Replay) != null ? m.Replay : null;
-                                    <span class="badge me-1 mb-1 @(bad ? "text-bg-danger" : "text-bg-secondary")" title="@why" role="@(scanReplay != null ? "button" : null)" @onclick="() => { if (scanReplay != null) Load(scanReplay); }">@m.Map @m.ExpPerHour.ToString("N0")@(m.Died ? " ☠" : m.Route is { Safe: false } ? " ✘route" : "")@(scanReplay != null ? " ▶" : "")</span>
+                                    <span class="badge me-1 mb-1 @(m.Died ? "text-bg-danger" : "text-bg-secondary")" title="@why" role="@(scanReplay != null ? "button" : null)" @onclick="() => { if (scanReplay != null) Load(scanReplay); }">@m.Map @m.ExpPerHour.ToString("N0")@(m.Died ? " ☠" : "")@(scanReplay != null ? " ▶" : "")</span>
                                 }</td>
                             </tr>
                         }
@@ -168,7 +167,7 @@
             <div class="mt-2 fw-semibold @(rr.FailsAt == null ? "text-success" : "text-danger")">@rr.Verdict</div>
             <div class="small text-secondary">@rr.Character Lv @rr.Level · @rr.Seeds seeds · @rr.WallSeconds.ToString("0.0")s to simulate</div>
             <table class="table table-sm small mt-2 mb-0" style="font-variant-numeric:tabular-nums">
-                <thead><tr><th>#</th><th>Map</th><th>Leaves by</th><th class="text-end">Entered</th><th class="text-end">Crossed</th><th class="text-end">Died</th><th class="text-end" title="not across in 5 min: fleeing back and forth">Blocked</th><th class="text-end">Mean s</th><th class="text-end">HP left</th><th class="text-end">Fly Wings</th><th>Killers</th><th>Replays</th></tr></thead>
+                <thead><tr><th>#</th><th>Map</th><th>Leaves by</th><th class="text-end">Entered</th><th class="text-end">Crossed</th><th class="text-end">Died</th><th class="text-end" title="not across in @(RouteSimulator.HopSeconds / 60) min: fleeing back and forth">Blocked</th><th class="text-end">Mean s</th><th class="text-end">HP left</th><th class="text-end">Fly Wings</th><th>Killers</th><th>Replays</th></tr></thead>
                 <tbody>
                     @for (var i = 0; i < rr.Hops.Count; i++)
                     {
@@ -179,7 +178,7 @@
                             <td class="text-end">@hop.Entered</td><td class="text-end">@hop.Arrived</td><td class="text-end">@hop.Died</td><td class="text-end">@hop.Stuck</td>
                             <td class="text-end">@hop.MeanSeconds.ToString("0")</td><td class="text-end">@(hop.Arrived > 0 ? hop.MeanHpLeftPct.ToString("0") + "%" : "—")</td>
                             <td class="text-end">@hop.MeanFlyWings.ToString("0.0")</td><td>@string.Join(", ", hop.Killers)</td>
-                            <td>@foreach (var run in rr.Runs.Where(r => r.Count > idx && r[idx].Replay != null)) { var o = run[idx]; var replayName = o.Replay ?? ""; var fullRoute = replayName.EndsWith("_continuous", StringComparison.Ordinal); <a class="me-1" title="@(fullRoute ? "Play the full route" : "Play this map crossing")" href="simulation?run=@replayName" @onclick="() => SelectRouteReplay(replayName)" @onclick:preventDefault>@(fullRoute ? "⇢" : o.Died ? "☠" : o.Arrived ? "✓" : "⧗")</a> }</td>
+                            <td>@foreach (var run in rr.Runs.Where(r => r.Count > idx && r[idx].Replay != null)) { var o = run[idx]; var replayName = o.Replay ?? ""; var fullRoute = replayName.EndsWith(RouteSimulator.ContinuousSuffix, StringComparison.Ordinal); <a class="me-1" title="@(fullRoute ? "Play the full route" : "Play this map crossing")" href="simulation?run=@replayName" @onclick="() => SelectRouteReplay(replayName)" @onclick:preventDefault>@(fullRoute ? "⇢" : o.Died ? "☠" : o.Arrived ? "✓" : "⧗")</a> }</td>
                         </tr>
                     }
                 </tbody>
@@ -200,7 +199,7 @@
                                 <td class="text-nowrap">@r.From → @r.To</td>
                                 <td class="@(r.FailsAt == null ? "text-success" : "text-danger")">@(r.FailsAt == null ? "✔ survives" : $"✘ dies/blocked on {r.FailsAt}")</td>
                                 <td class="text-end">@r.Survived/@r.Seeds</td>
-                                <td>@(name.EndsWith("_live", StringComparison.Ordinal) ? "live bot" : "this page")</td>
+                                <td>@(RouteChecks.IsLive(name) ? "live bot" : "this page")</td>
                                 <td>@(HasReplay(r) ? "▶" : "")</td>
                             </tr>
                         }
@@ -442,14 +441,9 @@
         string? replay = null;
         if (route != null)
             foreach (var outcome in route.Runs.SelectMany(run => run))
-                if (outcome.Replay is { } candidate && Runner.PathOf(candidate) != null && (replay == null || candidate.EndsWith("_continuous", StringComparison.Ordinal)))
+                if (outcome.Replay is { } candidate && Runner.PathOf(candidate) != null && (replay == null || candidate.EndsWith(RouteSimulator.ContinuousSuffix, StringComparison.Ordinal)))
                     replay = candidate;
-        if (replay != null)
-        {
-            Load(replay);
-            _activeTab = "survival";
-            _playbackSelection = "route:" + name;
-        }
+        if (replay != null) Load(replay, "survival", "route:" + name);
         else
         {
             _replay = null;
@@ -466,7 +460,7 @@
         if (results.Count != _routeSeen)
         {
             _routeResults = ReplayableRoutes();
-            if (results.Count > 0 && !results[0].EndsWith("_live")) LoadRoute(results[0]); // a page check just finished
+            if (results.Count > 0 && !RouteChecks.IsLive(results[0])) LoadRoute(results[0]); // a page check just finished
         }
         _routeSeen = results.Count;
         if (Routes.LiveScans.Count != _scanSeen) { _scanSeen = Routes.LiveScans.Count; _scansSaved = Routes.SavedScans(); }
@@ -508,20 +502,10 @@
         _playbackSelection = selection;
         if (selection.StartsWith("route:", StringComparison.Ordinal)) LoadRoute(selection[6..]);
         else if (selection.StartsWith("segment:", StringComparison.Ordinal)) SelectRouteReplay(selection[8..]);
-        else if (selection.StartsWith("run:", StringComparison.Ordinal))
-        {
-            _activeTab = "leveling";
-            Load(selection[4..]);
-        }
+        else if (selection.StartsWith("run:", StringComparison.Ordinal)) Load(selection[4..]);
     }
 
-    private void SelectRouteReplay(string name)
-    {
-        _activeTab = "survival";
-        _playbackSelection = "segment:" + name;
-        Load(name);
-        _playbackSelection = "segment:" + name;
-    }
+    private void SelectRouteReplay(string name) => Load(name, "survival", "segment:" + name);
 
     private List<string> RouteReplayNames() => _route is not { } route ? new() : route.Runs.SelectMany(r => r)
         .Select(o => o.Replay).Where(n => n != null).Cast<string>().Distinct(StringComparer.Ordinal).ToList();
@@ -540,7 +524,7 @@
     private int _scanSeen;
     private static string Stamp(string name) => DateTime.TryParseExact(name.Split('_')[0], "yyyyMMdd-HHmmss", null, System.Globalization.DateTimeStyles.None, out var t) ? t.ToString("MM-dd HH:mm") : "";
 
-    private string? LatestPageRoute() => _routeResults.FirstOrDefault(r => !r.EndsWith("_live", StringComparison.Ordinal));
+    private string? LatestPageRoute() => _routeResults.FirstOrDefault(r => !RouteChecks.IsLive(r));
 
     private int PlaybackOptions() => _runs.Count + _routeResults.Count + RouteReplayNames().Count;
 
@@ -555,11 +539,12 @@
         else _activeTab = "leveling";
     }
 
-    private void Load(string name)
+    /// <summary>Plays a saved replay, showing <paramref name="tab"/> with <paramref name="selection"/> picked (default: a leveling run).</summary>
+    private void Load(string name, string tab = "leveling", string? selection = null)
     {
         _routeReplayUnavailable = false;
-        _activeTab = "leveling";
-        _playbackSelection = "run:" + name;
+        _activeTab = tab;
+        _playbackSelection = selection ?? "run:" + name;
         try
         {
             _replay = Runner.Load(name);

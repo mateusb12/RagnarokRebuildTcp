@@ -341,7 +341,7 @@ public sealed class BotBehaviorConfig
         JunkSellCount = other.JunkSellCount;
         // Old configs restocked Fly Wings in the potion slot; wings have their own pool now (FlyWingWeightShare), and a
         // wing there meant the bot never bought a potion (Bot2, Lv 70, died at orcsdun02 with no HP heal in the bag).
-        RestockItemId = other.RestockItemId == other.FlyWingItemId ? 501 : other.RestockItemId;
+        RestockItemId = other.RestockItemId == other.FlyWingItemId ? new BotBehaviorConfig().RestockItemId : other.RestockItemId;
         ConsumableWeightShare = other.ConsumableWeightShare;
         HealingZenyShare = other.HealingZenyShare;
         BuffZenyShare = other.BuffZenyShare;

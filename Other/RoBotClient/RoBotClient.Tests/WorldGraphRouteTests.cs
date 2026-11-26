@@ -19,7 +19,8 @@ public class WorldGraphRouteTests(ITestOutputHelper output)
     [InlineData("prt_maze02")]
     [InlineData("prt_maze03")]
     [InlineData("xmas_dun02")]
-    [InlineData("ama_dun01")]    public void MapIsReachableFromProntera(string map)
+    [InlineData("ama_dun01")]
+    public void MapIsReachableFromProntera(string map)
     {
         var world = Db.Value.World;
         var entry = world.EntryCell(map);

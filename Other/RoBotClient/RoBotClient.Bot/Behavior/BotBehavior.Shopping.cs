@@ -741,7 +741,6 @@ private string? _customBuyWhy; // set by the gear logic alongside RequestBuyItem
             var defaultPrice = 0;
             foreach (var (id, p) in npc.ShopItems)
                 if (id == potion) { defaultPrice = p; break; }
-            // This dealer doesn't stock it: the strongest weaker one from HealingItemIds that it does.
             if (defaultPrice == 0 && _data != null && _config.HealingItemIds.Contains(potion)
                 && npc.ShopItems.Where(s => _config.HealingItemIds.Contains(s.Item1) && _data.HpRecovery(s.Item1) < _data.HpRecovery(potion))
                     .OrderByDescending(s => _data.HpRecovery(s.Item1)).FirstOrDefault() is { Item2: > 0 } alt)
